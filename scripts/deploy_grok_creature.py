@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Deploy Grok Build onto a running Caspar node as a `docker` creature entity.
+
+The creature is the signaling bridge in `caspar/` plus the Grok Build CLI: the
+node builds the image, starts one long-lived container, and the container serves
+every prompt the Decillion backend signals it (see `caspar/README.md`).
+
+It is the platform's **agent backbone** — the program every Decillion agent proxy
+forwards its prompts to. It speaks the wire contract the davinci agent creature
+spoke (`davinci/step` / `davinci/result`, the `davinci.agent` manifest slot), so
+it is a drop-in replacement for whatever backbone the manifest already points at.
+
+What this script does, in order:
+
+  1. log in to the node as the deploy operator (the SAME account that owns the
+     program being reused — a program can only be redeployed by its owner);
+  2. gzip-tar the build context — the prebuilt `bin/grok` + `caspar/` by default,
+     or this repo's Rust source in `source` mode;
+  3. compose the Dockerfile: `caspar/Dockerfile[.prebuilt]` + the host CA bundle +
+     the baked env (the xAI credentials, never written to disk here) + a
+     context-digest LABEL;
+  4. deploy the entity — onto an EXISTING program id when one is given, so
+     already-deployed agent proxies keep pointing at a valid backbone;
+  5. wait for the node to finish building the image (by watching for the digest
+     LABEL, so a fully-cached rebuild does not burn the whole timeout);
+  6. `runEntity` with `forceRestart`, so the new image actually runs.
+
+Environment
+-----------
+Connection (plaintext TCP, matching the local `casparctl` node):
+    CASPAR_NODE_HOST        node host                     (default 127.0.0.1)
+    CASPAR_NODE_PORT        node TCP port                 (default 8074)
+    CASPAR_CA_BUNDLE        host CA bundle baked into the image for egress TLS
+                            (default /etc/ssl/certs/ca-certificates.crt)
+    CASPAR_DEPLOY_IDENTITY_FILE  persisted deploy-operator identity, shared with
+                            every tool deploy so a redeploy reuses the same account
+                            and program (default: next to CASPAR_MANIFEST)
+    CASPAR_OPERATOR_ID / CASPAR_OPERATOR_PRIVATE_KEY  inject the operator explicitly
+    CASPAR_DEPLOY_USER      first-login username only      (default davinci_admin)
+
+Program / entity:
+    GROK_REUSE_PROGRAM_ID   redeploy onto this existing program (no new creature)
+    GROK_ENTITY_ID          entity id                    (default davinci)
+    GROK_STOP_PROGRAM_ID    stop mode: stop this program's entity and exit
+    DAVINCI_* equivalents are accepted for every one of the three above, so this
+    script is a drop-in for the davinci deploy entrypoint the Decillion CI calls.
+
+Grok backbone (baked into the image; read from this environment only):
+    XAI_API_KEY / GROK_CODE_XAI_API_KEY
+    GROK_CREATURE_MODEL, GROK_CREATURE_LLM_* (a non-xAI default backbone)
+
+Agent build:
+    GROK_CLI_SOURCE         prebuilt (default: ship a CI-built bin/grok, no compile
+                            on the node — caspar/Dockerfile.prebuilt)
+                            | source (compile crates/ inside the image)
+                            | release (download the published grok binary)
+    GROK_RUNTIME_BASE       runtime image base (default node:22-trixie-slim via ECR)
+
+VM:
+    GROK_RUN_ENTITY         1 to start the VM after deploy (default), 0 to skip
+    GROK_VM_RAM_MB          default 2048     GROK_VM_DISK_GB   default 8
+    GROK_VM_CPUS            default 2        GROK_VM_MAX_SECONDS default unlimited
+    GROK_FORCE_RESTART      default 1
+    GROK_REBUILD_TIMEOUT    image build wait, seconds (default 900; a `source`
+                            build of the whole workspace needs far more)
+
+Output (stdout, machine-readable — the CI greps these):
+    DAVINCI_PROGRAM_ID=<id>     GROK_PROGRAM_ID=<id>
+    DAVINCI_ENTITY_ID=<id>      GROK_ENTITY_ID=<id>
+    DAVINCI_VM_ID=<vmId>        GROK_VM_ID=<vmId>
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import tarfile
+from pathlib import Path
+from typing import Dict, Tuple
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+
+from caspar_deploy_common import (  # noqa: E402
+    NODE_HOST,
+    NODE_PORT,
+    apply_ca,
+    b64_bytes,
+    bad,
+    bake_snippet,
+    docker_image_context,
+    docker_image_id,
+    env_any,
+    info,
+    ok,
+    resolve_operator,
+    stamp_context,
+    truthy,
+    vm_label,
+    vm_max_seconds,
+    wait_for_image,
+    warn,
+)
+from caspar_signaling import CasparSignalingClient  # noqa: E402
+
+ENTITY_ID = env_any("GROK_ENTITY_ID", "DAVINCI_ENTITY_ID", "CLAUDE_ENTITY_ID", default="davinci")
+
+# Where the agent's binary comes from:
+#   prebuilt (default) use a bin/grok built earlier on the CI host (the lightweight
+#                      path: the image build is a copy, not a cargo build — see
+#                      scripts/package-creature.sh and caspar/Dockerfile.prebuilt);
+#   source            compile this repo's crates/ inside the image;
+#   release           download the published CLI (a fallback, not the default).
+CLI_SOURCES = ("prebuilt", "source", "release")
+
+
+def resolve_cli_source() -> str:
+    mode = env_any("GROK_CLI_SOURCE", "CLAUDE_CODE_CLI_SOURCE", default="prebuilt").lower()
+    # The old backbone spelled its in-image compile "source" and its download path
+    # "npm"; map that so an unchanged CI keeps working.
+    if mode == "npm":
+        mode = "release"
+    if mode not in CLI_SOURCES:
+        warn(f"unknown GROK_CLI_SOURCE={mode!r} — falling back to 'prebuilt'")
+        mode = "prebuilt"
+    return mode
+
+
+# The backbone credentials + runtime knobs to bake into the image. Read from this
+# host's environment only — never written to the repo, never sent in a signal.
+BAKE_ENV_NAMES = (
+    "XAI_API_KEY",
+    "GROK_CODE_XAI_API_KEY",
+    "GROK_CREATURE_MODEL",
+    "GROK_CREATURE_PERMISSION_MODE",
+    "GROK_CREATURE_MAX_WALL_SECONDS",
+    "GROK_CREATURE_MAX_TURNS",
+    "GROK_CREATURE_TOOL_TIMEOUT",
+    "GROK_CREATURE_TASK_WAIT",
+    "GROK_CREATURE_TRACE_ALL",
+    "GROK_CREATURE_STREAM_STEPS",
+    "GROK_CREATURE_HISTORY_TURNS",
+    "GROK_CREATURE_USER",
+    "GROK_CREATURE_FORCE_SANDBOX_FS",
+    "GROK_CREATURE_DISALLOWED_TOOLS",
+    "GROK_CREATURE_DISCOVER_TOOLS",
+    "GROK_CREATURE_AUTH_FILE",
+)
+
+# A deploy host's proxy is usually a *loopback* proxy, which inside the creature's
+# network namespace points at nothing — so proxying is opt-in, never inherited.
+PROXY_ENV_NAMES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
+
+
+def bake_env() -> Dict[str, str]:
+    """The Grok credentials/knobs to bake into the creature image."""
+    names = list(BAKE_ENV_NAMES)
+    if truthy(os.environ.get("GROK_BAKE_PROXY", "")):
+        names += list(PROXY_ENV_NAMES)
+    env = {name: os.environ[name].strip() for name in names if os.environ.get(name, "").strip()}
+    # A default (non-xAI) backbone for agents that bring no provider of their own:
+    # the same {provider, model, api_key} shape a per-agent override uses, so the
+    # creature serves it through exactly one code path.
+    provider = env_any("GROK_CREATURE_LLM_PROVIDER", default="")
+    api_key = env_any("GROK_CREATURE_LLM_API_KEY", default="")
+    if provider and api_key:
+        env["GROK_CREATURE_LLM_PROVIDER"] = provider
+        env["GROK_CREATURE_LLM_API_KEY"] = api_key
+        for name in ("GROK_CREATURE_LLM_MODEL", "GROK_CREATURE_LLM_BASE_URL"):
+            value = env_any(name, default="")
+            if value:
+                env[name] = value
+    for name in PROXY_ENV_NAMES:
+        value = env.get(name, "")
+        if value and ("127.0.0.1" in value or "localhost" in value):
+            warn(f"{name} points at loopback ({value}) — inside the creature that address is not the proxy; "
+                 "unset GROK_BAKE_PROXY or give the proxy an address reachable from the docker network")
+    return env
+
+
+# Directories/files of this repo that go into the image build context in `source`
+# mode. The agent is COMPILED FROM THIS SOURCE inside the image (see
+# caspar/Dockerfile); target/, docs and the vendored notices are not needed to
+# build it, so they stay out of a payload that travels over a signal.
+CONTEXT_TREES = ("crates", "prod", "bin", "third_party", "caspar", ".cargo")
+CONTEXT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "clippy.toml", "rustfmt.toml", "SOURCE_REV")
+CONTEXT_EXCLUDE_SUFFIXES = (".map", ".log")
+CONTEXT_EXCLUDE_DIRS = {"__pycache__", "node_modules", ".git", "target", "docs"}
+
+
+def _tar_filter(entry: tarfile.TarInfo):
+    parts = set(entry.name.split("/"))
+    if parts & CONTEXT_EXCLUDE_DIRS:
+        return None
+    if entry.name.endswith(CONTEXT_EXCLUDE_SUFFIXES):
+        return None
+    # Deterministic metadata: the context digest must not change just because a
+    # file was checked out at a different time or by a different user.
+    entry.uid = entry.gid = 0
+    entry.uname = entry.gname = "root"
+    entry.mtime = 0
+    return entry
+
+
+def bundle_tar_gz() -> bytes:
+    """Gzip a tar of the build context.
+
+    Gzipped because it travels inside a deploy signal. In the default `prebuilt`
+    mode that is the compiled binary plus the ~200 KB signaling bridge; `source`
+    mode ships the whole Rust workspace, which is an order of magnitude larger and
+    is why it is not the default. `ADD bundle.tar.gz` unpacks it in the image.
+    """
+    mode = resolve_cli_source()
+    binary = REPO / "bin" / "grok"
+    if mode == "prebuilt" and not binary.exists():
+        bad("GROK_CLI_SOURCE=prebuilt, but bin/grok is not present. "
+            "Build it first (scripts/package-creature.sh), or download the CI artifact into bin/.")
+        raise SystemExit(2)
+
+    buf = io.BytesIO()
+    # mtime=0 keeps the gzip header (and therefore the context digest) stable.
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9) as tar:
+        tar.gzip_mtime = 0  # type: ignore[attr-defined]  (documented no-op on old pythons)
+        caspar_root = REPO / "caspar"
+        if mode == "prebuilt":
+            info(f"shipping the prebuilt agent binary ({binary.stat().st_size // 1048576} MiB) — no compile on the node")
+            tar.add(binary, arcname="bin/grok", filter=_tar_filter)
+            for path in sorted(p for p in caspar_root.rglob("*") if p.is_file()):
+                tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
+        elif mode == "release":
+            info("shipping only the signaling bridge — the image downloads the published grok binary")
+            for path in sorted(p for p in caspar_root.rglob("*") if p.is_file()):
+                tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
+        else:
+            for tree in CONTEXT_TREES:
+                root = REPO / tree
+                if not root.exists():
+                    continue
+                for path in sorted(p for p in root.rglob("*") if p.is_file()):
+                    tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
+            for name in CONTEXT_FILES:
+                path = REPO / name
+                if path.exists():
+                    tar.add(path, arcname=name, filter=_tar_filter)
+            # A binary already built on this host is shipped too, so the image can
+            # use it directly instead of rebuilding.
+            if binary.exists() and truthy(os.environ.get("GROK_SHIP_LOCAL_BINARY", "0")):
+                info(f"shipping the locally built binary ({binary.stat().st_size // 1048576} MiB)")
+                tar.add(binary, arcname="bin/grok", filter=_tar_filter)
+    return buf.getvalue()
+
+
+def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
+    """The image's Dockerfile: repo file + build mode + CA + baked env + label."""
+    cli_source = resolve_cli_source()
+    mode_blurb = {
+        "prebuilt": " (copying in the CI-built bin/grok — no compile on the node)",
+        "source": " (compiling crates/ inside the image — slow; expect tens of minutes)",
+        "release": " (downloading the published grok binary)",
+    }[cli_source]
+    info(f"agent build mode: {cli_source}{mode_blurb}")
+
+    dockerfile_name = "Dockerfile.prebuilt" if cli_source == "prebuilt" else "Dockerfile"
+    dockerfile = (REPO / "caspar" / dockerfile_name).read_bytes()
+
+    # These substitutions apply to caspar/Dockerfile (source/release); the prebuilt
+    # Dockerfile has no GROK_CLI_SOURCE ARG, so the replace is a no-op there.
+    dockerfile = dockerfile.replace(b"ARG GROK_CLI_SOURCE=source", f"ARG GROK_CLI_SOURCE={cli_source}".encode())
+    runtime_base = env_any("GROK_RUNTIME_BASE", default="")
+    if runtime_base:
+        info(f"runtime image base: {runtime_base}")
+        dockerfile = dockerfile.replace(
+            b"ARG RUNTIME_BASE=public.ecr.aws/docker/library/node:22-trixie-slim",
+            f"ARG RUNTIME_BASE={runtime_base}".encode(),
+        )
+
+    dockerfile = apply_ca(dockerfile, files)
+    baked = bake_env()
+    if baked:
+        # Report the names only — a key must never reach a log.
+        info(f"baking backbone credentials/knobs into the image: {', '.join(sorted(baked))}")
+    else:
+        info("no default backbone credentials baked into the image. This is fine when every agent "
+             "brings its own LLM provider + key (config.llm: xai/openai/anthropic/gemini/openrouter) — "
+             "those runs carry their own endpoint. Only agents with NO per-agent LLM override need a "
+             "default backbone here (XAI_API_KEY, or the GROK_CREATURE_LLM_* trio).")
+    dockerfile = dockerfile + b"\n" + bake_snippet(baked).encode()
+    return stamp_context(dockerfile, files)
+
+
+def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) -> Dict[str, str]:
+    """Deploy (or redeploy) the creature entity; returns the ids it landed on."""
+    creature_id = ""
+    prev_image_id = ""
+    if program_id:
+        info(f"redeploying the grok-build entity onto existing program {program_id} (entity {entity_id}) — no new creature")
+        # Capture the image id BEFORE the rebuild so the wait can detect a change.
+        prev_image_id = docker_image_id(program_id, entity_id)
+    else:
+        suffix = os.urandom(4).hex()
+        creature_id = client.create_machine_creature(f"m-grok-build-{suffix}")
+        program_id = client.create_program(creature_id, "/grok-build", "docker", "grok build agent")
+        info(f"created machine creature {creature_id} and program {program_id}")
+
+    context = bundle_tar_gz()
+    info(f"build context: {len(context) / 1048576:.1f} MiB gzipped ({len(context) * 4 // 3 // 1048576} MiB as base64 in the deploy signal)")
+    files: Dict[str, str] = {"bundle.tar.gz": b64_bytes(context)}
+    dockerfile, digest = compose_dockerfile(files)
+    already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
+
+    client.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile), files_b64=files)
+    if already_current:
+        ok("image already built from this exact context — no rebuild to wait for")
+    else:
+        timeout = int(env_any("GROK_REBUILD_TIMEOUT", "DAVINCI_REBUILD_TIMEOUT", default="900"))
+        wait_for_image(program_id, entity_id, timeout=timeout, prev_image_id=prev_image_id, expect_context=digest)
+    ok(f"grok-build creature deployed: program={program_id} entity={entity_id}")
+    return {"creature_id": creature_id, "program_id": program_id, "entity_id": entity_id}
+
+
+def main() -> int:
+    info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT}")
+    client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=180).connect()
+    # Authenticate as the ONE durable deploy operator (the same account the tool
+    # deploys use), so this redeploy owns the agent program it minted before and
+    # keeps every deployed agent proxy pointing at the same backbone.
+    resolve_operator(client)
+
+    # Stop mode: bring a running entity down gracefully, then exit. The Decillion
+    # CI uses this before restarting the node, so the VM is not yanked with it.
+    stop_pid = env_any("GROK_STOP_PROGRAM_ID", "DAVINCI_STOP_PROGRAM_ID", "CLAUDE_STOP_PROGRAM_ID")
+    if stop_pid:
+        info(f"stopping entity {ENTITY_ID} on program {stop_pid} (graceful pre-shutdown)")
+        try:
+            client.stop_entity(stop_pid, ENTITY_ID)
+            ok(f"stopEntity requested for {stop_pid}/{ENTITY_ID}")
+            print(f"DAVINCI_STOPPED={stop_pid}", flush=True)
+            print(f"GROK_STOPPED={stop_pid}", flush=True)
+        except Exception as exc:  # noqa: BLE001 — the entity may not be running
+            warn(f"stopEntity failed ({exc}); the entity may not be running")
+        client.close()
+        return 0
+
+    reuse_pid = env_any("GROK_REUSE_PROGRAM_ID", "DAVINCI_REUSE_PROGRAM_ID", "CLAUDE_REUSE_PROGRAM_ID")
+    try:
+        deployed = deploy(client, program_id=reuse_pid, entity_id=ENTITY_ID)
+    except Exception as exc:  # noqa: BLE001
+        bad(f"deploy failed: {exc}")
+        client.close()
+        return 1
+
+    # Machine-readable markers. Both spellings are printed so this script is a
+    # drop-in for the davinci deploy entrypoint the Decillion CI greps.
+    for prefix in ("DAVINCI", "GROK"):
+        print(f"{prefix}_PROGRAM_ID=" + deployed["program_id"], flush=True)
+        print(f"{prefix}_ENTITY_ID=" + deployed["entity_id"], flush=True)
+
+    if truthy(env_any("GROK_RUN_ENTITY", "DAVINCI_RUN_ENTITY", default="1")):
+        ram = int(env_any("GROK_VM_RAM_MB", "DAVINCI_VM_RAM_MB", default="2048"))
+        disk = int(env_any("GROK_VM_DISK_GB", "DAVINCI_VM_DISK_GB", default="8"))
+        cpus = int(env_any("GROK_VM_CPUS", "DAVINCI_VM_CPUS", default="2"))
+        max_seconds = vm_max_seconds("GROK_VM_MAX_SECONDS", "DAVINCI_VM_MAX_SECONDS")
+        label = vm_label(max_seconds)
+        # forceRestart is essential after a (re)deploy: without it the node's
+        # idempotent run_vm resumes the OLD container (old code) instead of
+        # creating a fresh one from the just-built image.
+        force_restart = truthy(env_any("GROK_FORCE_RESTART", "DAVINCI_FORCE_RESTART", default="1"))
+        info(f"starting the creature as a standalone VM entity (ram={ram}MB disk={disk}GB cpu={cpus} "
+             f"maxExec={label} forceRestart={force_restart})")
+        try:
+            vm_id = client.run_entity(deployed["program_id"], deployed["entity_id"], ram_mb=ram, disk_gb=disk,
+                                      cpu_cores=cpus, max_exec_seconds=max_seconds, force_restart=force_restart)
+            if vm_id:
+                ok(f"grok-build VM entity running: {vm_id}")
+                print("DAVINCI_VM_ID=" + vm_id, flush=True)
+                print("GROK_VM_ID=" + vm_id, flush=True)
+                if truthy(env_any("GROK_WAIT_READY", default="1")):
+                    found, _logs = client.wait_for_vm_log(vm_id, "GROK_READY", timeout=int(env_any("GROK_READY_TIMEOUT", default="180")), poll=3)
+                    if found:
+                        ok("creature is connected to the gateway and serving prompts (GROK_READY)")
+                    else:
+                        warn("no GROK_READY in the VM logs yet — the container may still be starting; "
+                             "check `/machines/readVmLogs` for this vmId")
+            else:
+                warn("runEntity returned no vmId")
+        except Exception as exc:  # noqa: BLE001 — the program is deployed regardless
+            warn(f"runEntity failed ({exc}); the program is deployed and the backend can still spawn it per prompt")
+    else:
+        info("GROK_RUN_ENTITY=0 — skipping the standalone runEntity start")
+
+    client.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

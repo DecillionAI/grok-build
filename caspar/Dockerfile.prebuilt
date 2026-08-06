@@ -1,0 +1,77 @@
+# Grok Build Caspar creature image — PREBUILT (default, lightweight) variant.
+#
+# The agent is the `grok` binary compiled from THIS repository's Rust source, but
+# not here: it is built once, on the CI host (scripts/package-creature.sh →
+# .github/workflows/build-grok-binaries.yml) and shipped in as a prebuilt
+# `bundle.tar.gz` (bin/grok + the caspar/ signaling bridge). This image just
+# unpacks it — so the node-side build is a copy, not a full cargo build of a
+# 60-crate workspace.
+#
+#   bundle.tar.gz  ──(built in CI from THIS repo's crates/, not a vendor download)
+#        │
+#        ▼  ADD (unpacked into /app)
+#   /app/bin/grok   +   /app/caspar/**   ──▶  node /app/caspar/runtime.mjs
+#
+# Build context: a directory (or Caspar deploy payload) whose only required file is
+# `bundle.tar.gz`, laid out with `bin/` and `caspar/` at its root — exactly what
+# scripts/package-creature.sh emits.
+#
+#   docker build -f caspar/Dockerfile.prebuilt -t grok-build-creature <context-with-bundle.tar.gz>
+#
+# glibc: the binary is built on the CI host and run here, so the runtime base must
+# be at least as new as the build host. Debian trixie (glibc 2.41) is newer than
+# every current LTS CI image, which is why it — not bookworm — is the default base.
+# Override with --build-arg RUNTIME_BASE=… when your build host is newer still.
+#
+# The ECR mirror of the official node image avoids Docker Hub anonymous-pull rate
+# limits during node-side builds (the same reason the davinci creature used it).
+
+ARG RUNTIME_BASE=public.ecr.aws/docker/library/node:22-trixie-slim
+FROM ${RUNTIME_BASE}
+
+# git: the agent works in a real repo-shaped workspace.
+# ripgrep: the CLI's search tools.
+# ca-certificates: outbound TLS (the xAI API, and the node's egress gateway).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ripgrep ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# >>> caspar-ca <<<
+# (the deployer substitutes the host CA bundle here when it has one — an
+# intercepting egress proxy would otherwise break outbound TLS)
+
+# The prebuilt payload: bin/grok and the caspar/ bridge, at the archive root, so
+# this unpacks straight into /app/bin + /app/caspar.
+ADD bundle.tar.gz /app
+
+# Fail the build loudly if the prebuilt binary is missing or does not run — better
+# here, where the build log shows it, than on the first prompt an agent receives.
+# (A glibc mismatch between the build host and this base surfaces exactly here.)
+RUN test -x /app/bin/grok \
+    && /app/bin/grok --version
+
+# The node uploads runtime inputs to /app/input before starting the container; the
+# directory must exist for the upload (and the container start) to succeed. /data is
+# the VM's persistent mount — session workspaces and the CLI's per-thread config
+# live there so a conversation's files survive a container restart.
+RUN mkdir -p /app/input /data/workspaces /data/grok-config \
+    && useradd --create-home --shell /bin/bash grok \
+    && chown -R grok:grok /app /data
+
+# An autonomous agent has no human to approve tool calls, and nothing it does needs
+# root — so the creature runs unprivileged.
+USER grok
+ENV HOME=/home/grok \
+    NODE_ENV=production \
+    GROK_BIN=/app/bin/grok \
+    GROK_CREATURE_INPUT_DIR=/app/input \
+    GROK_CREATURE_WORKSPACE_ROOT=/data/workspaces \
+    GROK_CREATURE_CONFIG_DIR=/data/grok-config \
+    GROK_CREATURE_PERMISSION_MODE=bypassPermissions
+
+# Serve prompts over the signaling API (the gateway path). With no gateway env
+# injected, the same entrypoint answers one task from /app/input and exits — the
+# offline self-test.
+CMD ["node", "/app/caspar/runtime.mjs"]

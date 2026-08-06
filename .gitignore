@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Caspar creature build artifacts (see caspar/README.md)
+/bin/grok
+/out
