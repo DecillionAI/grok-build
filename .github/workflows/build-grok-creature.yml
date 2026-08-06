@@ -1,0 +1,179 @@
+# ─────────────────────────────────────────────────────────────
+# build-grok-creature — pre-build the Grok Build creature binary
+# ─────────────────────────────────────────────────────────────
+# Compiles the `grok` CLI **from this repository's own crates/** (never a
+# downloaded release), packages it with the caspar/ signaling bridge into a
+# portable bundle, and publishes it three ways:
+#
+#   1. workflow artifact        — bundle.tar.gz + grok + manifest.json
+#   2. GitHub Release assets    — on a v* tag (or a manual run with make_release)
+#   3. prebuilt container image — pushed to GHCR (ghcr.io/<owner>/grok-build-creature)
+#
+# The point is to do the heavy build ONCE, here, so the later Caspar deploy is
+# lightweight: it either pulls the prebuilt image, or feeds bundle.tar.gz to
+# `scripts/deploy_grok_creature.py` with GROK_CLI_SOURCE=prebuilt — in which the
+# node's image build is a copy, not a cargo build of the whole workspace.
+#
+# It is NOT on every push: a full release build of this workspace is expensive, and
+# the deploy host builds its own copy anyway (decillionai-server's ci-deploy.sh runs
+# scripts/package-creature.sh). Run it by hand, or tag a release, when you want a
+# published artifact/image.
+# ─────────────────────────────────────────────────────────────
+name: build-grok-creature
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: "Build and push the prebuilt image to GHCR."
+        required: false
+        type: boolean
+        default: true
+      make_release:
+        description: "Attach the bundle to a GitHub Release (always on for v* tags)."
+        required: false
+        type: boolean
+        default: false
+
+# Least privilege: read the repo, write Releases, write GHCR packages.
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-grok-creature-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1) Build the CLI from source and package the portable bundle ───────────
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        # The proto build resolves bin/protoc through DotSlash; the system protoc
+        # is the supported alternative and needs no download at build time.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: grok-creature-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: grok-creature-cargo-
+
+      - name: Build + package the creature bundle (from crates/, not a release download)
+        env:
+          OUT_DIR: out
+        run: bash scripts/package-creature.sh
+
+      - name: Show manifest
+        run: cat out/manifest.json
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-build-creature-bundle
+          path: |
+            out/bundle.tar.gz
+            out/manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.make_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('creature-{0}', github.sha) }}
+          name: Grok Build creature ${{ github.sha }}
+          body: |
+            Pre-built Grok Build creature binary, compiled from this repository's
+            `crates/` (not a published release download).
+
+            - `bundle.tar.gz` — portable build context (`bin/grok` + the `caspar/` bridge).
+              Deploy lightweight with `GROK_CLI_SOURCE=prebuilt`, or build
+              `caspar/Dockerfile.prebuilt` against it.
+            - `manifest.json` — version, git sha, sizes, the build host's glibc.
+
+            Prebuilt image: `ghcr.io/${{ github.repository_owner }}/grok-build-creature`
+          files: |
+            out/bundle.tar.gz
+            out/manifest.json
+          fail_on_unmatched_files: true
+
+  # ── 2) Build the prebuilt runtime image and push it to GHCR ────────────────
+  image:
+    needs: bundle
+    runs-on: ubuntu-latest
+    # Push by default; a manual run can opt out with push_image=false.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+    steps:
+      - name: Checkout (for caspar/Dockerfile.prebuilt)
+        uses: actions/checkout@v4
+
+      - name: Download the prebuilt bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-build-creature-bundle
+          path: out
+
+      - name: Assemble the docker build context
+        run: |
+          mkdir -p context
+          cp out/bundle.tar.gz context/bundle.tar.gz
+          cp caspar/Dockerfile.prebuilt context/Dockerfile.prebuilt
+          ls -lh context
+
+      - name: Lowercase the image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/grok-build-creature" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Build and push the prebuilt creature image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./context
+          file: ./context/Dockerfile.prebuilt
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Prebuilt Grok Build creature image"
+            echo ""
+            echo "Pushed tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

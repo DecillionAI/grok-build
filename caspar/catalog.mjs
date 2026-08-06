@@ -1,0 +1,150 @@
+/**
+ * The space's tool catalog, expressed as MCP tools.
+ *
+ * The Decillion backend sends `config.tools` with every prompt: one entry per
+ * creature the space's agents may employ (the project's cloud sandbox, published
+ * tools, sub-agents). Each entry carries the routing ids needed to *signal* that
+ * creature (`program_id`, `entity_id`, `creature_id`), its input schema
+ * (`arg_schema` + `required`), its default routing `function`, and — crucially —
+ * `defaults`: arguments the platform pins onto every call (e.g. the space id a
+ * per-space tool is bound to).
+ *
+ * We surface each entry to Grok as an MCP tool so the model can call it
+ * with real argument names, and execute the call by signalling the creature over
+ * the gateway (see `toolInvoker.mjs`). Pinned `defaults` are applied AFTER the
+ * model's own arguments, so an agent can neither forget the binding nor point a
+ * tool at another space's resources by naming a different id.
+ */
+
+/** MCP tool names must be stable, unique and free of protocol-hostile characters. */
+export function mcpToolName(entry, taken = new Set()) {
+  const raw = String(entry.name || entry.tool_id || entry.toolId || "tool");
+  let base = raw
+    .replace(/[^A-Za-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+  if (!base) base = "tool";
+  let name = base;
+  let n = 2;
+  while (taken.has(name)) {
+    name = `${base}_${n++}`;
+  }
+  taken.add(name);
+  return name;
+}
+
+const SCHEMA_TYPES = new Set(["string", "number", "integer", "boolean", "object", "array"]);
+
+/** Normalise a catalog `arg_schema` into a JSON-Schema `properties` map. */
+function properties(entry) {
+  const argSchema = entry.arg_schema || entry.argSchema || {};
+  const props = {};
+  for (const [name, spec] of Object.entries(argSchema)) {
+    if (!name) continue;
+    const raw = spec && typeof spec === "object" ? spec : {};
+    const type = SCHEMA_TYPES.has(String(raw.type || "").toLowerCase()) ? String(raw.type).toLowerCase() : "string";
+    props[name] = { type, description: String(raw.description || raw.desc || "") };
+    if (Array.isArray(raw.enum) && raw.enum.length) props[name].enum = raw.enum;
+  }
+  return props;
+}
+
+/**
+ * A multi-function creature (the per-space sandbox: exec/write/read/…) is one
+ * catalog entry whose function comes from the model's arguments. Expose that
+ * explicitly so the model can pick a function instead of guessing.
+ */
+function withFunctionArg(props, entry) {
+  const functions = Array.isArray(entry.functions) ? entry.functions.filter((f) => typeof f === "string" && f) : [];
+  if (!functions.length || props.function) return props;
+  return {
+    ...props,
+    function: {
+      type: "string",
+      description: `Which operation of this creature to run (default "${entry.function || "invoke"}")`,
+      enum: functions,
+    },
+  };
+}
+
+/** Describe a catalog entry for the model: what it is and how to talk to it. */
+function describe(entry) {
+  const bits = [];
+  if (entry.description) bits.push(String(entry.description));
+  if (entry.kind === "agent") bits.push("This is another agent — talk to it in prose.");
+  if (entry.category) bits.push(`Category: ${entry.category}.`);
+  if (entry.risk) bits.push(`Risk: ${entry.risk}.`);
+  const pinned = entry.defaults && typeof entry.defaults === "object" ? Object.keys(entry.defaults) : [];
+  if (pinned.length) bits.push(`The platform pins ${pinned.join(", ")} for you — do not pass them.`);
+  return bits.join(" ") || String(entry.name || entry.tool_id || "creature");
+}
+
+/**
+ * Build the MCP tool definitions for a catalog, plus the name → entry map the
+ * invoker needs. Entries with no routable target are dropped: handing a live
+ * agent a tool that cannot be reached only produces confident failures.
+ */
+export function buildToolDefinitions(catalog) {
+  const tools = [];
+  const byName = new Map();
+  const taken = new Set();
+  for (const entry of Array.isArray(catalog) ? catalog : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const target = entry.program_id || entry.programId || entry.machine_id || entry.tool_id || entry.creature_id || "";
+    if (!target) continue;
+    const name = mcpToolName(entry, taken);
+    const props = withFunctionArg(properties(entry), entry);
+    const required = Array.isArray(entry.required) ? entry.required.filter((r) => r in props) : Object.keys(props).filter((k) => k !== "function");
+    tools.push({
+      name,
+      description: describe(entry),
+      inputSchema: { type: "object", properties: props, required },
+    });
+    byName.set(name, entry);
+  }
+  return { tools, byName };
+}
+
+/**
+ * Union two catalogs, keyed by the creature's routing id. `primary`
+ * (`config.tools` from the backend) is authoritative and always kept — it
+ * carries the platform-pinned `defaults` (e.g. the bound `space_id`) that
+ * live-discovered entries cannot know. `extra` (from `discovery.mjs`) only
+ * contributes creatures the primary did not already list, so an agent sees the
+ * space's full roster without ever losing a binding.
+ */
+export function mergeCatalogs(primary, extra) {
+  const keyOf = (e) => String(e?.program_id || e?.programId || e?.tool_id || e?.creature_id || e?.creatureId || e?.name || "");
+  const out = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(primary) ? primary : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = keyOf(entry);
+    if (key) seen.add(key);
+    out.push(entry);
+  }
+  for (const entry of Array.isArray(extra) ? extra : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = keyOf(entry);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * The arguments actually sent to a creature: the model's, with the platform's
+ * pinned `defaults` applied on top (they win by design), and nulls dropped.
+ */
+export function mergeArgs(entry, args) {
+  const payload = {};
+  for (const [k, v] of Object.entries(args && typeof args === "object" ? args : {})) {
+    if (v !== null && v !== undefined) payload[k] = v;
+  }
+  const defaults = entry.defaults && typeof entry.defaults === "object" ? entry.defaults : {};
+  for (const [k, v] of Object.entries(defaults)) {
+    if (v !== null && v !== undefined) payload[k] = v;
+  }
+  return payload;
+}
