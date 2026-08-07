@@ -251,7 +251,7 @@ def main() -> int:
         ok("image already built from this exact context — no rebuild to wait for")
     else:
         wait_for_image(program_id, entity_id, timeout=int(env_any("SANDBOX_REBUILD_TIMEOUT", default="480")),
-                       prev_image_id=prev_image_id, expect_context=digest)
+                       prev_image_id=prev_image_id, expect_context=digest, client=client)
     ok(f"{TOOL_ID} creature deployed: program={program_id} entity={entity_id}")
 
     if reminted:

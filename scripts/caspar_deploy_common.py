@@ -400,8 +400,33 @@ def docker_image_context(program_id: str, entity_id: str) -> str:
         return ""
 
 
+def build_log_lines(client) -> List[str]:
+    """The node's docker BUILD output.
+
+    The runtime emits image-build output before any VM exists, onto a node-wide
+    stream: vm id ``main``, log type ``build`` (see the docker plugin's
+    ``emit_vm_log`` calls, and the readVmLogs handler which deliberately leaves
+    build streams readable by any authenticated user). That is the only place the
+    reason for a failed or slow build is written — polling for the image only ever
+    says "still not there".
+    """
+    if client is None:
+        return []
+    try:
+        from caspar_signaling import log_text  # local import: same directory
+
+        return [log_text(entry).rstrip() for entry in client.read_vm_logs("main", "build", count=400)]
+    except Exception:  # noqa: BLE001 — diagnostics must never break a deploy
+        return []
+
+
+# Lines that mean the build is over and failed. The plugin turns a bollard build
+# error into `docker build failed: …` after echoing the daemon's own message.
+_BUILD_FAILURE_MARKERS = ("docker build failed", "failed to solve", "returned a non-zero code")
+
+
 def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
-                   prev_image_id: str = "", expect_context: str = "") -> bool:
+                   prev_image_id: str = "", expect_context: str = "", client=None) -> bool:
     """Wait until the node has (re)built the entity's image.
 
     The node builds asynchronously and only re-tags on success, so on a redeploy the
@@ -427,7 +452,24 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
     # exactly what this looked like from the CI log. Report progress while waiting.
     heartbeat = float(env_any("CASPAR_WAIT_HEARTBEAT_SECS", default="30")) or 30.0
     next_beat = started + heartbeat
+    # Echo the node's own build output as it happens. This is the difference
+    # between "10 minutes and no progress" and watching the base image pull, the
+    # apt install and the bundle download go by — or seeing exactly which step
+    # failed, immediately, instead of at the end of a 900s timeout.
+    printed = 0
     while time.time() < deadline:
+        lines = build_log_lines(client)
+        if len(lines) < printed:  # the stream rotated; resync rather than skip
+            printed = 0
+        for line in lines[printed:]:
+            if line:
+                print(f"    build | {line[:400]}", flush=True)
+        printed = len(lines)
+        failure = next((line for line in lines if any(m in line.lower() for m in _BUILD_FAILURE_MARKERS)), "")
+        if failure:
+            bad(f"the node's image build FAILED: {failure[:400]}")
+            bad("the container will keep running whatever image it had before this deploy")
+            return False
         if expect_context:
             built = images_with_context(expect_context)
             if built:
