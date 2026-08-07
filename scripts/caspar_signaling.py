@@ -248,14 +248,30 @@ class CasparSignalingClient:
         return r.get("logs", []) if isinstance(r, dict) else []
 
     def wait_for_vm_log(self, vm_id: str, marker: str, *, timeout: float = 90.0,
-                        poll: float = 2.0) -> Tuple[bool, List[Any]]:
-        """Poll VM logs until a line containing ``marker`` appears, or time out."""
-        deadline = time.time() + timeout
+                        poll: float = 2.0, heartbeat: float = 30.0) -> Tuple[bool, List[Any]]:
+        """Poll VM logs until a line containing ``marker`` appears, or time out.
+
+        Prints a heartbeat while waiting: a container that is still booting (or an
+        image the node is still building) can take minutes, and a wait that says
+        nothing for that long reads as a hung deploy. The heartbeat also shows the
+        container's own most recent line, so progress is visible as it happens
+        rather than only in the post-mortem.
+        """
+        started = time.time()
+        deadline = started + timeout
+        next_beat = started + heartbeat
         logs: List[Any] = []
         while time.time() < deadline:
             logs = self.read_vm_logs(vm_id)
             if any(marker in log_text(entry) for entry in logs):
                 return True, logs
+            now = time.time()
+            if heartbeat and now >= next_beat:
+                lines = [log_text(entry).strip() for entry in logs]
+                lines = [line for line in lines if line]
+                latest = lines[-1][:160] if lines else "(no output from the container yet)"
+                info(f"  … waiting for {marker} — {int(now - started)}s of {int(timeout)}s; last log: {latest}")
+                next_beat = now + heartbeat
             time.sleep(poll)
         return False, logs
 
@@ -380,6 +396,10 @@ def find_correlated_signal(message: Any, correlation_id: str) -> Optional[Dict[s
         return None
 
     return walk(message)
+
+
+def info(message: str) -> None:
+    print(f"\033[36m[deploy]\033[0m {message}", flush=True)
 
 
 def log_text(entry: Any) -> str:

@@ -21,6 +21,10 @@
 # from the node — GitHub release assets are, which is why the backbone repo
 # publishes a rolling `creature-<branch>` release.
 #
+# The download is tightly bounded (connect 20s, 300s per attempt, 2 retries) on
+# purpose: a builder that cannot reach the asset should fail this layer in minutes
+# with a visible curl error, not stall the deploy for the better part of an hour.
+#
 # glibc: the binary is built on the backbone repo's CI (ubuntu-22.04, glibc 2.35)
 # and run here, so the runtime base must be at least as new. Debian trixie (2.41)
 # is, comfortably. Override with --build-arg RUNTIME_BASE=… if you need another.
@@ -62,7 +66,8 @@ LABEL org.decillion.grok-bundle-url=$GROK_BUNDLE_URL
 RUN test -n "$GROK_BUNDLE_URL" \
       || { echo "ERROR: GROK_BUNDLE_URL is empty — the deployer must pass the published bundle URL" >&2; exit 1; } \
     && echo "fetching the agent binary: $GROK_BUNDLE_URL (built from ${GROK_BUNDLE_SHA})" \
-    && curl -fsSL --retry 3 --retry-delay 2 --max-time 900 -o /tmp/grok-bundle.tar.gz "$GROK_BUNDLE_URL" \
+    && curl -fsSL --connect-timeout 20 --retry 2 --retry-delay 5 --max-time 300 \
+         -o /tmp/grok-bundle.tar.gz "$GROK_BUNDLE_URL" \
     && tar -xzf /tmp/grok-bundle.tar.gz -C /app bin/grok \
     && rm -f /tmp/grok-bundle.tar.gz \
     && chmod +x /app/bin/grok \

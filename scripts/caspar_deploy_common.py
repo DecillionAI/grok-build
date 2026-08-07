@@ -382,8 +382,13 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
              "— skipping the image wait (add this user to the docker group, or allow passwordless sudo, "
              "to get build observability back). The entity's readiness check is the real signal.")
         return True
-    deadline = time.time() + timeout
+    started = time.time()
+    deadline = started + timeout
     info(f"waiting for the node to build image {tag} (≤{timeout}s)…")
+    # A silent 15-minute wait is indistinguishable from a hung deploy — and that is
+    # exactly what this looked like from the CI log. Report progress while waiting.
+    heartbeat = float(env_any("CASPAR_WAIT_HEARTBEAT_SECS", default="30")) or 30.0
+    next_beat = started + heartbeat
     while time.time() < deadline:
         if expect_context and docker_image_context(program_id, entity_id) == expect_context:
             ok(f"image built from the deployed context: {tag}")
@@ -395,6 +400,11 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
         if not prev_image_id and not expect_context and current:
             ok(f"image present: {tag}")
             return True
+        now = time.time()
+        if now >= next_beat:
+            info(f"  … still building {tag} — {int(now - started)}s elapsed of {timeout}s "
+                 f"(the node builds asynchronously; this only watches)")
+            next_beat = now + heartbeat
         time.sleep(3)
     warn(f"image {tag} did not appear/change within {timeout}s — proceeding with the current image; "
          "check the node's build logs if the entity misbehaves (a host that cannot query docker "
