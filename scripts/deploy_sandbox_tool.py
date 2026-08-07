@@ -64,7 +64,7 @@ from caspar_deploy_common import (  # noqa: E402
     b64_file,
     bad,
     bake_snippet,
-    docker_image_context,
+    image_built_for_context,
     docker_image_id,
     env_any,
     info,
@@ -207,7 +207,9 @@ def main() -> int:
 
     files = build_context()
     dockerfile, digest = compose_dockerfile(files)
-    already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
+    # Does an image built from exactly this context already exist? Asked by
+    # LABEL, because the node names images by machine id, not program id.
+    already_current = image_built_for_context(digest)
 
     def push(pid: str) -> None:
         client.deploy(pid, entity_id, "docker", b64_bytes(dockerfile), files_b64=files,
