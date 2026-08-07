@@ -71,12 +71,39 @@ concurrency:
 jobs:
   # ── 1) Build the CLI from source and package the portable bundle ───────────
   bundle:
-    # Pinned to the OLDEST supported runner on purpose. The binary is dynamically
-    # linked, so the glibc it is built against is a *floor* on every machine that
-    # later runs it — the creature image (Debian trixie, 2.41) and the deploy host
-    # that smoke-tests the download. Building on 22.04 (glibc 2.35) keeps that
-    # floor low; building on the newest runner would strand older hosts.
-    runs-on: ubuntu-22.04
+    # Built once per CPU architecture. The `grok` binary is a native ELF, so it
+    # only runs on the arch it was compiled for — an amd64 binary on an arm64
+    # (Graviton) deploy host dies with `Exec format error` at the image build's
+    # `grok --version` smoke test, which is exactly what stranded the arm64 host.
+    # So publish BOTH: an amd64 `bundle.tar.gz` (the historical asset name, kept
+    # unchanged) and an arm64 `bundle-arm64.tar.gz`; the deploy pulls the one that
+    # matches its host (see decillionai-server ci-deploy.sh + deploy_grok_creature.py).
+    #
+    # Each leg is pinned to the OLDEST supported runner of its arch on purpose. The
+    # binary is dynamically linked, so the glibc it is built against is a *floor* on
+    # every machine that later runs it — the creature image (Debian trixie, 2.41)
+    # and the deploy host that smoke-tests the download. Building on 22.04 (glibc
+    # 2.35) keeps that floor low; building on the newest runner would strand older
+    # hosts.
+    strategy:
+      fail-fast: false
+      # Serialize the two arches: both publish to the SAME rolling release
+      # (creature-<branch>), and softprops/action-gh-release racing to create that
+      # release from two jobs at once can 422. One at a time is plenty — the cargo
+      # cache makes the second leg cheap. amd64 goes first so, if arm64 hosted
+      # runners are ever unavailable, the historical amd64 asset still publishes.
+      max-parallel: 1
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            bundle_asset: bundle.tar.gz
+            manifest_asset: manifest.json
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            bundle_asset: bundle-arm64.tar.gz
+            manifest_asset: manifest-arm64.json
+    runs-on: ${{ matrix.runner }}
     outputs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
     steps:
@@ -97,24 +124,34 @@ jobs:
             ~/.cargo/git
             target
             .protoc-cache
-          key: grok-creature-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'bin/protoc') }}
-          restore-keys: grok-creature-cargo-
+          key: grok-creature-cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'bin/protoc') }}
+          restore-keys: grok-creature-cargo-${{ matrix.arch }}-
 
       - name: Build + package the creature bundle (from crates/, not a release download)
         env:
           OUT_DIR: out
         run: bash scripts/package-creature.sh
 
+      - name: Name the bundle assets for ${{ matrix.arch }}
+        # package-creature.sh always writes out/bundle.tar.gz + out/manifest.json.
+        # amd64 keeps those historical names; arm64 gets the -arm64 suffix so both
+        # arches can live on the one rolling release without clobbering each other.
+        run: |
+          if [ "${{ matrix.arch }}" != "amd64" ]; then
+            cp -f out/bundle.tar.gz "out/${{ matrix.bundle_asset }}"
+            cp -f out/manifest.json "out/${{ matrix.manifest_asset }}"
+          fi
+
       - name: Show manifest
-        run: cat out/manifest.json
+        run: cat "out/${{ matrix.manifest_asset }}"
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: grok-build-creature-bundle
+          name: grok-build-creature-bundle-${{ matrix.arch }}
           path: |
-            out/bundle.tar.gz
-            out/manifest.json
+            out/${{ matrix.bundle_asset }}
+            out/${{ matrix.manifest_asset }}
           if-no-files-found: error
           retention-days: 30
 
@@ -138,7 +175,9 @@ jobs:
         # Every build publishes, because the deploy host can only fetch releases:
         # its token cannot read this repo's workflow artifacts (cross-org, and the
         # artifacts API needs auth even for public repos). Re-running on the same
-        # branch updates the release in place, so the URL never changes.
+        # branch updates the release in place, so the URL never changes. Each arch
+        # leg uploads only its own asset pair, so the two legs are additive on the
+        # shared rolling release rather than overwriting one another.
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
@@ -150,17 +189,23 @@ jobs:
           body: |
             Pre-built Grok Build creature binary, compiled from this repository's
             `crates/` at `${{ github.sha }}` (not a published release download).
+            Published per CPU architecture — the deploy pulls the asset matching
+            its host:
 
-            - `bundle.tar.gz` — portable build context (`bin/grok` + the `caspar/`
-              bridge). This is what `decillionai-server`'s deploy downloads and
-              wraps in the creature image (`caspar/Dockerfile.prebuilt`); deploy it
-              by hand with `GROK_CLI_SOURCE=prebuilt`.
-            - `manifest.json` — version, git sha, sizes, the build host's glibc.
+            - `bundle.tar.gz` / `manifest.json` — **amd64/x86_64**.
+            - `bundle-arm64.tar.gz` / `manifest-arm64.json` — **arm64/aarch64**
+              (e.g. AWS Graviton deploy hosts).
+
+            Each `bundle*.tar.gz` is a portable build context (`bin/grok` + the
+            `caspar/` bridge) that `decillionai-server`'s deploy downloads and wraps
+            in the creature image (`caspar/Dockerfile.fetch`); the matching
+            `manifest*.json` carries the version, git sha, sizes, build glibc and
+            build arch.
 
             Prebuilt image: `ghcr.io/${{ github.repository_owner }}/grok-build-creature`
           files: |
-            out/bundle.tar.gz
-            out/manifest.json
+            out/${{ matrix.bundle_asset }}
+            out/${{ matrix.manifest_asset }}
           fail_on_unmatched_files: true
 
   # ── 2) Build the prebuilt runtime image and push it to GHCR ────────────────
@@ -174,9 +219,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download the prebuilt bundle
+        # The GHCR image is amd64 (ubuntu-latest is x86_64); take the amd64 leg's
+        # artifact, which carries the historical out/bundle.tar.gz name.
         uses: actions/download-artifact@v4
         with:
-          name: grok-build-creature-bundle
+          name: grok-build-creature-bundle-amd64
           path: out
 
       - name: Assemble the docker build context
