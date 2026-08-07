@@ -256,6 +256,29 @@ Key knobs (all documented in the script's header):
 | `GROK_BUNDLE_URL` | Which published bundle the image fetches. Derived from the checkout's remote + branch when unset |
 | `GROK_MAX_DEPLOY_MB` | Refuse a deploy payload over this (default 16), instead of letting the node close the socket on an oversized frame |
 | `GROK_VM_RAM_MB` / `_DISK_GB` / `_CPUS` / `_MAX_SECONDS` | VM resources (defaults 2048 MB / 8 GB / 2 cpu / unlimited) |
+| `GROK_READY_TIMEOUT` | How long to wait for the creature's `GROK_READY` line (default 180s, or 600s when the image build cannot be observed from the deploy host) |
+| `GROK_RESTART_ON_NOT_READY` | `1` (default) — restart the entity once when it never reports ready, which is what picks up an image that finished building after the first start |
+
+### Why a deploy can "succeed" with the old creature still serving
+
+The node builds the image **asynchronously** and `runEntity` starts whatever image
+the tag currently points at. So on a host where the deploy cannot query docker (the
+deploy user is not in the docker group), three things used to compound:
+
+1. the image wait polled a docker it could not talk to, got nothing, and burned its
+   whole timeout before warning about an image it never had a way to see;
+2. `runEntity` then started the container — possibly from the **previous** image,
+   because the build was still running;
+3. the readiness check reported only "no GROK_READY", which looks the same whether
+   the build failed, is still going, or an old container is happily serving.
+
+Now: the deploy probes docker once (plain, then `sudo -n`) and skips the pointless
+wait outright when it cannot observe builds; the readiness wait becomes the real
+signal and is given longer in that case; a creature that does not report ready is
+**restarted once**, which is exactly what picks up a just-finished image; and if it
+still does not come up, the VM log tail is printed with the case named — previous
+backbone (`CLAUDE_*` sentinels), this build failing to reach the gateway
+(`GROK_BOOT`), or no output at all (the build produced nothing runnable).
 
 ### Being the platform's agent backbone, with zero Decillion changes
 

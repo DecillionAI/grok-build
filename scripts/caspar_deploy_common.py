@@ -24,7 +24,7 @@ import stat
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 GREEN, RED, YELLOW, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;33m", "\033[0;36m", "\033[0m"
 
@@ -306,10 +306,40 @@ def image_tag(program_id: str, entity_id: str) -> str:
     return f"{program_id.replace('@', '_')}/{entity_id}"
 
 
+# How this process talks to docker, resolved once. The node builds creature images
+# on its own docker daemon; this script only *observes* that. On a host where the
+# deploy user is not in the docker group the plain CLI fails, and every observation
+# silently returns "" — which used to mean the build wait burned its whole timeout
+# on every deploy and then warned about an image it was never able to see.
+_DOCKER_CLI: Optional[List[str]] = None
+_DOCKER_PROBED = False
+
+
+def docker_cli() -> Optional[List[str]]:
+    """The docker command this process can actually use, or None if there is none."""
+    global _DOCKER_CLI, _DOCKER_PROBED  # noqa: PLW0603 — a process-wide probe, done once
+    if _DOCKER_PROBED:
+        return _DOCKER_CLI
+    _DOCKER_PROBED = True
+    for candidate in (["docker"], ["sudo", "-n", "docker"]):
+        try:
+            out = subprocess.run([*candidate, "version", "--format", "{{.Server.Version}}"],
+                                 capture_output=True, text=True, timeout=15)
+            if out.returncode == 0:
+                _DOCKER_CLI = candidate
+                return _DOCKER_CLI
+        except Exception:  # noqa: BLE001 — try the next way in
+            continue
+    return None
+
+
 def docker_image_id(program_id: str, entity_id: str) -> str:
     """Current image id for a program/entity tag, or "" (also when docker is unreachable)."""
+    cli = docker_cli()
+    if not cli:
+        return ""
     try:
-        out = subprocess.run(["docker", "images", "--no-trunc", "--format", "{{.ID}}", image_tag(program_id, entity_id)],
+        out = subprocess.run([*cli, "images", "--no-trunc", "--format", "{{.ID}}", image_tag(program_id, entity_id)],
                              capture_output=True, text=True, timeout=15)
         lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
         return lines[0] if lines else ""
@@ -319,9 +349,12 @@ def docker_image_id(program_id: str, entity_id: str) -> str:
 
 def docker_image_context(program_id: str, entity_id: str) -> str:
     """The context digest baked into the current image, or "" when absent."""
+    cli = docker_cli()
+    if not cli:
+        return ""
     try:
         out = subprocess.run(
-            ["docker", "inspect", "--format", '{{index .Config.Labels "' + CONTEXT_LABEL + '"}}',
+            [*cli, "inspect", "--format", '{{index .Config.Labels "' + CONTEXT_LABEL + '"}}',
              image_tag(program_id, entity_id)],
             capture_output=True, text=True, timeout=15)
         return out.stdout.strip() if out.returncode == 0 else ""
@@ -339,6 +372,16 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
     satisfied, so a no-op rebuild returns at once).
     """
     tag = image_tag(program_id, entity_id)
+    if not docker_cli():
+        # Polling would ask a docker this process cannot talk to, get "" every time,
+        # and burn the entire timeout before warning about an image it never had a
+        # way to see. Say so once and move on: the entity's readiness check (its
+        # first log line) is the real evidence that the build produced something
+        # runnable, and it costs minutes instead of a quarter of an hour.
+        warn(f"cannot query docker from this process, so the node's build of {tag} is not observable here "
+             "— skipping the image wait (add this user to the docker group, or allow passwordless sudo, "
+             "to get build observability back). The entity's readiness check is the real signal.")
+        return True
     deadline = time.time() + timeout
     info(f"waiting for the node to build image {tag} (≤{timeout}s)…")
     while time.time() < deadline:
