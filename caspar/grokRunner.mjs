@@ -285,13 +285,31 @@ export const DEFAULT_BUILTIN_FS_TOOLS = [
 // on regardless of an allowlist, but a deny list would still strip them.
 
 /**
- * Which built-in tools to deny for this run — the shell + filesystem set, ALWAYS
- * (the agent works on the space's sandbox, never its private container). Not gated
- * on a sandbox being present: the requirement is that these are never a fallback.
+ * Which built-in tools to deny for this run.
+ *
+ * Two modes:
+ *
+ *   1. **Sandbox backend active** (`opts.sandboxActive === true`): grok's
+ *      built-in `bash` / `read_file` / `edit` / `list_dir` / `glob` / `grep` /
+ *      `task` / `get_task_output` / `kill_task` / … route to the space's
+ *      shared sandbox through the Rust `SandboxTerminalBackend` +
+ *      `SandboxFileSystem`. Nothing needs disabling — they are literally the
+ *      way the agent reaches the sandbox now. Returning `[]` also unblocks
+ *      the `task` tool's requirement on `get_task_output` + `kill_task`,
+ *      which the old deny list stripped and which caused
+ *      "Requirements unsatisfied: [RequirementError { tool: GrokBuild:task }]"
+ *      at session init.
+ *
+ *   2. **No sandbox** (self-tests, local dev): keep the legacy behaviour —
+ *      deny the whole shell + filesystem set so an agent never does throwaway
+ *      work inside its private container that its teammates never see. This
+ *      is the pre-sandbox-backend behaviour.
+ *
  * `GROK_CREATURE_FORCE_SANDBOX_FS=0` turns the enforcement off entirely;
  * `GROK_CREATURE_DISALLOWED_TOOLS` overrides the exact list.
  */
-export function disallowedBuiltinTools({ env = process.env } = {}) {
+export function disallowedBuiltinTools({ env = process.env, sandboxActive = false } = {}) {
+  if (sandboxActive) return [];
   if (!creatureFlag("FORCE_SANDBOX_FS", true, env)) return [];
   const override = creatureList("DISALLOWED_TOOLS", env);
   if (override.length) return override;
@@ -383,6 +401,9 @@ export function newSessionId() {
  * @param opts.maxWallSeconds hard wall-clock ceiling for the run
  * @param opts.onMessage      called with every parsed stream-json message
  * @param opts.onStderr       called with the child's stderr chunks (diagnostics)
+ * @param opts.extraEnv       extra env vars merged into the child (used e.g.
+ *                            to point the child at the sandbox bridge socket
+ *                            via `GROK_SANDBOX_SOCKET`).
  * @returns `{ result, messages, exitCode, timedOut, stderr, argv, warnings, backbone, sessionId }`
  */
 export async function runGrok(opts) {
@@ -403,6 +424,7 @@ export async function runGrok(opts) {
     onStderr,
     env = process.env,
     tempDir,
+    extraEnv,
   } = opts;
 
   const warnings = [];
@@ -430,7 +452,13 @@ export async function runGrok(opts) {
     warning,
     provider,
     credential,
-  } = buildChildEnv({ env, llm, grokHome, home: drop ? drop.home : undefined });
+  } = buildChildEnv({
+    env,
+    llm,
+    grokHome,
+    home: drop ? drop.home : undefined,
+    extra: extraEnv && typeof extraEnv === "object" ? extraEnv : undefined,
+  });
   if (warning) warnings.push(warning);
 
   const chosenModel = llmModel || model;

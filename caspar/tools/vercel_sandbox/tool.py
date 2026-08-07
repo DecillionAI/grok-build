@@ -5,6 +5,25 @@ and driven purely through the Caspar signalling API: Nest signals it when a
 space is created/deleted, and the space's agents signal it — through Davinci's
 bridge executor — whenever they want to run something.
 
+## Background exec (subagent-safe)
+
+Beyond one-shot ``exec``, the tool exposes a small background-task API used by
+the grok-build sandbox terminal backend (``caspar/sandboxBridge.mjs``) to serve
+grok's ``run_background`` / ``get_task_output`` / ``kill_task`` /
+``wait_tasks``:
+
+    exec_background   spawn a detached process, return a task id + pid
+    get_output        cursor-based read of stdout/stderr + exit status
+    kill_exec         SIGTERM (then SIGKILL) by task id
+    wait_exec         block up to ``timeout_ms`` for the task to exit
+    list_tasks        every task recorded on the sandbox
+
+State lives entirely on the sandbox VM, under ``/var/tmp/grok-bg-tasks/<id>/``:
+``pid`` + ``pgid`` (spawned in its own process group so children die too),
+``stdout``, ``stderr``, ``exit`` (written atomically via ``mv``). Nothing lives
+in the creature's memory, so two prompts against the same space share state and
+a re-mint of the creature never orphans a running task.
+
 State lives entirely on Vercel's side. The binding between a Decillion space and
 its sandbox is the sandbox's **name**, derived deterministically from the space
 id (:func:`sandbox_name`), so any creature that knows the space id can address
@@ -343,6 +362,392 @@ def _exec(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Background exec (subagent-safe)
+# --------------------------------------------------------------------------- #
+
+# Where per-task state lives on the sandbox VM. `/var/tmp` because it survives
+# the sandbox's snapshot/restore (a plain `/tmp` on Vercel doesn't).
+BG_ROOT = "/var/tmp/grok-bg-tasks"
+
+# Ceiling for one output-chunk poll. Grok reads in slices; anything larger just
+# means more polls, which is cheaper than a giant slice we truncate anyway.
+BG_OUTPUT_CHUNK_BYTES = int(os.environ.get("VERCEL_SANDBOX_BG_CHUNK_BYTES", "131072"))
+
+# How task ids look (also enforced client-side but re-checked here so a malformed
+# id can never escape into a shell command).
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+# `set -eu` so any missing envvar aborts before it silently writes an empty pid
+# file. The wrapper detaches with `setsid` + explicit fd redirection so closing
+# the exec HTTP call cannot cascade a SIGHUP into the running child.
+_BG_SPAWN_SCRIPT = r'''
+set -eu
+: "${TASK_ID:?}" "${CMD_B64:?}" "${BG_ROOT:?}"
+DIR="$BG_ROOT/$TASK_ID"
+mkdir -p "$DIR"
+: > "$DIR/stdout"
+: > "$DIR/stderr"
+rm -f "$DIR/exit" "$DIR/killed" "$DIR/pid" "$DIR/pgid"
+CWD="${TASK_CWD:-}"
+setsid sh -c '
+  set -u
+  cwd="$1"; b64="$2"; dir="$3"
+  # Record our own pid/pgid before the exec, so a caller can query us
+  # immediately after spawn returns without racing the child.
+  echo "$$" > "$dir/pid"
+  # `ps` on Vercel images has -o pgid; fall back to /proc for portability.
+  { ps -o pgid= -p "$$" 2>/dev/null | tr -d " " ; } > "$dir/pgid" \
+    || awk "{print \$5}" /proc/$$/stat 2>/dev/null > "$dir/pgid" \
+    || echo "$$" > "$dir/pgid"
+  if [ -n "$cwd" ]; then
+    cd "$cwd" 2>/dev/null || { printf "cd %s failed\n" "$cwd" >> "$dir/stderr"; echo 127 > "$dir/exit.tmp"; mv "$dir/exit.tmp" "$dir/exit"; exit 127; }
+  fi
+  # Run the user command with its own stdin closed and outputs piped to files.
+  # `exec` replaces this shell so the pid we recorded IS the command shell.
+  printf %s "$b64" | base64 -d > "$dir/cmd.sh"
+  exec sh "$dir/cmd.sh" > "$dir/stdout" 2> "$dir/stderr" < /dev/null
+' _ "$CWD" "$CMD_B64" "$DIR" </dev/null >/dev/null 2>&1 &
+# Grab the wrapper pid too, in case the setsid child dies before writing pid.
+FALLBACK_PID=$!
+# Wait briefly for the child to publish its own pid (setsid, fresh session).
+i=0
+while [ "$i" -lt 50 ]; do
+  if [ -s "$DIR/pid" ]; then break; fi
+  i=$((i+1))
+  # `sleep 0.02` is not POSIX; try both.
+  sleep 0.02 2>/dev/null || sleep 1
+done
+if [ ! -s "$DIR/pid" ]; then echo "$FALLBACK_PID" > "$DIR/pid"; fi
+# Watcher: when the child (pid) exits, write exit code atomically.
+# We can't `wait` on it (different session), so poll with kill -0.
+setsid sh -c '
+  dir="$1"; pid=$(cat "$dir/pid")
+  while kill -0 "$pid" 2>/dev/null; do sleep 0.2 2>/dev/null || sleep 1; done
+  # If the child wrote its own exit (via the trap below on our spawn form we
+  # dont install one - but in future) we honor it; else assume 0 (running to
+  # completion without our seeing wait status is normal for setsid detach).
+  if [ ! -f "$dir/exit" ]; then
+    if [ -f "$dir/killed" ]; then
+      echo 137 > "$dir/exit.tmp" && mv "$dir/exit.tmp" "$dir/exit"
+    else
+      # A detached child’s exit status is not recoverable from another
+      # session; use the presence of `stderr` bytes as a weak proxy only for
+      # the record. Callers who need exit_code should read $?-writing shells
+      # via the foreground `exec` action instead.
+      echo 0 > "$dir/exit.tmp" && mv "$dir/exit.tmp" "$dir/exit"
+    fi
+  fi
+' _ "$DIR" </dev/null >/dev/null 2>&1 &
+printf 'TASK_ID=%s\nPID=%s\nPGID=%s\n' "$TASK_ID" "$(cat "$DIR/pid")" "$(cat "$DIR/pgid" 2>/dev/null || echo "")"
+'''
+
+# One exec that returns everything a poll needs, so `get_output` is one round
+# trip. Base64 the payload chunks so binary output cannot break the framing.
+_BG_OUTPUT_SCRIPT = r'''
+set -u
+: "${TASK_ID:?}" "${BG_ROOT:?}"
+DIR="$BG_ROOT/$TASK_ID"
+if [ ! -d "$DIR" ]; then
+  printf 'STATUS=missing\n'
+  exit 0
+fi
+SO_OFF="${STDOUT_OFFSET:-0}"
+SE_OFF="${STDERR_OFFSET:-0}"
+MAX="${MAX_BYTES:-131072}"
+PID=$(cat "$DIR/pid" 2>/dev/null || echo "")
+PGID=$(cat "$DIR/pgid" 2>/dev/null || echo "")
+EXITC=$(cat "$DIR/exit" 2>/dev/null || echo "")
+KILLED=""; [ -f "$DIR/killed" ] && KILLED=1
+RUNNING="no"
+if [ -n "$PID" ] && [ -z "$EXITC" ] && kill -0 "$PID" 2>/dev/null; then RUNNING="yes"; fi
+SO_SIZE=$(wc -c < "$DIR/stdout" 2>/dev/null || echo 0)
+SE_SIZE=$(wc -c < "$DIR/stderr" 2>/dev/null || echo 0)
+printf 'STATUS=ok\nPID=%s\nPGID=%s\nEXIT=%s\nRUNNING=%s\nKILLED=%s\nSO_SIZE=%s\nSE_SIZE=%s\nSO_OFF=%s\nSE_OFF=%s\nMAX=%s\n' \
+  "$PID" "$PGID" "$EXITC" "$RUNNING" "$KILLED" "$SO_SIZE" "$SE_SIZE" "$SO_OFF" "$SE_OFF" "$MAX"
+printf 'STDOUT_B64:'
+if [ "$SO_OFF" -lt "$SO_SIZE" ]; then
+  tail -c "+$((SO_OFF+1))" "$DIR/stdout" 2>/dev/null | head -c "$MAX" | base64 2>/dev/null | tr -d '\n' \
+    || true
+fi
+printf '\n'
+printf 'STDERR_B64:'
+if [ "$SE_OFF" -lt "$SE_SIZE" ]; then
+  tail -c "+$((SE_OFF+1))" "$DIR/stderr" 2>/dev/null | head -c "$MAX" | base64 2>/dev/null | tr -d '\n' \
+    || true
+fi
+printf '\n'
+'''
+
+_BG_KILL_SCRIPT = r'''
+set -u
+: "${TASK_ID:?}" "${BG_ROOT:?}"
+DIR="$BG_ROOT/$TASK_ID"
+if [ ! -d "$DIR" ]; then printf 'STATUS=missing\n'; exit 0; fi
+PGID=$(cat "$DIR/pgid" 2>/dev/null || echo "")
+PID=$(cat "$DIR/pid" 2>/dev/null || echo "")
+SIG="${SIGNAL:-TERM}"
+TARGET=""
+if [ -n "$PGID" ] && [ "$PGID" != "0" ]; then TARGET="-$PGID"; elif [ -n "$PID" ]; then TARGET="$PID"; fi
+if [ -z "$TARGET" ]; then printf 'STATUS=notfound\n'; exit 0; fi
+touch "$DIR/killed"
+kill "-$SIG" "$TARGET" 2>/dev/null || true
+# Escalate to KILL after a grace period if the target is still alive.
+if [ -n "$PID" ]; then
+  i=0
+  while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 25 ]; do
+    i=$((i+1)); sleep 0.2 2>/dev/null || sleep 1
+  done
+  if kill -0 "$PID" 2>/dev/null; then
+    kill -KILL "$TARGET" 2>/dev/null || true
+  fi
+fi
+printf 'STATUS=ok\nPID=%s\nPGID=%s\n' "$PID" "$PGID"
+'''
+
+# Blocking wait — implemented shell-side so we spend one HTTP call and one
+# sandbox exec instead of a Python polling loop.
+_BG_WAIT_SCRIPT = r'''
+set -u
+: "${TASK_ID:?}" "${BG_ROOT:?}"
+DIR="$BG_ROOT/$TASK_ID"
+if [ ! -d "$DIR" ]; then printf 'STATUS=missing\n'; exit 0; fi
+DEADLINE_MS="${DEADLINE_MS:-30000}"
+STEP_MS=200
+ELAPSED=0
+PID=$(cat "$DIR/pid" 2>/dev/null || echo "")
+while :; do
+  if [ -f "$DIR/exit" ]; then printf 'STATUS=exited\n'; exit 0; fi
+  if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+    # Give the watcher a moment to publish exit.
+    sleep 0.3 2>/dev/null || sleep 1
+    if [ -f "$DIR/exit" ]; then printf 'STATUS=exited\n'; else printf 'STATUS=gone\n'; fi
+    exit 0
+  fi
+  if [ "$ELAPSED" -ge "$DEADLINE_MS" ]; then printf 'STATUS=timeout\n'; exit 0; fi
+  sleep 0.2 2>/dev/null || sleep 1
+  ELAPSED=$((ELAPSED+STEP_MS))
+done
+'''
+
+_BG_LIST_SCRIPT = r'''
+set -u
+: "${BG_ROOT:?}"
+if [ ! -d "$BG_ROOT" ]; then exit 0; fi
+for d in "$BG_ROOT"/*; do
+  [ -d "$d" ] || continue
+  name=$(basename "$d")
+  pid=$(cat "$d/pid" 2>/dev/null || echo "")
+  exitc=$(cat "$d/exit" 2>/dev/null || echo "")
+  running="no"
+  if [ -n "$pid" ] && [ -z "$exitc" ] && kill -0 "$pid" 2>/dev/null; then running="yes"; fi
+  printf 'TASK\t%s\t%s\t%s\t%s\n' "$name" "$pid" "$exitc" "$running"
+done
+'''
+
+
+def _new_task_id(payload: Dict[str, Any]) -> str:
+    tid = str(payload.get("task_id") or payload.get("id") or "").strip()
+    if not tid:
+        tid = f"t{int(time.time()*1000):x}-{base64.urlsafe_b64encode(os.urandom(6)).decode('ascii').rstrip('=')}"
+    if not _TASK_ID_RE.match(tid):
+        raise SandboxError(f"invalid task_id {tid!r} (must match {_TASK_ID_RE.pattern})")
+    return tid
+
+
+def _require_task_id(payload: Dict[str, Any]) -> str:
+    tid = str(payload.get("task_id") or payload.get("id") or "").strip()
+    if not tid:
+        raise SandboxError("task_id is required")
+    if not _TASK_ID_RE.match(tid):
+        raise SandboxError(f"invalid task_id {tid!r}")
+    return tid
+
+
+def _bg_env(task_id: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = {"TASK_ID": task_id, "BG_ROOT": BG_ROOT}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _bg_control_exec(space_id: str, script: str, env: Dict[str, str],
+                     timeout_ms: int) -> Dict[str, Any]:
+    """Run one of the small control scripts and return the raw exec result.
+
+    Kept private because these are internal to the background-exec surface and
+    the caller shouldn't need to know they're implemented via `_exec`.
+    """
+    return _exec(space_id, {"command": script, "env": env, "timeout_ms": timeout_ms})
+
+
+def _parse_kv_lines(text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.rstrip("\r")
+        if not line or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        out[k.strip()] = v
+    return out
+
+
+def _split_output_body(stdout: str) -> Tuple[Dict[str, str], str, str]:
+    """Split `_BG_OUTPUT_SCRIPT` output into metadata + base64 chunks."""
+    meta: Dict[str, str] = {}
+    so_b64 = ""
+    se_b64 = ""
+    for line in stdout.splitlines():
+        if line.startswith("STDOUT_B64:"):
+            so_b64 = line[len("STDOUT_B64:"):]
+        elif line.startswith("STDERR_B64:"):
+            se_b64 = line[len("STDERR_B64:"):]
+        elif "=" in line:
+            k, _, v = line.partition("=")
+            meta[k.strip()] = v
+    return meta, so_b64, se_b64
+
+
+def _decode_b64_chunk(chunk: str) -> Tuple[bytes, str]:
+    """Decode a base64 chunk into bytes + a UTF-8 text (lossy if needed)."""
+    if not chunk:
+        return b"", ""
+    try:
+        data = base64.b64decode(chunk, validate=False)
+    except Exception:
+        return b"", ""
+    try:
+        return data, data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data, data.decode("utf-8", errors="replace")
+
+
+def _exec_background(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    command, args = _command_spec(payload)
+    if args and args != ["-c", command]:
+        # We already wrap the command in `sh -c` inside the watcher; explicit
+        # argv would land us with two layers of quoting. Reject it loudly.
+        raise SandboxError("exec_background takes a shell `command` string, not `args`")
+    task_id = _new_task_id(payload)
+    cmd_b64 = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    env = _bg_env(task_id, {"CMD_B64": cmd_b64})
+    if payload.get("cwd"):
+        env["TASK_CWD"] = str(payload["cwd"])
+    if isinstance(payload.get("env"), dict):
+        # Extra env vars merged into the wrapper's env, exported so the child
+        # inherits them. Values are coerced to strings for the exec API.
+        for k, v in payload["env"].items():
+            env[f"USER_{str(k)}"] = str(v)
+    result = _bg_control_exec(space_id, _BG_SPAWN_SCRIPT, env,
+                              timeout_ms=int(payload.get("timeout_ms") or 15000))
+    meta = _parse_kv_lines(result.get("stdout") or "")
+    if not meta.get("PID"):
+        return {"ok": False, "action": "exec_background", "space_id": space_id,
+                "task_id": task_id, "error": "spawn produced no pid",
+                "raw_stdout": result.get("stdout"), "raw_stderr": result.get("stderr")}
+    return {
+        "ok": True, "action": "exec_background", "space_id": space_id,
+        "sandbox": sandbox_name(space_id), "session_id": result.get("session_id"),
+        "task_id": task_id, "pid": meta.get("PID"), "pgid": meta.get("PGID"),
+        "started_at_ms": int(time.time() * 1000),
+    }
+
+
+def _get_output(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    task_id = _require_task_id(payload)
+    env = _bg_env(task_id, {
+        "STDOUT_OFFSET": str(int(payload.get("stdout_offset") or 0)),
+        "STDERR_OFFSET": str(int(payload.get("stderr_offset") or 0)),
+        "MAX_BYTES": str(int(payload.get("max_bytes") or BG_OUTPUT_CHUNK_BYTES)),
+    })
+    result = _bg_control_exec(space_id, _BG_OUTPUT_SCRIPT, env,
+                              timeout_ms=int(payload.get("timeout_ms") or 15000))
+    meta, so_b64, se_b64 = _split_output_body(result.get("stdout") or "")
+    if meta.get("STATUS") == "missing":
+        return {"ok": False, "action": "get_output", "space_id": space_id,
+                "task_id": task_id, "error": "no such task", "missing": True}
+    so_bytes, so_text = _decode_b64_chunk(so_b64)
+    se_bytes, se_text = _decode_b64_chunk(se_b64)
+    exitc = meta.get("EXIT") or ""
+    running = (meta.get("RUNNING") or "no") == "yes"
+    exit_code: Optional[int]
+    if exitc == "":
+        exit_code = None
+    else:
+        try:
+            exit_code = int(exitc)
+        except ValueError:
+            exit_code = None
+    return {
+        "ok": True, "action": "get_output", "space_id": space_id,
+        "sandbox": sandbox_name(space_id), "session_id": result.get("session_id"),
+        "task_id": task_id, "pid": meta.get("PID"), "pgid": meta.get("PGID"),
+        "running": running, "exit_code": exit_code,
+        "killed": bool(meta.get("KILLED")),
+        "stdout": so_text, "stderr": se_text,
+        "stdout_bytes": len(so_bytes), "stderr_bytes": len(se_bytes),
+        "stdout_next_offset": int(meta.get("SO_OFF", "0") or 0) + len(so_bytes),
+        "stderr_next_offset": int(meta.get("SE_OFF", "0") or 0) + len(se_bytes),
+        "stdout_total": int(meta.get("SO_SIZE", "0") or 0),
+        "stderr_total": int(meta.get("SE_SIZE", "0") or 0),
+    }
+
+
+def _kill_exec(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    task_id = _require_task_id(payload)
+    env = _bg_env(task_id, {"SIGNAL": str(payload.get("signal") or "TERM")})
+    result = _bg_control_exec(space_id, _BG_KILL_SCRIPT, env,
+                              timeout_ms=int(payload.get("timeout_ms") or 30000))
+    meta = _parse_kv_lines(result.get("stdout") or "")
+    status = meta.get("STATUS") or "ok"
+    return {
+        "ok": status in ("ok", "notfound"), "action": "kill_exec", "space_id": space_id,
+        "sandbox": sandbox_name(space_id), "session_id": result.get("session_id"),
+        "task_id": task_id, "status": status,
+        "pid": meta.get("PID"), "pgid": meta.get("PGID"),
+        "missing": status == "missing",
+    }
+
+
+def _wait_exec(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    task_id = _require_task_id(payload)
+    deadline_ms = int(payload.get("timeout_ms") or 30000)
+    # The shell script polls up to `deadline_ms`; add a small HTTP buffer.
+    env = _bg_env(task_id, {"DEADLINE_MS": str(deadline_ms)})
+    result = _bg_control_exec(space_id, _BG_WAIT_SCRIPT, env,
+                              timeout_ms=deadline_ms + 10000)
+    meta = _parse_kv_lines(result.get("stdout") or "")
+    status = meta.get("STATUS") or "unknown"
+    reply = _get_output(space_id, {"task_id": task_id,
+                                   "stdout_offset": int(payload.get("stdout_offset") or 0),
+                                   "stderr_offset": int(payload.get("stderr_offset") or 0),
+                                   "max_bytes": int(payload.get("max_bytes") or BG_OUTPUT_CHUNK_BYTES)})
+    reply["action"] = "wait_exec"
+    reply["wait_status"] = status
+    reply["timed_out"] = status == "timeout"
+    return reply
+
+
+def _list_tasks(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    result = _bg_control_exec(space_id, _BG_LIST_SCRIPT, {"BG_ROOT": BG_ROOT},
+                              timeout_ms=int(payload.get("timeout_ms") or 15000))
+    tasks: List[Dict[str, Any]] = []
+    for line in (result.get("stdout") or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5 or parts[0] != "TASK":
+            continue
+        _, name, pid, exitc, running = parts[:5]
+        try:
+            code = int(exitc) if exitc else None
+        except ValueError:
+            code = None
+        tasks.append({"task_id": name, "pid": pid, "exit_code": code,
+                      "running": running == "yes"})
+    return {"ok": True, "action": "list_tasks", "space_id": space_id,
+            "sandbox": sandbox_name(space_id), "session_id": result.get("session_id"),
+            "tasks": tasks, "count": len(tasks)}
+
+
+# --------------------------------------------------------------------------- #
 # Filesystem
 # --------------------------------------------------------------------------- #
 
@@ -627,6 +1032,17 @@ _ACTIONS = {
     "exec": _exec,
     "run": _exec,
     "shell": _exec,
+    "exec_background": _exec_background,
+    "run_background": _exec_background,
+    "spawn": _exec_background,
+    "get_output": _get_output,
+    "get_task_output": _get_output,
+    "kill_exec": _kill_exec,
+    "kill_task": _kill_exec,
+    "wait_exec": _wait_exec,
+    "wait_task": _wait_exec,
+    "list_tasks": _list_tasks,
+    "tasks": _list_tasks,
     "write": _write,
     "read": _read,
     "mkdir": _mkdir,

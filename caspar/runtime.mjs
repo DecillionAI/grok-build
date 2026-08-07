@@ -46,6 +46,7 @@ import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
+import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -152,8 +153,10 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   const { tools: toolDefs, byName } = buildToolDefinitions(catalog);
   let invoker = null;
   let socketServer = null;
+  let sandboxBridge = null;
   let mcpServers;
   const tempDir = runTempDir();
+  const extraEnv = {};
   if (bridge && toolDefs.length) {
     invoker = new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "");
     const socketPath = path.join(tempDir, "tools.sock");
@@ -177,6 +180,30 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     } catch (err) {
       log("GROK_BOOT", { tool_bridge_error: String(err?.message || err) });
       socketServer = null;
+    }
+
+    // If the space has a sandbox creature attached, stand up the sandbox
+    // bridge socket too. The grok binary's `SandboxTerminalBackend` /
+    // `SandboxFileSystem` connect to this socket for every built-in shell +
+    // file call, so the agent works on the shared VM instead of the CLI's
+    // private container. This is what makes `bash`, `read_file`, `edit`,
+    // `list_dir`, `task` / `get_task_output` / `kill_task` execute against
+    // the space's sandbox without the model having to reach for a separate
+    // MCP tool. Detection uses the same heuristic as the system-prompt
+    // "shared environment" hint below — no hardcoded program id.
+    const sandboxToolName = creatureFlag("USE_SANDBOX_BACKEND", true)
+      ? detectSandboxTool(toolDefs, byName)
+      : null;
+    if (sandboxToolName) {
+      const sandboxSocketPath = path.join(tempDir, "sandbox.sock");
+      sandboxBridge = new SandboxBridgeServer(sandboxSocketPath, invoker, sandboxToolName);
+      try {
+        await sandboxBridge.start();
+        extraEnv.GROK_SANDBOX_SOCKET = sandboxSocketPath;
+      } catch (err) {
+        log("GROK_BOOT", { sandbox_bridge_error: String(err?.message || err) });
+        sandboxBridge = null;
+      }
     }
   }
 
@@ -202,10 +229,16 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     return category === "execution" || /sandbox/.test(name);
   });
   const sharedEnv = sharedEnvDef ? { name: qualify(sharedEnvDef.name), description: sharedEnvDef.description } : undefined;
-  // Force shell + filesystem work onto the shared sandbox: the CLI's own
-  // Bash/Read/Write/… built-ins are turned off unconditionally, so the agent cannot
-  // do throwaway work on its private container that its teammates never see.
-  const disallowedTools = disallowedBuiltinTools();
+  // Force shell + filesystem work onto the shared sandbox. Two paths:
+  //  • Sandbox backend active (`sandboxBridge` up): the CLI's built-ins
+  //    `bash`, `read_file`, `edit`, `list_dir`, `glob`, `grep`, `task`,
+  //    `get_task_output`, `kill_task` all route through
+  //    `SandboxTerminalBackend` + `SandboxFileSystem` to the space's shared
+  //    VM. Nothing to disable — the built-ins ARE the sandbox now.
+  //  • No sandbox: keep the legacy deny list so the agent can't do throwaway
+  //    work inside its private container.
+  const sandboxActive = Boolean(sandboxBridge);
+  const disallowedTools = disallowedBuiltinTools({ sandboxActive });
   const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds) || creatureNumber("MAX_WALL_SECONDS", 900);
@@ -217,6 +250,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     history_turns: Array.isArray(task.history) ? task.history.length : 0,
     tools: toolDefs.map((t) => t.name),
     shared_env: sharedEnv?.name,
+    sandbox_backend: sandboxActive || undefined,
     disallowed_builtins: disallowedTools.length ? disallowedTools : undefined,
     skill: Boolean(task.skill),
     group_chat: Boolean(task.groupChat || task.group_chat),
@@ -244,9 +278,15 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
       // allowlist is passed: Grok keeps its MCP meta-tools (`search_tool` /
       // `use_tool`) on regardless, and an allowlist would strip the planning and web
       // built-ins the agent still needs.
-      // Turn off the CLI's own shell/filesystem built-ins, so bash and file work are
-      // forced onto the space's shared sandbox (see above).
+      // With the sandbox backend up this is `[]`; the CLI's built-ins are the
+      // sandbox now. Without it, the legacy deny list keeps shell/FS work off
+      // the private container. Either way `runGrok` gets a definitive list.
       disallowedTools,
+      // Point the grok child at the sandbox bridge socket (only present when
+      // the space has a sandbox creature attached). `runGrok` merges this
+      // into the child env; grok's `SandboxTerminalBackend::from_env` picks
+      // it up on session spawn.
+      extraEnv,
       maxWallSeconds,
       tempDir,
       onMessage: (message) => {
@@ -256,6 +296,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   } catch (err) {
     run = { result: null, messages: [], exitCode: null, timedOut: false, stderr: String(err?.message || err), warnings: [] };
   } finally {
+    if (sandboxBridge) await sandboxBridge.stop();
     if (socketServer) await socketServer.stop();
     if (invoker) invoker.dispose();
     try {
