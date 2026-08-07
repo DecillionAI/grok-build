@@ -74,6 +74,13 @@ Agent build:
 
 VM:
     GROK_RUN_ENTITY         1 to start the VM after deploy (default), 0 to skip
+    GROK_WAIT_READY         1 to wait for the creature's GROK_READY line (default)
+    GROK_READY_TIMEOUT      seconds to wait for it (default 180, or 600 when the
+                            image build could not be observed from this host)
+    GROK_RESTART_ON_NOT_READY  1 (default) to restart the entity once if it never
+                            reported ready — the node builds asynchronously, so a
+                            container started mid-build runs the PREVIOUS image and
+                            only a restart picks up the new one
     GROK_VM_RAM_MB          default 2048     GROK_VM_DISK_GB   default 8
     GROK_VM_CPUS            default 2        GROK_VM_MAX_SECONDS default unlimited
     GROK_FORCE_RESTART      default 1
@@ -109,6 +116,7 @@ from caspar_deploy_common import (  # noqa: E402
     b64_bytes,
     bad,
     bake_snippet,
+    docker_cli,
     docker_image_context,
     docker_image_id,
     env_any,
@@ -122,7 +130,7 @@ from caspar_deploy_common import (  # noqa: E402
     wait_for_image,
     warn,
 )
-from caspar_signaling import CasparSignalingClient  # noqa: E402
+from caspar_signaling import CasparSignalingClient, log_text  # noqa: E402
 
 ENTITY_ID = env_any("GROK_ENTITY_ID", "DAVINCI_ENTITY_ID", "CLAUDE_ENTITY_ID", default="davinci")
 
@@ -371,6 +379,41 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
     return stamp_context(dockerfile, files)
 
 
+def report_not_ready(logs) -> None:
+    """Explain a container that never announced itself, from what it *did* say.
+
+    "no GROK_READY in the VM logs" on its own is a dead end: it is equally the
+    shape of a build that failed, a build still running, an old image left in place,
+    and a creature that crashed on boot. The logs distinguish those, and we already
+    have them here — so print the tail and name the case rather than making an
+    operator go dig for `/machines/readVmLogs`.
+    """
+    lines = [log_text(entry).rstrip() for entry in (logs or [])]
+    lines = [line for line in lines if line]
+    if not lines:
+        warn("the creature produced NO log output at all. Most likely the node is still building the image "
+             "(it builds asynchronously, and this deploy could not observe it), or the build failed and there "
+             "is nothing runnable to start. Re-run once the build settles, and check the node's docker build "
+             "logs for this program.")
+        return
+
+    joined = "\n".join(lines)
+    if "GROK_BOOT" in joined or "GROK_BRIDGE" in joined:
+        warn("the creature started but never reported GROK_READY — it is running this build and failing to "
+             "reach the gateway. The tail below is from the creature itself.")
+    elif "CLAUDE_READY" in joined or "CLAUDE_BOOT" in joined or "CLAUDE_BRIDGE" in joined:
+        bad("the container that is running is the PREVIOUS backbone (it logs CLAUDE_* sentinels), not this "
+            "build — the node started an older image, so the new one did not finish building in time. "
+            "Re-run the deploy; the image build continues in the background.")
+    else:
+        warn("no GROK_READY in the VM logs, and nothing recognisable from this creature either — the tail "
+             "below is whatever the container did emit.")
+    tail = lines[-20:]
+    warn(f"last {len(tail)} VM log line(s):")
+    for line in tail:
+        print(f"    | {line[:400]}", flush=True)
+
+
 def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) -> Dict[str, str]:
     """Deploy (or redeploy) the creature entity; returns the ids it landed on."""
     creature_id = ""
@@ -462,20 +505,45 @@ def main() -> int:
         force_restart = truthy(env_any("GROK_FORCE_RESTART", "DAVINCI_FORCE_RESTART", default="1"))
         info(f"starting the creature as a standalone VM entity (ram={ram}MB disk={disk}GB cpu={cpus} "
              f"maxExec={label} forceRestart={force_restart})")
+        def start(attempt: int) -> str:
+            vm = client.run_entity(deployed["program_id"], deployed["entity_id"], ram_mb=ram, disk_gb=disk,
+                                   cpu_cores=cpus, max_exec_seconds=max_seconds, force_restart=force_restart)
+            if vm:
+                ok(f"grok-build VM entity running: {vm}" + (f" (attempt {attempt})" if attempt > 1 else ""))
+            return vm
+
         try:
-            vm_id = client.run_entity(deployed["program_id"], deployed["entity_id"], ram_mb=ram, disk_gb=disk,
-                                      cpu_cores=cpus, max_exec_seconds=max_seconds, force_restart=force_restart)
+            vm_id = start(1)
             if vm_id:
-                ok(f"grok-build VM entity running: {vm_id}")
                 print("DAVINCI_VM_ID=" + vm_id, flush=True)
                 print("GROK_VM_ID=" + vm_id, flush=True)
                 if truthy(env_any("GROK_WAIT_READY", default="1")):
-                    found, _logs = client.wait_for_vm_log(vm_id, "GROK_READY", timeout=int(env_any("GROK_READY_TIMEOUT", default="180")), poll=3)
+                    # When the image build could not be observed (no docker access
+                    # here), this wait is the ONLY evidence the build produced a
+                    # runnable image — so it has to outlast a cold build+boot, not
+                    # just a boot.
+                    default_ready = "180" if docker_cli() else "600"
+                    ready_timeout = int(env_any("GROK_READY_TIMEOUT", default=default_ready))
+                    found, logs = client.wait_for_vm_log(vm_id, "GROK_READY", timeout=ready_timeout, poll=3)
+                    if not found and truthy(env_any("GROK_RESTART_ON_NOT_READY", default="1")):
+                        # The node builds asynchronously: a container started before
+                        # the build finished is running the PREVIOUS image, and no
+                        # amount of further waiting changes that — but a restart now,
+                        # with the build finished, picks the new image up. This is
+                        # the whole reason a deploy could report success while the
+                        # old backbone kept serving.
+                        warn("not ready yet — restarting the entity once, in case it was started before the "
+                             "node finished building the new image")
+                        restarted = start(2)
+                        if restarted:
+                            vm_id = restarted
+                            print("DAVINCI_VM_ID=" + vm_id, flush=True)
+                            print("GROK_VM_ID=" + vm_id, flush=True)
+                            found, logs = client.wait_for_vm_log(vm_id, "GROK_READY", timeout=ready_timeout, poll=3)
                     if found:
                         ok("creature is connected to the gateway and serving prompts (GROK_READY)")
                     else:
-                        warn("no GROK_READY in the VM logs yet — the container may still be starting; "
-                             "check `/machines/readVmLogs` for this vmId")
+                        report_not_ready(logs)
             else:
                 warn("runEntity returned no vmId")
         except Exception as exc:  # noqa: BLE001 — the program is deployed regardless
