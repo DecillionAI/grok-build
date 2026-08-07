@@ -453,7 +453,8 @@ def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) ->
         ok("image already built from this exact context — no rebuild to wait for")
     else:
         timeout = int(env_any("GROK_REBUILD_TIMEOUT", "DAVINCI_REBUILD_TIMEOUT", default="900"))
-        wait_for_image(program_id, entity_id, timeout=timeout, prev_image_id=prev_image_id, expect_context=digest)
+        wait_for_image(program_id, entity_id, timeout=timeout, prev_image_id=prev_image_id,
+                       expect_context=digest, client=client)
     ok(f"grok-build creature deployed: program={program_id} entity={entity_id}")
     return {"creature_id": creature_id, "program_id": program_id, "entity_id": entity_id}
 
