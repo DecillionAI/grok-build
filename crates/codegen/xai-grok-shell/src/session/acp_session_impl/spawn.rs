@@ -698,6 +698,26 @@ pub(crate) async fn spawn_session_actor(
         match terminal_backend_kind {
             TerminalBackendKind::ReuseParent => parent_terminal_backend
                 .expect("ReuseParent is only selected when a parent backend is present"),
+            TerminalBackendKind::SandboxRemote => {
+                // Guaranteed present by `sandbox_socket_available()`; a race
+                // between the check and construction (bridge crashes at the
+                // wrong instant) falls back to the ACP or local path so the
+                // session still starts.
+                match xai_grok_tools::computer::sandbox::SandboxTerminalBackend::from_env() {
+                    Some(backend) => std::sync::Arc::new(backend)
+                        as std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
+                    None => std::sync::Arc::new(
+                        LocalTerminalBackend::new_local_with_login_shell_capture(
+                            resolve_search_shadows(),
+                            crate::util::config::resolve_login_shell_capture(
+                                remote_settings.as_ref().and_then(|r| r.login_shell_capture),
+                            ),
+                            resolve_policy(),
+                            tool_context.process_scope.clone(),
+                        ),
+                    ),
+                }
+            }
             TerminalBackendKind::AcpClient => {
                 std::sync::Arc::new(crate::terminal::AcpTerminalAdapter::new(
                     tool_context.gateway.clone().unwrap(),
@@ -732,8 +752,24 @@ pub(crate) async fn spawn_session_actor(
             .warm_shell(tool_context.cwd.as_path())
             .await;
     }
+    // FS backend follows the same seam as the terminal backend: when the
+    // sandbox bridge is available every read/write goes to the shared VM.
+    // Falls through to ACP-client FS (when the invoking client offered it) or
+    // the process's local FS in a self-test.
     let fs_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem> =
-        if client_fs_capable && tool_context.gateway.is_some() {
+        if matches!(terminal_backend_kind, TerminalBackendKind::SandboxRemote) {
+            match xai_grok_tools::computer::sandbox::SandboxFileSystem::from_env() {
+                Some(fs) => std::sync::Arc::new(fs)
+                    as std::sync::Arc<dyn xai_grok_tools::computer::types::AsyncFileSystem>,
+                None if client_fs_capable && tool_context.gateway.is_some() => {
+                    std::sync::Arc::new(xai_grok_workspace::file_system::AcpFsAdapter::new(
+                        tool_context.gateway.clone().unwrap(),
+                        tool_context.session_id.clone().unwrap(),
+                    ))
+                }
+                None => std::sync::Arc::new(xai_grok_tools::computer::local::LocalFs),
+            }
+        } else if client_fs_capable && tool_context.gateway.is_some() {
             std::sync::Arc::new(xai_grok_workspace::file_system::AcpFsAdapter::new(
                 tool_context.gateway.clone().unwrap(),
                 tool_context.session_id.clone().unwrap(),
@@ -2557,10 +2593,24 @@ impl crate::session::mcp_restart::RestartActions for SessionRestartActions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalBackendKind {
     ReuseParent,
+    /// Route every shell + FS built-in to the Caspar sandbox bridge (per-space
+    /// Vercel Sandbox microVM). Selected when the host set
+    /// `GROK_SANDBOX_SOCKET` for the child.
+    SandboxRemote,
     AcpClient,
     LocalPersistent,
     LocalNonPersistent,
 }
+
+/// True when the process was launched inside a Decillion agent creature with a
+/// live sandbox bridge socket. Checked once per session spawn so the child
+/// picks the sandbox backend over local processes.
+fn sandbox_socket_available() -> bool {
+    std::env::var(xai_grok_tools::computer::sandbox::SANDBOX_SOCKET_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 fn select_terminal_backend_kind(
     is_subagent: bool,
     has_parent_backend: bool,
@@ -2568,8 +2618,41 @@ fn select_terminal_backend_kind(
     has_gateway: bool,
     cursor_harness: bool,
 ) -> TerminalBackendKind {
+    select_terminal_backend_kind_with(
+        is_subagent,
+        has_parent_backend,
+        client_terminal_capable,
+        has_gateway,
+        cursor_harness,
+        sandbox_socket_available(),
+    )
+}
+
+/// Test-friendly variant that takes the sandbox availability explicitly. The
+/// production entry point sniffs `GROK_SANDBOX_SOCKET`; tests avoid touching
+/// process env.
+fn select_terminal_backend_kind_with(
+    is_subagent: bool,
+    has_parent_backend: bool,
+    client_terminal_capable: bool,
+    has_gateway: bool,
+    cursor_harness: bool,
+    sandbox_available: bool,
+) -> TerminalBackendKind {
+    // A subagent always reuses the parent's backend when it has one — that is
+    // how owner-scoped kill semantics work (see
+    // `LocalTerminalBackend::kill_all_background_tasks_by_owner`). The
+    // sandbox backend inherits the same property because we clone the
+    // `Arc<dyn TerminalBackend>` for the child.
     if is_subagent && has_parent_backend {
         TerminalBackendKind::ReuseParent
+    } else if sandbox_available {
+        // The Decillion agent bridge sets `GROK_SANDBOX_SOCKET` when the
+        // space has a cloud sandbox attached; every shell/FS built-in should
+        // run there, not in the CLI's private container. This wins over the
+        // ACP-client path because we ARE the client, and our chosen backend
+        // is a Caspar signal — not the (unrelated) ACP terminal wire.
+        TerminalBackendKind::SandboxRemote
     } else if client_terminal_capable && has_gateway {
         TerminalBackendKind::AcpClient
     } else if cursor_harness {
@@ -2687,6 +2770,41 @@ mod terminal_backend_select_tests {
         assert_eq!(
             select_terminal_backend_kind(false, false, false, false, false),
             TerminalBackendKind::LocalNonPersistent
+        );
+    }
+    #[test]
+    fn sandbox_socket_wins_over_acp_and_local() {
+        use super::select_terminal_backend_kind_with;
+        // Non-subagent with sandbox present: sandbox beats ACP + local.
+        assert_eq!(
+            select_terminal_backend_kind_with(false, false, true, true, false, true),
+            TerminalBackendKind::SandboxRemote,
+        );
+        assert_eq!(
+            select_terminal_backend_kind_with(false, false, false, false, false, true),
+            TerminalBackendKind::SandboxRemote,
+        );
+    }
+    #[test]
+    fn subagent_with_parent_still_reuses_over_sandbox() {
+        // Owner-scoped kill semantics rely on the subagent sharing the
+        // parent's backend; sandbox availability must not break that.
+        use super::select_terminal_backend_kind_with;
+        assert_eq!(
+            select_terminal_backend_kind_with(true, true, true, true, true, true),
+            TerminalBackendKind::ReuseParent,
+        );
+    }
+    #[test]
+    fn sandbox_missing_falls_through_to_acp_or_local() {
+        use super::select_terminal_backend_kind_with;
+        assert_eq!(
+            select_terminal_backend_kind_with(false, false, true, true, false, false),
+            TerminalBackendKind::AcpClient,
+        );
+        assert_eq!(
+            select_terminal_backend_kind_with(false, false, false, false, false, false),
+            TerminalBackendKind::LocalNonPersistent,
         );
     }
 }
