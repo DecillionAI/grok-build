@@ -171,12 +171,31 @@ def git_output(*args: str) -> str:
         return ""
 
 
+def host_bundle_asset() -> str:
+    """The release asset name matching the architecture the node will build on.
+
+    The node builds the creature image natively on THIS host (the deploy runs on
+    the node host), so the `grok` binary in the bundle must run on this machine's
+    CPU — an amd64 binary on an arm64 host dies with `Exec format error` at the
+    image's `grok --version` smoke test. The `build-grok-creature` workflow
+    publishes an amd64 `bundle.tar.gz` (the historical name) and an arm64
+    `bundle-arm64.tar.gz`. Override the choice with GROK_BUNDLE_ARCH.
+    """
+    import platform
+
+    arch = (env_any("GROK_BUNDLE_ARCH", default="") or platform.machine()).lower()
+    if arch in ("aarch64", "arm64"):
+        return "bundle-arm64.tar.gz"
+    return "bundle.tar.gz"
+
+
 def bundle_url() -> str:
     """The published bundle the image will download.
 
     Explicit `GROK_BUNDLE_URL` wins. Otherwise it is derived from this checkout:
     the origin remote's `owner/repo` and the branch it is on, which is exactly what
-    the `build-grok-creature` workflow publishes as `creature-<branch>`.
+    the `build-grok-creature` workflow publishes as `creature-<branch>`, picking the
+    asset that matches this host's architecture.
     """
     explicit = env_any("GROK_BUNDLE_URL", default="")
     if explicit:
@@ -188,7 +207,7 @@ def bundle_url() -> str:
     if not path:
         return ""
     slug = (branch or "main").replace("/", "-")
-    return f"https://github.com/{path}/releases/download/creature-{slug}/bundle.tar.gz"
+    return f"https://github.com/{path}/releases/download/creature-{slug}/{host_bundle_asset()}"
 
 
 def bundle_sha(url: str) -> str:
@@ -198,9 +217,13 @@ def bundle_sha(url: str) -> str:
     works — it just cannot tell a refreshed bundle at the same URL from the one it
     already cached, so the label falls back to a timestamp.
     """
-    if not url.endswith("bundle.tar.gz"):
+    base = url.rsplit("/", 1)[-1]  # bundle.tar.gz | bundle-arm64.tar.gz
+    if not (base.startswith("bundle") and base.endswith(".tar.gz")):
         return ""
-    manifest_url = url[: -len("bundle.tar.gz")] + "manifest.json"
+    # The manifest sits next to the bundle, named to match its arch suffix:
+    # bundle.tar.gz → manifest.json, bundle-arm64.tar.gz → manifest-arm64.json.
+    manifest_name = "manifest" + base[len("bundle") : -len(".tar.gz")] + ".json"
+    manifest_url = url[: -len(base)] + manifest_name
     request = urllib.request.Request(manifest_url)
     token = env_any("GROK_BUNDLE_TOKEN", default="")
     if token:

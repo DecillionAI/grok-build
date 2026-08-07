@@ -111,6 +111,10 @@ GIT_REF="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 BIN_BYTES="$(wc -c < bin/grok | tr -d ' ')"
 BUNDLE_BYTES="$(wc -c < "$OUT_DIR/bundle.tar.gz" | tr -d ' ')"
 GLIBC="$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}' || echo unknown)"
+# The binary is a native ELF — it only runs on the CPU it was built for. Record
+# the build arch so an amd64-vs-arm64 mismatch is visible in the manifest instead
+# of surfacing as `Exec format error` at the image's `grok --version` smoke test.
+BUILD_ARCH="$(uname -m 2>/dev/null || echo unknown)"
 
 cat > "$OUT_DIR/manifest.json" <<JSON
 {
@@ -120,6 +124,7 @@ cat > "$OUT_DIR/manifest.json" <<JSON
   "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "source": "crates/ (this repository) — not a published release download",
   "buildGlibc": "$GLIBC",
+  "buildArch": "$BUILD_ARCH",
   "binBytes": $BIN_BYTES,
   "bundleBytes": $BUNDLE_BYTES
 }
