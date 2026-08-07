@@ -72,6 +72,24 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     fi
   fi
 
+  # The published creature bundle is a PORTABLE artifact: it must run on any deploy
+  # host, not just this build runner. The repo's .cargo/config.toml pins
+  # aarch64-unknown-linux-gnu to `target-cpu=neoverse-v2` (Graviton4), which emits
+  # instructions that CRASH with SIGILL ("Illegal instruction", exit 132) on older
+  # arm64 hosts (Graviton2/3 = Neoverse-N1/V1). For the creature we build the arm64
+  # binary for a baseline CPU instead (the repo already uses `generic` for its musl
+  # target). Set CREATURE_ARM64_TARGET_CPU to tune it (e.g. neoverse-n1). amd64 is
+  # unaffected — its config carries no target-cpu, so it is already baseline.
+  # A caller-provided RUSTFLAGS is respected as-is.
+  case "$(uname -m)" in
+    aarch64 | arm64)
+      if [ -z "${RUSTFLAGS:-}" ]; then
+        export RUSTFLAGS="-C target-cpu=${CREATURE_ARM64_TARGET_CPU:-generic} -C force-unwind-tables=yes"
+        log "arm64: RUSTFLAGS=$RUSTFLAGS (portable baseline — overrides .cargo/config.toml neoverse-v2)"
+      fi
+      ;;
+  esac
+
   log "building the agent (cargo build --$PROFILE -p xai-grok-pager-bin) — this takes a while"
   cargo build --locked "--$PROFILE" -p xai-grok-pager-bin
 
@@ -125,6 +143,7 @@ cat > "$OUT_DIR/manifest.json" <<JSON
   "source": "crates/ (this repository) — not a published release download",
   "buildGlibc": "$GLIBC",
   "buildArch": "$BUILD_ARCH",
+  "buildRustflags": "$(printf '%s' "${RUSTFLAGS:-(from .cargo/config.toml)}" | sed 's/"/\\"/g')",
   "binBytes": $BIN_BYTES,
   "bundleBytes": $BUNDLE_BYTES
 }
