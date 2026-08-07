@@ -52,18 +52,23 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo "[package] ERROR: cargo not found — install the Rust toolchain (rustup) to build the creature" >&2
     exit 1
   }
-  # `bin/protoc` is a DotSlash wrapper: it downloads its payload on first use and
-  # needs `dotslash` on PATH. Without it the proto build falls through to a protoc
-  # on PATH, so point $PROTOC at one when we can find it — a build that gets neither
-  # fails in a build script with a much less obvious message.
-  if [ -z "${PROTOC:-}" ] && ! command -v dotslash >/dev/null 2>&1; then
-    if command -v protoc >/dev/null 2>&1; then
-      PROTOC="$(command -v protoc)"
+  # protoc. `bin/protoc` is a DotSlash wrapper, so with DotSlash installed the build
+  # resolves the repo's pinned protoc by itself and we stay out of the way.
+  # Otherwise scripts/fetch_pinned_protoc.py finds one that can actually build this
+  # tree: an explicit $PROTOC, a system protoc that is new enough, or — failing
+  # both — a hash-verified download of exactly the version bin/protoc pins.
+  # ("New enough" matters: the tools proto uses proto3 optional fields, which
+  # protoc rejects before 3.15, and Ubuntu 22.04 still ships 3.12.)
+  if command -v dotslash >/dev/null 2>&1 && [ -z "${PROTOC:-}" ]; then
+    log "dotslash is installed — the build will use the pinned bin/protoc"
+  else
+    if PROTOC="$(python3 "$ROOT/scripts/fetch_pinned_protoc.py")" && [ -n "$PROTOC" ]; then
       export PROTOC
-      log "no dotslash on PATH — using system protoc at $PROTOC"
+      log "protoc: $PROTOC ($("$PROTOC" --version 2>/dev/null || echo 'version unknown'))"
     else
-      echo "[package] WARNING: neither dotslash nor protoc found; the proto build may fail." >&2
-      echo "[package]          install one: 'cargo install dotslash' or 'apt-get install protobuf-compiler'" >&2
+      echo "[package] ERROR: could not resolve a usable protoc for the proto build." >&2
+      echo "[package]        Install DotSlash ('cargo install dotslash') or set \$PROTOC to a protoc >= 3.15." >&2
+      exit 1
     fi
   fi
 
