@@ -82,7 +82,8 @@ which the node relays while keeping the correlation open.
 | `result.mjs` | Builds the terminal reply (answer, billable usage, plan, budget). |
 | `attachments.mjs` | Materialises prompt attachments into the session workspace. |
 | `build/imageBuild.sh` | Builds/verifies the binary inside the image. |
-| `Dockerfile` / `Dockerfile.prebuilt` | The creature image (in-image compile / prebuilt binary). |
+| `Dockerfile.fetch` | The creature image the deploy uses: the build downloads the published bundle. |
+| `Dockerfile` / `Dockerfile.prebuilt` | The other two image shapes: in-image compile (or published-CLI download), and a bundle already in the build context (what the GHCR image is built from). |
 | `tools/` | The platform's docker tool creatures: the per-space `vercel_sandbox` and the `github` tool, plus their shared runtime. |
 | `tests/` | Checks — see *Testing*. |
 
@@ -177,19 +178,29 @@ image build is a copy, not a 60-crate cargo build inside a gVisor sandbox.
 **rolling per-branch release** (`creature-main`, `creature-<branch-with-dashes>`),
 and a `ghcr.io/<owner>/grok-build-creature` image.
 
-The rolling release is the one that matters for the platform:
-`decillionai-server`'s `ci-deploy.sh` **downloads** it and wraps it in the creature
-image, so the deploy host compiles nothing — no Rust toolchain, no crates.io, no
-cargo — and neither does the node's image builder.
+The rolling release is the one that matters for the platform: the deploy stamps its
+URL into the creature image, and **the node's image build downloads it**.
 
 ```
 https://github.com/<owner>/grok-build/releases/download/creature-<branch>/bundle.tar.gz
 ```
 
-It has to be a *release* asset rather than the workflow artifact because the deploy
-host has no credentials for this repo (its token belongs to another org, and
-GitHub's artifacts API needs auth even for public repos). Release assets download
-anonymously.
+**Why the image fetches it instead of the deploy shipping it.** A Caspar deploy is
+one length-prefixed frame, and the node caps a frame at 20 MB (`network/framing.rs`
+`MAX_FRAME_LEN`; the TCP client path allows 32 MB). The release build of `grok` is
+~170 MB — ~63 MB gzipped, ~84 MB once base64-encoded into the signal. Sending it
+made the node close the socket mid-write, which the deployer reported as the
+unhelpful `[Errno 32] Broken pipe`. No compression setting fixes that; the binary
+simply cannot travel in a signal. So `caspar/Dockerfile.fetch` `curl`s it during the
+build (the node's builder already has egress — it installs apt packages in the same
+build), and the deploy payload is just the ~200 KB bridge. `deploy_grok_creature.py`
+also refuses a payload over `GROK_MAX_DEPLOY_MB`, so an oversized context fails with
+that explanation instead of a broken pipe.
+
+It has to be a *release* asset rather than the workflow artifact because neither the
+deploy host nor the node has credentials for this repo (the host's token belongs to
+another org, and GitHub's artifacts API needs auth even for public repos). Release
+assets download anonymously.
 
 The bundle job pins `runs-on: ubuntu-22.04` deliberately: the binary is dynamically
 linked, so the glibc it is built against is a floor on every machine that later runs
@@ -241,7 +252,9 @@ Key knobs (all documented in the script's header):
 | `CASPAR_DEPLOY_IDENTITY_FILE` | Where the durable deploy-operator identity is persisted (default: next to `CASPAR_MANIFEST`). The backbone **and** every tool authenticate as this one account, so a redeploy always owns the program being reused and never mints a new one. |
 | `CASPAR_OPERATOR_ID` + `CASPAR_OPERATOR_PRIVATE_KEY` | Inject the operator identity explicitly (highest precedence) |
 | `XAI_API_KEY` | The default backbone, baked into the image |
-| `GROK_CLI_SOURCE` | `prebuilt` (default, ship the workflow-built `bin/grok`), `source` (compile `crates/` in the image), or `release` (download the published binary) |
+| `GROK_CLI_SOURCE` | `prebuilt` (default — the image downloads the workflow-published bundle), `source` (compile `crates/` in the image; its context is over the deploy frame limit on this repo), or `release` (the image downloads the published x.ai binary) |
+| `GROK_BUNDLE_URL` | Which published bundle the image fetches. Derived from the checkout's remote + branch when unset |
+| `GROK_MAX_DEPLOY_MB` | Refuse a deploy payload over this (default 16), instead of letting the node close the socket on an oversized frame |
 | `GROK_VM_RAM_MB` / `_DISK_GB` / `_CPUS` / `_MAX_SECONDS` | VM resources (defaults 2048 MB / 8 GB / 2 cpu / unlimited) |
 
 ### Being the platform's agent backbone, with zero Decillion changes
@@ -259,10 +272,11 @@ AGENT_DIR=/path/to/grok-build \
 bash scripts/ci-deploy.sh
 ```
 
-That run does **not** compile anything: it downloads this repo's published
-`creature-<branch>` bundle (above), unpacks `bin/grok` into the checkout and
-deploys it. If no bundle has been published for the branch it deploys nothing and
-says so, leaving the running backbone in place.
+That run does **not** compile anything and does not download the binary either: it
+picks this repo's published `creature-<branch>` bundle (above), checks the asset
+exists, and stamps its URL into the image the node builds. If no bundle has been
+published for the branch it deploys nothing and says so, leaving the running
+backbone in place.
 
 The deployer records the program id in `.caspar-deploy.json` under `davinci.agent`,
 which is what `CasparService.agentBackbone()` reads and what every new agent proxy
