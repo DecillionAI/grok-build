@@ -170,6 +170,37 @@ it runs, and tars `bin/grok` + `caspar/` into a ready-to-use Docker build contex
 That is what the deployer ships in the default **prebuilt** mode — so the node's
 image build is a copy, not a 60-crate cargo build inside a gVisor sandbox.
 
+### The published bundle is what Decillion deploys
+
+`.github/workflows/build-grok-creature.yml` runs that packaging step on every push
+(and on `v*` tags) and publishes `bundle.tar.gz` three ways: a workflow artifact, a
+**rolling per-branch release** (`creature-main`, `creature-<branch-with-dashes>`),
+and a `ghcr.io/<owner>/grok-build-creature` image.
+
+The rolling release is the one that matters for the platform:
+`decillionai-server`'s `ci-deploy.sh` **downloads** it and wraps it in the creature
+image, so the deploy host compiles nothing — no Rust toolchain, no crates.io, no
+cargo — and neither does the node's image builder.
+
+```
+https://github.com/<owner>/grok-build/releases/download/creature-<branch>/bundle.tar.gz
+```
+
+It has to be a *release* asset rather than the workflow artifact because the deploy
+host has no credentials for this repo (its token belongs to another org, and
+GitHub's artifacts API needs auth even for public repos). Release assets download
+anonymously.
+
+The bundle job pins `runs-on: ubuntu-22.04` deliberately: the binary is dynamically
+linked, so the glibc it is built against is a floor on every machine that later runs
+it — building on the oldest supported runner keeps that floor low.
+
+**A branch is deployable before it merges:** push it, let the workflow publish
+`creature-<branch>`, and point the deploy's `AGENT_BRANCH` at it. Until that
+workflow run finishes there is no bundle for the branch, and the Decillion deploy
+skips the agent step (leaving the running backbone live) rather than falling back to
+a compile.
+
 Build requirements are the repo's own (see the root README): the pinned Rust
 toolchain, plus a `protoc` — either DotSlash (`bin/protoc`) or a system
 `protobuf-compiler` (`$PROTOC`); `package-creature.sh` points the build at the
@@ -210,7 +241,7 @@ Key knobs (all documented in the script's header):
 | `CASPAR_DEPLOY_IDENTITY_FILE` | Where the durable deploy-operator identity is persisted (default: next to `CASPAR_MANIFEST`). The backbone **and** every tool authenticate as this one account, so a redeploy always owns the program being reused and never mints a new one. |
 | `CASPAR_OPERATOR_ID` + `CASPAR_OPERATOR_PRIVATE_KEY` | Inject the operator identity explicitly (highest precedence) |
 | `XAI_API_KEY` | The default backbone, baked into the image |
-| `GROK_CLI_SOURCE` | `prebuilt` (default, ship a CI-built `bin/grok`), `source` (compile `crates/` in the image), or `release` (download the published binary) |
+| `GROK_CLI_SOURCE` | `prebuilt` (default, ship the workflow-built `bin/grok`), `source` (compile `crates/` in the image), or `release` (download the published binary) |
 | `GROK_VM_RAM_MB` / `_DISK_GB` / `_CPUS` / `_MAX_SECONDS` | VM resources (defaults 2048 MB / 8 GB / 2 cpu / unlimited) |
 
 ### Being the platform's agent backbone, with zero Decillion changes
@@ -227,6 +258,11 @@ AGENT_REPO=https://github.com/cosmopole-org/grok-build \
 AGENT_DIR=/path/to/grok-build \
 bash scripts/ci-deploy.sh
 ```
+
+That run does **not** compile anything: it downloads this repo's published
+`creature-<branch>` bundle (above), unpacks `bin/grok` into the checkout and
+deploys it. If no bundle has been published for the branch it deploys nothing and
+says so, leaving the running backbone in place.
 
 The deployer records the program id in `.caspar-deploy.json` under `davinci.agent`,
 which is what `CasparService.agentBackbone()` reads and what every new agent proxy
