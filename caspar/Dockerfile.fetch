@@ -1,0 +1,93 @@
+# Grok Build Caspar creature image — FETCH variant (the deploy default).
+#
+# Same runtime as caspar/Dockerfile.prebuilt, differing in ONE thing: where the
+# agent binary comes from. Here the **image build downloads it**, instead of it
+# travelling inside the deploy signal.
+#
+# That is not an optimisation, it is a hard requirement. A deploy signal is a
+# single length-prefixed frame and the node rejects one over its cap (see caspar's
+# `network/framing.rs` MAX_FRAME_LEN = 20 MB, `network/client/tcp.rs` MAX_FRAME =
+# 32 MB) by closing the connection — which the deployer sees as
+# `[Errno 32] Broken pipe`. The release build of `grok` is ~170 MB (~63 MB gzipped,
+# ~84 MB once base64-encoded into the signal), so shipping it in the payload
+# cannot work at any compression. The bridge alone is ~200 KB and fits easily.
+#
+#   deploy signal ──▶ bundle.tar.gz (caspar/ bridge only, ~200 KB)
+#   image build   ──▶ curl $GROK_BUNDLE_URL  (bin/grok, ~63 MB, straight from
+#                                             the backbone repo's release)
+#
+# The node's builder has egress (it installs apt packages during this very build),
+# so the download is no new capability. The URL must be reachable **anonymously**
+# from the node — GitHub release assets are, which is why the backbone repo
+# publishes a rolling `creature-<branch>` release.
+#
+# glibc: the binary is built on the backbone repo's CI (ubuntu-22.04, glibc 2.35)
+# and run here, so the runtime base must be at least as new. Debian trixie (2.41)
+# is, comfortably. Override with --build-arg RUNTIME_BASE=… if you need another.
+
+ARG RUNTIME_BASE=public.ecr.aws/docker/library/node:22-trixie-slim
+FROM ${RUNTIME_BASE}
+
+# git: the agent works in a real repo-shaped workspace.
+# ripgrep: the CLI's search tools.
+# ca-certificates + curl: outbound TLS, and the bundle download below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# >>> caspar-ca <<<
+# (the deployer substitutes the host CA bundle here when it has one — an
+# intercepting egress proxy would otherwise break both the download below and the
+# creature's own outbound TLS)
+
+# The signaling bridge, from the deploy payload: small enough to travel in the
+# signal, and authoritative — it is the checkout's caspar/, not the copy inside the
+# published bundle, which may be from an older commit.
+ADD bundle.tar.gz /app
+
+# Which published bundle to unpack. GROK_BUNDLE_SHA is the commit it was built
+# from: it is here so that a NEW bundle at the same URL produces a different layer
+# instead of a cache hit on the old one.
+ARG GROK_BUNDLE_URL
+ARG GROK_BUNDLE_SHA=unknown
+LABEL org.decillion.grok-bundle-sha=$GROK_BUNDLE_SHA
+LABEL org.decillion.grok-bundle-url=$GROK_BUNDLE_URL
+
+# Only `bin/grok` is taken from the bundle — see the ADD above for why the bridge
+# is not. `--version` is the real gate on the binary: a truncated download, a wrong
+# asset or a glibc mismatch between the build host and this base all fail HERE,
+# in a build log, rather than at the first prompt an agent receives.
+RUN test -n "$GROK_BUNDLE_URL" \
+      || { echo "ERROR: GROK_BUNDLE_URL is empty — the deployer must pass the published bundle URL" >&2; exit 1; } \
+    && echo "fetching the agent binary: $GROK_BUNDLE_URL (built from ${GROK_BUNDLE_SHA})" \
+    && curl -fsSL --retry 3 --retry-delay 2 --max-time 900 -o /tmp/grok-bundle.tar.gz "$GROK_BUNDLE_URL" \
+    && tar -xzf /tmp/grok-bundle.tar.gz -C /app bin/grok \
+    && rm -f /tmp/grok-bundle.tar.gz \
+    && chmod +x /app/bin/grok \
+    && /app/bin/grok --version
+
+# The node uploads runtime inputs to /app/input before starting the container; the
+# directory must exist for the upload (and the container start) to succeed. /data is
+# the VM's persistent mount — session workspaces and the CLI's per-thread config
+# live there so a conversation's files survive a container restart.
+RUN mkdir -p /app/input /data/workspaces /data/grok-config \
+    && useradd --create-home --shell /bin/bash grok \
+    && chown -R grok:grok /app /data
+
+# An autonomous agent has no human to approve tool calls, and nothing it does needs
+# root — so the creature runs unprivileged.
+USER grok
+ENV HOME=/home/grok \
+    NODE_ENV=production \
+    GROK_BIN=/app/bin/grok \
+    GROK_CREATURE_INPUT_DIR=/app/input \
+    GROK_CREATURE_WORKSPACE_ROOT=/data/workspaces \
+    GROK_CREATURE_CONFIG_DIR=/data/grok-config \
+    GROK_CREATURE_PERMISSION_MODE=bypassPermissions
+
+# Serve prompts over the signaling API (the gateway path). With no gateway env
+# injected, the same entrypoint answers one task from /app/input and exits — the
+# offline self-test.
+CMD ["node", "/app/caspar/runtime.mjs"]

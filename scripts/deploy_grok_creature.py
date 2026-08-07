@@ -14,10 +14,11 @@ What this script does, in order:
 
   1. log in to the node as the deploy operator (the SAME account that owns the
      program being reused — a program can only be redeployed by its owner);
-  2. gzip-tar the build context — the prebuilt `bin/grok` + `caspar/` by default,
+  2. gzip-tar the build context — just the `caspar/` bridge by default (~200 KB),
      or this repo's Rust source in `source` mode;
-  3. compose the Dockerfile: `caspar/Dockerfile[.prebuilt]` + the host CA bundle +
-     the baked env (the xAI credentials, never written to disk here) + a
+  3. compose the Dockerfile: `caspar/Dockerfile.fetch` (stamped with the published
+     bundle's URL + commit) or `caspar/Dockerfile`, plus the host CA bundle, the
+     baked env (the xAI credentials, never written to disk here) and a
      context-digest LABEL;
   4. deploy the entity — onto an EXISTING program id when one is given, so
      already-deployed agent proxies keep pointing at a valid backbone;
@@ -50,10 +51,25 @@ Grok backbone (baked into the image; read from this environment only):
     GROK_CREATURE_MODEL, GROK_CREATURE_LLM_* (a non-xAI default backbone)
 
 Agent build:
-    GROK_CLI_SOURCE         prebuilt (default: ship a CI-built bin/grok, no compile
-                            on the node — caspar/Dockerfile.prebuilt)
-                            | source (compile crates/ inside the image)
-                            | release (download the published grok binary)
+    GROK_CLI_SOURCE         prebuilt (default: the IMAGE downloads the bundle this
+                            repo's build-grok-creature workflow published —
+                            caspar/Dockerfile.fetch; nothing is compiled anywhere)
+                            | source (compile crates/ inside the image; its context
+                              exceeds what a deploy signal can carry, see below)
+                            | release (the image downloads the published x.ai CLI)
+    GROK_BUNDLE_URL         the bundle to download. Derived when unset from this
+                            checkout's origin remote + branch:
+                            .../releases/download/creature-<branch>/bundle.tar.gz
+    GROK_BUNDLE_REPO / GROK_BUNDLE_BRANCH  override just those parts of the URL
+    GROK_BUNDLE_TOKEN       bearer token, only for a private backbone repo (the
+                            NODE must be able to fetch the URL too, so prefer a
+                            publicly readable asset)
+    GROK_MAX_DEPLOY_MB      refuse a payload over this (default 16). A deploy is
+                            ONE frame and caspar caps it at 20 MB; an oversized
+                            frame is answered by closing the socket, which reaches
+                            the deployer as a bare "[Errno 32] Broken pipe". This
+                            is why the ~170 MB binary is fetched by the image
+                            rather than shipped in the payload.
     GROK_RUNTIME_BASE       runtime image base (default node:22-trixie-slim via ECR)
 
 VM:
@@ -73,9 +89,13 @@ Output (stdout, machine-readable — the CI greps these):
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
 import sys
 import tarfile
+import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -107,12 +127,18 @@ from caspar_signaling import CasparSignalingClient  # noqa: E402
 ENTITY_ID = env_any("GROK_ENTITY_ID", "DAVINCI_ENTITY_ID", "CLAUDE_ENTITY_ID", default="davinci")
 
 # Where the agent's binary comes from:
-#   prebuilt (default) use a bin/grok built earlier on the CI host (the lightweight
-#                      path: the image build is a copy, not a cargo build — see
-#                      scripts/package-creature.sh and caspar/Dockerfile.prebuilt);
+#   prebuilt (default) the IMAGE downloads the bundle this repo's
+#                      `build-grok-creature` workflow published (caspar/Dockerfile.fetch);
 #   source            compile this repo's crates/ inside the image;
-#   release           download the published CLI (a fallback, not the default).
+#   release           the image downloads the published x.ai CLI.
 CLI_SOURCES = ("prebuilt", "source", "release")
+
+# How big a deploy payload the node will accept. A deploy is ONE length-prefixed
+# frame; caspar caps it (network/framing.rs MAX_FRAME_LEN = 20 MB, and the TCP
+# client path at 32 MB) and simply closes the connection when a frame is over —
+# which surfaces here as `[Errno 32] Broken pipe`, with nothing explaining why. So
+# the payload is checked before it is sent, well under the smaller cap.
+MAX_PAYLOAD_MB = int(env_any("GROK_MAX_DEPLOY_MB", default="16"))
 
 
 def resolve_cli_source() -> str:
@@ -125,6 +151,59 @@ def resolve_cli_source() -> str:
         warn(f"unknown GROK_CLI_SOURCE={mode!r} — falling back to 'prebuilt'")
         mode = "prebuilt"
     return mode
+
+
+def git_output(*args: str) -> str:
+    try:
+        import subprocess
+
+        out = subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:  # noqa: BLE001 — a missing/odd checkout just means "derive nothing"
+        return ""
+
+
+def bundle_url() -> str:
+    """The published bundle the image will download.
+
+    Explicit `GROK_BUNDLE_URL` wins. Otherwise it is derived from this checkout:
+    the origin remote's `owner/repo` and the branch it is on, which is exactly what
+    the `build-grok-creature` workflow publishes as `creature-<branch>`.
+    """
+    explicit = env_any("GROK_BUNDLE_URL", default="")
+    if explicit:
+        return explicit
+    remote = env_any("GROK_BUNDLE_REPO", default="") or git_output("remote", "get-url", "origin")
+    branch = env_any("GROK_BUNDLE_BRANCH", "AGENT_BRANCH", default="") or git_output("rev-parse", "--abbrev-ref", "HEAD")
+    path = re.sub(r"^[a-z]+://[^/]+/", "", remote or "").removesuffix(".git")
+    path = re.sub(r"^git@[^:]+:", "", path)
+    if not path:
+        return ""
+    slug = (branch or "main").replace("/", "-")
+    return f"https://github.com/{path}/releases/download/creature-{slug}/bundle.tar.gz"
+
+
+def bundle_sha(url: str) -> str:
+    """The commit the published bundle was built from, for the image's cache key.
+
+    Best-effort: the manifest sits next to the bundle. Without it the build still
+    works — it just cannot tell a refreshed bundle at the same URL from the one it
+    already cached, so the label falls back to a timestamp.
+    """
+    if not url.endswith("bundle.tar.gz"):
+        return ""
+    manifest_url = url[: -len("bundle.tar.gz")] + "manifest.json"
+    request = urllib.request.Request(manifest_url)
+    token = env_any("GROK_BUNDLE_TOKEN", default="")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+            data = json.loads(response.read().decode("utf-8"))
+        return str(data.get("gitSha") or "")
+    except Exception as exc:  # noqa: BLE001 — advisory only
+        warn(f"could not read the bundle manifest ({exc}); the image cannot cache-key on the bundle's commit")
+        return ""
 
 
 # The backbone credentials + runtime knobs to bake into the image. Read from this
@@ -206,30 +285,23 @@ def _tar_filter(entry: tarfile.TarInfo):
 def bundle_tar_gz() -> bytes:
     """Gzip a tar of the build context.
 
-    Gzipped because it travels inside a deploy signal. In the default `prebuilt`
-    mode that is the compiled binary plus the ~200 KB signaling bridge; `source`
-    mode ships the whole Rust workspace, which is an order of magnitude larger and
-    is why it is not the default. `ADD bundle.tar.gz` unpacks it in the image.
+    This travels inside a deploy signal, so it has to stay small (see
+    MAX_PAYLOAD_MB). In `prebuilt` and `release` mode it is just the ~200 KB
+    signaling bridge — the agent binary is downloaded by the image build itself.
+    `source` mode ships the whole Rust workspace, which is far over that limit on
+    this repo and is why it is neither the default nor generally usable here.
+    `ADD bundle.tar.gz` unpacks it in the image.
     """
     mode = resolve_cli_source()
-    binary = REPO / "bin" / "grok"
-    if mode == "prebuilt" and not binary.exists():
-        bad("GROK_CLI_SOURCE=prebuilt, but bin/grok is not present. "
-            "Build it first (scripts/package-creature.sh), or download the CI artifact into bin/.")
-        raise SystemExit(2)
 
     buf = io.BytesIO()
     # mtime=0 keeps the gzip header (and therefore the context digest) stable.
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9) as tar:
         tar.gzip_mtime = 0  # type: ignore[attr-defined]  (documented no-op on old pythons)
         caspar_root = REPO / "caspar"
-        if mode == "prebuilt":
-            info(f"shipping the prebuilt agent binary ({binary.stat().st_size // 1048576} MiB) — no compile on the node")
-            tar.add(binary, arcname="bin/grok", filter=_tar_filter)
-            for path in sorted(p for p in caspar_root.rglob("*") if p.is_file()):
-                tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
-        elif mode == "release":
-            info("shipping only the signaling bridge — the image downloads the published grok binary")
+        if mode in ("prebuilt", "release"):
+            what = "the published bundle" if mode == "prebuilt" else "the published grok binary"
+            info(f"shipping only the signaling bridge — the image downloads {what}")
             for path in sorted(p for p in caspar_root.rglob("*") if p.is_file()):
                 tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
         else:
@@ -243,11 +315,6 @@ def bundle_tar_gz() -> bytes:
                 path = REPO / name
                 if path.exists():
                     tar.add(path, arcname=name, filter=_tar_filter)
-            # A binary already built on this host is shipped too, so the image can
-            # use it directly instead of rebuilding.
-            if binary.exists() and truthy(os.environ.get("GROK_SHIP_LOCAL_BINARY", "0")):
-                info(f"shipping the locally built binary ({binary.stat().st_size // 1048576} MiB)")
-                tar.add(binary, arcname="bin/grok", filter=_tar_filter)
     return buf.getvalue()
 
 
@@ -255,16 +322,31 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
     """The image's Dockerfile: repo file + build mode + CA + baked env + label."""
     cli_source = resolve_cli_source()
     mode_blurb = {
-        "prebuilt": " (copying in the CI-built bin/grok — no compile on the node)",
+        "prebuilt": " (the image downloads the bundle this repo's workflow published)",
         "source": " (compiling crates/ inside the image — slow; expect tens of minutes)",
         "release": " (downloading the published grok binary)",
     }[cli_source]
     info(f"agent build mode: {cli_source}{mode_blurb}")
 
-    dockerfile_name = "Dockerfile.prebuilt" if cli_source == "prebuilt" else "Dockerfile"
+    dockerfile_name = "Dockerfile.fetch" if cli_source == "prebuilt" else "Dockerfile"
     dockerfile = (REPO / "caspar" / dockerfile_name).read_bytes()
 
-    # These substitutions apply to caspar/Dockerfile (source/release); the prebuilt
+    if cli_source == "prebuilt":
+        # The binary cannot ride the deploy signal (it is ~170 MB), so the image
+        # fetches it. Everything the build needs to do that is stamped in here.
+        url = bundle_url()
+        if not url:
+            bad("GROK_CLI_SOURCE=prebuilt, but no bundle URL could be determined. "
+                "Set GROK_BUNDLE_URL, or run from a checkout whose origin remote and branch "
+                "name the published creature-<branch> release.")
+            raise SystemExit(2)
+        sha = bundle_sha(url) or f"unknown-{int(time.time())}"
+        info(f"agent binary: {url}")
+        info(f"published from commit {sha}")
+        dockerfile = dockerfile.replace(b"ARG GROK_BUNDLE_URL", f"ARG GROK_BUNDLE_URL={url}".encode(), 1)
+        dockerfile = dockerfile.replace(b"ARG GROK_BUNDLE_SHA=unknown", f"ARG GROK_BUNDLE_SHA={sha}".encode(), 1)
+
+    # These substitutions apply to caspar/Dockerfile (source/release); the fetch
     # Dockerfile has no GROK_CLI_SOURCE ARG, so the replace is a no-op there.
     dockerfile = dockerfile.replace(b"ARG GROK_CLI_SOURCE=source", f"ARG GROK_CLI_SOURCE={cli_source}".encode())
     runtime_base = env_any("GROK_RUNTIME_BASE", default="")
@@ -304,7 +386,19 @@ def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) ->
         info(f"created machine creature {creature_id} and program {program_id}")
 
     context = bundle_tar_gz()
-    info(f"build context: {len(context) / 1048576:.1f} MiB gzipped ({len(context) * 4 // 3 // 1048576} MiB as base64 in the deploy signal)")
+    encoded_mb = len(context) * 4 / 3 / 1048576
+    info(f"build context: {len(context) / 1048576:.1f} MiB gzipped ({encoded_mb:.1f} MiB as base64 in the deploy signal)")
+    if encoded_mb > MAX_PAYLOAD_MB:
+        # The node closes the connection on an oversized frame, which would reach
+        # us as an unexplained "[Errno 32] Broken pipe" halfway through the send.
+        bad(f"the deploy payload is {encoded_mb:.1f} MiB, over the {MAX_PAYLOAD_MB} MiB a single deploy signal may carry.")
+        bad("The node rejects an oversized frame by closing the socket, which looks like a broken pipe.")
+        if resolve_cli_source() == "source":
+            bad("`source` mode ships the whole Rust workspace — use the default GROK_CLI_SOURCE=prebuilt, "
+                "where the image downloads the published bundle instead.")
+        else:
+            bad("Raise GROK_MAX_DEPLOY_MB only if this node's frame cap is genuinely larger.")
+        raise SystemExit(2)
     files: Dict[str, str] = {"bundle.tar.gz": b64_bytes(context)}
     dockerfile, digest = compose_dockerfile(files)
     already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
