@@ -49,6 +49,16 @@ echo "[caspar] building the agent from crates/ (cargo --release, this takes a wh
 PROTOC="${PROTOC:-$(command -v protoc || true)}"
 export PROTOC
 [ -n "$PROTOC" ] || { echo "[caspar] ERROR: no protoc available for the proto build" >&2; exit 1; }
+# The tools proto uses proto3 optional fields, which protoc rejects before 3.15
+# ("--experimental_allow_proto3_optional was not set") from deep inside a build
+# script. Fail here instead, where the reason is obvious.
+protoc_ver="$("$PROTOC" --version 2>/dev/null | sed -E 's/[^0-9]*([0-9]+)\.([0-9]+).*/\1 \2/')"
+set -- $protoc_ver
+if [ "${1:-0}" -lt 3 ] || { [ "${1:-0}" -eq 3 ] && [ "${2:-0}" -lt 15 ]; }; then
+  echo "[caspar] ERROR: $PROTOC is $("$PROTOC" --version 2>/dev/null) — this tree needs protoc >= 3.15" >&2
+  echo "[caspar]        (its proto3 optional fields are rejected by older releases)" >&2
+  exit 1
+fi
 
 cargo build --release --locked -p xai-grok-pager-bin
 mkdir -p bin

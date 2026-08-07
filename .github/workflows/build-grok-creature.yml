@@ -83,10 +83,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protoc
-        # The proto build resolves bin/protoc through DotSlash; the system protoc
-        # is the supported alternative and needs no download at build time.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # No protoc step: scripts/package-creature.sh resolves one itself, downloading
+      # the exact version bin/protoc pins (hash-verified) when the runner has no
+      # DotSlash and no protoc new enough. Installing apt's protobuf-compiler here
+      # would be actively wrong on this runner — 22.04 ships 3.12, which rejects the
+      # proto3 optional fields this tree uses.
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -95,7 +96,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: grok-creature-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            .protoc-cache
+          key: grok-creature-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'bin/protoc') }}
           restore-keys: grok-creature-cargo-
 
       - name: Build + package the creature bundle (from crates/, not a release download)

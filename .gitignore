@@ -5,3 +5,4 @@
 # Caspar creature build artifacts (see caspar/README.md)
 /bin/grok
 /out
+/.protoc-cache
