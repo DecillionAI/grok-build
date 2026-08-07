@@ -259,6 +259,23 @@ Key knobs (all documented in the script's header):
 | `GROK_READY_TIMEOUT` | How long to wait for the creature's `GROK_READY` line (default 180s, or 600s when the image build cannot be observed from the deploy host) |
 | `GROK_RESTART_ON_NOT_READY` | `1` (default) — restart the entity once when it never reports ready, which is what picks up an image that finished building after the first start |
 
+### Why the image wait used to take its full timeout, every time
+
+The node names a creature's image after the **machine (creature) id**
+(`vms/docker/src/controller.rs::docker_image_ref` → `<machine_id>/<entity_id>`),
+but the deploy scripts polled `<program_id>/<entity_id>`. Those are different ids —
+a creature minted as `8@global` gets program `10@global` — so the tag being polled
+never existed and every wait ran to its timeout (900s for the agent, 600s for the
+github tool, 480s for the sandbox: up to **33 minutes of nothing per deploy**),
+then warned that the image "did not appear". A redeploy cannot even derive the
+machine id: it is minted on the *first* deploy and not recorded afterwards.
+
+The wait now asks for the **context-digest label** every deployed Dockerfile is
+stamped with (`images_with_context`), which identifies our build exactly and needs
+no id mapping. The same lookup answers "is this context already built?", so an
+unchanged creature skips the wait outright instead of polling for a tag that will
+never appear.
+
 ### Why a deploy can "succeed" with the old creature still serving
 
 The node builds the image **asynchronously** and `runEntity` starts whatever image

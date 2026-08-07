@@ -303,7 +303,45 @@ def stamp_context(dockerfile: bytes, files_b64: Dict[str, str]) -> Tuple[bytes, 
 
 
 def image_tag(program_id: str, entity_id: str) -> str:
+    """The image tag a program/entity *would* have if tags were keyed by program.
+
+    They are NOT. The node builds and runs `<machine_id>/<entity_id>` — see caspar's
+    `vms/docker/src/controller.rs::docker_image_ref`, which takes the **machine
+    (creature) id**, not the program id. Those differ (a creature minted as
+    `8@global` gets program `10@global`), and a redeploy onto an existing program
+    does not even know the machine id: it was minted on the *first* deploy.
+
+    So this is only a display/fallback hint. Anything that must actually FIND the
+    image goes through the context-digest label instead (`images_with_context`),
+    which is exact and needs no id mapping at all.
+    """
     return f"{program_id.replace('@', '_')}/{entity_id}"
+
+
+def images_with_context(digest: str) -> List[str]:
+    """Image tags carrying our context-digest label — the reliable way to find one.
+
+    Every Dockerfile this repo deploys is stamped with `LABEL <CONTEXT_LABEL>=
+    <digest>` (see `stamp_context`), so asking docker for images with that exact
+    label answers "has the node finished building MY context?" without knowing how
+    the image is named. Matching on the tag instead is what made every build wait
+    burn its full timeout: the tag we guessed never existed.
+    """
+    cli = docker_cli()
+    if not cli or not digest:
+        return []
+    try:
+        out = subprocess.run(
+            [*cli, "images", "--filter", f"label={CONTEXT_LABEL}={digest}", "--format", "{{.Repository}}:{{.Tag}}"],
+            capture_output=True, text=True, timeout=15)
+        return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def image_built_for_context(digest: str) -> bool:
+    """True when an image built from exactly this context already exists."""
+    return bool(images_with_context(digest))
 
 
 # How this process talks to docker, resolved once. The node builds creature images
@@ -382,12 +420,19 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
              "— skipping the image wait (add this user to the docker group, or allow passwordless sudo, "
              "to get build observability back). The entity's readiness check is the real signal.")
         return True
-    deadline = time.time() + timeout
+    started = time.time()
+    deadline = started + timeout
     info(f"waiting for the node to build image {tag} (≤{timeout}s)…")
+    # A silent 15-minute wait is indistinguishable from a hung deploy — and that is
+    # exactly what this looked like from the CI log. Report progress while waiting.
+    heartbeat = float(env_any("CASPAR_WAIT_HEARTBEAT_SECS", default="30")) or 30.0
+    next_beat = started + heartbeat
     while time.time() < deadline:
-        if expect_context and docker_image_context(program_id, entity_id) == expect_context:
-            ok(f"image built from the deployed context: {tag}")
-            return True
+        if expect_context:
+            built = images_with_context(expect_context)
+            if built:
+                ok(f"image built from the deployed context: {', '.join(built[:3])}")
+                return True
         current = docker_image_id(program_id, entity_id)
         if prev_image_id and current and current != prev_image_id:
             ok(f"image rebuilt: {tag} -> {current[:19]}")
@@ -395,6 +440,11 @@ def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
         if not prev_image_id and not expect_context and current:
             ok(f"image present: {tag}")
             return True
+        now = time.time()
+        if now >= next_beat:
+            info(f"  … still building {tag} — {int(now - started)}s elapsed of {timeout}s "
+                 f"(the node builds asynchronously; this only watches)")
+            next_beat = now + heartbeat
         time.sleep(3)
     warn(f"image {tag} did not appear/change within {timeout}s — proceeding with the current image; "
          "check the node's build logs if the entity misbehaves (a host that cannot query docker "

@@ -117,7 +117,7 @@ from caspar_deploy_common import (  # noqa: E402
     bad,
     bake_snippet,
     docker_cli,
-    docker_image_context,
+    image_built_for_context,
     docker_image_id,
     env_any,
     info,
@@ -444,7 +444,9 @@ def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) ->
         raise SystemExit(2)
     files: Dict[str, str] = {"bundle.tar.gz": b64_bytes(context)}
     dockerfile, digest = compose_dockerfile(files)
-    already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
+    # Does an image built from exactly this context already exist? Asked by
+    # LABEL, because the node names images by machine id, not program id.
+    already_current = image_built_for_context(digest)
 
     client.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile), files_b64=files)
     if already_current:
