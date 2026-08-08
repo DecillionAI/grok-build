@@ -128,7 +128,60 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
   if (!list.length) return "";
   const agents = list.filter((c) => c.kind === "agent");
   const tools = list.filter((c) => c.kind !== "agent");
-  const render = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
+
+  /**
+   * Render one capability with its inline schema so the model can call it
+   * without a second search_tool round-trip. Historically the listing only
+   * carried name + description; multi-function creatures (the sandbox, the
+   * github tool) declare their operations in a `function` field of the
+   * schema, and without seeing its enum the model routinely invented
+   * compound tool names like `caspar__vercel_sandbox_exec` — which do not
+   * exist — and then reported "I don't have access to that action" to the
+   * user. Rendering the enum + the other args inline fixes that at source.
+   */
+  const renderTool = (c) => {
+    const parts = [`  • ${c.name}`];
+    if (c.description) parts.push(`— ${String(c.description).slice(0, 300)}`);
+    const props = c.inputSchema && typeof c.inputSchema === "object" ? c.inputSchema.properties : null;
+    const required = c.inputSchema && Array.isArray(c.inputSchema.required) ? c.inputSchema.required : [];
+    const pinned = new Set(Array.isArray(c.defaults) ? c.defaults : []);
+    let head = parts.join(" ");
+    if (!props || typeof props !== "object") return head;
+    const argLines = [];
+    // Surface `function` first (it decides which operation runs), then the
+    // rest of the args in schema order. Skip anything the platform pins for
+    // this call — the model must never pass those, and listing them invites
+    // it to try.
+    const keys = Object.keys(props);
+    keys.sort((a, b) => (a === "function" ? -1 : b === "function" ? 1 : 0));
+    for (const key of keys) {
+      if (pinned.has(key)) continue;
+      const spec = props[key] && typeof props[key] === "object" ? props[key] : {};
+      const type = typeof spec.type === "string" ? spec.type : "string";
+      const enumValues = Array.isArray(spec.enum) ? spec.enum : null;
+      const isRequired = required.includes(key);
+      const enumLabel = enumValues && enumValues.length
+        ? ` = one of { ${enumValues.slice(0, 24).join(", ")}${enumValues.length > 24 ? ", …" : ""} }`
+        : "";
+      const desc = typeof spec.description === "string" && spec.description
+        ? ` — ${String(spec.description).slice(0, 180)}`
+        : "";
+      const req = isRequired ? "" : " (optional)";
+      argLines.push(`      – ${key}: ${type}${enumLabel}${req}${desc}`);
+    }
+    if (c.defaultFunction && props.function) {
+      head += ` (default function: \`${c.defaultFunction}\`)`;
+    }
+    if (pinned.size) {
+      head += ` — the platform pins ${[...pinned].join(", ")}, do NOT pass ${pinned.size === 1 ? "it" : "them"}`;
+    }
+    if (!argLines.length) return head;
+    return `${head}\n    tool_input:\n${argLines.join("\n")}`;
+  };
+
+  const renderAgent = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
+
+  const render = (c) => (c.kind === "agent" ? renderAgent(c) : renderTool(c));
 
   const sharedEnv = opts.sharedEnv && opts.sharedEnv.name ? opts.sharedEnv : null;
   const disabledBuiltins = Array.isArray(opts.disabledBuiltins) ? opts.disabledBuiltins.filter(Boolean) : [];
@@ -169,8 +222,15 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "harness you happen to run on.\n" +
     "HOW TO CALL THEM: each one is an MCP tool, so you invoke it with the `use_tool` " +
     'meta-tool — use_tool(tool_name: "<the name listed below>", tool_input: { … }). ' +
-    "The names below are already fully qualified; use them verbatim. (`search_tool` " +
-    "can look one up again, but you do not need it — the full list is right here.)\n" +
+    "The names below are already fully qualified — use them verbatim, and NEVER " +
+    "invent a compound tool name for an operation. A multi-function creature (its " +
+    "listing shows a `function` field with an enum) selects the operation through " +
+    "that argument: e.g. `use_tool(tool_name: \"caspar__vercel_sandbox\", " +
+    'tool_input: { function: "exec", command: "npm test" })` — NOT ' +
+    "`use_tool(tool_name: \"caspar__vercel_sandbox_exec\", …)`, which does not exist " +
+    "and will come back as `Tool not found`. If a listing below shows no `function` " +
+    'field, the tool has a single operation — just pass its named args. `search_tool` ' +
+    "can refetch the live catalog when a teammate adds a tool mid-conversation.\n" +
     sharedBlock +
     sections.join("\n") +
     "\n" +

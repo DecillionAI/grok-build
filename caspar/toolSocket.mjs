@@ -77,7 +77,10 @@ export class ToolSocketServer {
   async _handle(request) {
     const id = request?.id ?? null;
     try {
-      if (request?.op === "list") return { id, ok: true, tools: this.handlers.list() };
+      // `list` may now do live discovery (hit the node to refresh the space's
+      // roster) so it can return a Promise. Await regardless of whether the
+      // handler is sync or async.
+      if (request?.op === "list") return { id, ok: true, tools: await this.handlers.list() };
       if (request?.op === "call") {
         const result = await this.handlers.call(String(request.name || ""), request.args || {});
         return { id, ok: true, result };

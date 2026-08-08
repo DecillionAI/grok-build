@@ -150,7 +150,53 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // The space's creatures, exposed to Grok as an MCP server. Nothing is wired
   // when the space has none: an agent handed tools that do not exist will promise
   // capabilities it cannot deliver.
+  //
+  // The initial catalog is what we bake into the system prompt (the model has
+  // to see something on turn one). But every subsequent `search_tool` MCP call
+  // re-runs discovery live against the node's on-chain program index, so a
+  // tool a teammate attaches mid-conversation shows up on the next call.
+  // A short in-memory cache keeps a burst of search_tool calls from
+  // hammering the node — a slow node's discovery already backs off inside
+  // discoverSpaceCatalog.
   const { tools: toolDefs, byName } = buildToolDefinitions(catalog);
+  const DISCOVERY_CACHE_MS = creatureNumber("DISCOVERY_CACHE_MS", 2000);
+  let lastToolDefs = toolDefs;
+  let lastDiscoveryAt = Date.now();
+  let refreshInFlight = null;
+  const refreshCatalog = async () => {
+    // If a fresh (< TTL) result exists, hand it back without a round-trip.
+    if (Date.now() - lastDiscoveryAt < DISCOVERY_CACHE_MS) return lastToolDefs;
+    // Collapse concurrent refreshes onto one node call.
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = (async () => {
+      try {
+        let liveCatalog = tools;
+        if (bridge) {
+          try {
+            const discovered = await discoverSpaceCatalog(bridge, task, {
+              log: () => {}, // don't spam the boot log on every search_tool
+            });
+            if (discovered.length) liveCatalog = mergeCatalogs(tools, discovered);
+          } catch {
+            // Discovery is best-effort — a slow node keeps the previous catalog
+            // rather than blanking the model's tool list.
+            return lastToolDefs;
+          }
+        }
+        const rebuilt = buildToolDefinitions(liveCatalog);
+        // Mutate the invoker's byName in place so calls to freshly-discovered
+        // tools work without swapping the reference the ToolInvoker holds.
+        byName.clear();
+        for (const [k, v] of rebuilt.byName) byName.set(k, v);
+        lastToolDefs = rebuilt.tools;
+        lastDiscoveryAt = Date.now();
+        return lastToolDefs;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+    return refreshInFlight;
+  };
   let invoker = null;
   let socketServer = null;
   let sandboxBridge = null;
@@ -161,7 +207,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     invoker = new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "");
     const socketPath = path.join(tempDir, "tools.sock");
     socketServer = new ToolSocketServer(socketPath, {
-      list: () => toolDefs,
+      list: () => refreshCatalog(),
       call: (name, args) => invoker.invoke(name, args),
     });
     try {
@@ -213,11 +259,24 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // Grok reaches MCP tools through its `use_tool` meta-tool, addressing them as
   // `<server>__<tool>` — so that qualified name is what the prompt must name.
   const qualify = (name) => `${MCP_SERVER_NAME}__${name}`;
-  const capabilities = toolDefs.map((t) => ({
-    name: qualify(t.name),
-    description: t.description,
-    kind: byName.get(t.name)?.kind || "tool",
-  }));
+  // The catalog carries the arg schema, the enum of operations for
+  // multi-function tools, and the platform-pinned defaults. Passing them
+  // through to the prompt (instead of just name + description) lets the model
+  // see how to *call* each tool — not merely that it exists — which is what
+  // stops it from inventing compound tool names like
+  // `caspar__vercel_sandbox_exec` and then telling the user it "doesn't have
+  // access to that action". See prompt.capabilitiesPreamble.
+  const capabilities = toolDefs.map((t) => {
+    const entry = byName.get(t.name) || {};
+    return {
+      name: qualify(t.name),
+      description: t.description,
+      kind: entry.kind || "tool",
+      inputSchema: t.inputSchema,
+      defaults: entry.defaults && typeof entry.defaults === "object" ? Object.keys(entry.defaults) : [],
+      defaultFunction: entry.function || undefined,
+    };
+  });
   // The space's shared machine (the cloud sandbox): the agent must treat its
   // filesystem/shell as the collaborative workspace, not its private local dir.
   // Recognised by the descriptor the platform publishes (category "execution")

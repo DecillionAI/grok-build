@@ -156,6 +156,14 @@ export function entryFromDescriptor(d, routing) {
     arg_schema: argSchema,
     ...(Array.isArray(d.requiredArgs) ? { required: d.requiredArgs } : {}),
     ...(d.function ? { function: d.function } : {}),
+    // The descriptor's per-action listing is what tells the model which
+    // operations it can pass in `function`. Carrying `tools` (and any
+    // explicit `functions` array the descriptor provides) through unchanged
+    // lets `catalog.extractFunctions` derive the enum without a second
+    // metadata fetch — otherwise the model sees a bare string field and
+    // routinely invents a compound tool name.
+    ...(Array.isArray(d.tools) ? { tools: d.tools } : {}),
+    ...(Array.isArray(d.functions) ? { functions: d.functions } : {}),
     requires_network: !!d.requiresNetwork,
     risk: d.risk || "low",
     // Routing ids in the snake_case shape catalog.mjs + toolInvoker.mjs read.
