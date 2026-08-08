@@ -308,7 +308,11 @@ async function readMembers(bridge, spaceId, timeoutMs) {
  *
  * @param bridge  connected `CasparBridgeClient` (null → returns []).
  * @param task    the decoded task (for the space id).
- * @param opts    `{ timeoutMs, maxMembers, log }`.
+ * @param opts    `{ timeoutMs, maxMembers, log, programIndexOnly }`.
+ *                `programIndexOnly` skips the per-member `getCreature` fan-out
+ *                (used for the cheap live refresh on every `search_tool`, where
+ *                the program index is authoritative and the members supplement
+ *                is not worth N node round-trips per tool-list).
  * @returns catalog entries (possibly empty). Never throws.
  */
 export async function discoverSpaceCatalog(bridge, task, opts = {}) {
@@ -316,6 +320,7 @@ export async function discoverSpaceCatalog(bridge, task, opts = {}) {
   if (!bridge || typeof bridge.call !== "function") return [];
   const spaceId = resolveSpaceId(task);
   if (!spaceId) return [];
+  const programIndexOnly = Boolean(opts.programIndexOnly);
 
   const timeoutMs = num(opts.timeoutMs, num(creatureEnv("DISCOVER_TIMEOUT_MS"), 8000));
   const maxMembers = num(opts.maxMembers, num(creatureEnv("DISCOVER_MAX"), 50));
@@ -346,8 +351,11 @@ export async function discoverSpaceCatalog(bridge, task, opts = {}) {
   }
 
   // 2) Store members — a supplement / fallback. Descriptor per member, so only
-  //    creatures that advertise one are employable.
-  if (byKey.size < maxMembers) {
+  //    creatures that advertise one are employable. Skipped for the cheap live
+  //    refresh (`programIndexOnly`): the program index above already carries
+  //    every attached tool + sub-agent, and the per-member `getCreature`
+  //    fan-out is what made a per-`search_tool` refresh block the whole run.
+  if (!programIndexOnly && byKey.size < maxMembers) {
     const members = await readMembers(bridge, spaceId, timeoutMs);
     const seen = new Set();
     const unique = [];

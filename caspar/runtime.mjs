@@ -159,43 +159,49 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // hammering the node — a slow node's discovery already backs off inside
   // discoverSpaceCatalog.
   const { tools: toolDefs, byName } = buildToolDefinitions(catalog);
-  const DISCOVERY_CACHE_MS = creatureNumber("DISCOVERY_CACHE_MS", 2000);
+  // Live re-discovery is **stale-while-revalidate**: `tools/list` (grok's
+  // `search_tool`) is answered INSTANTLY from the last-known catalog, and a
+  // refresh runs in the background to pick up tools a teammate attached
+  // mid-conversation. This matters because `search_tool` is on the model's
+  // hot path — an earlier version awaited discovery on every call, and a
+  // single slow node round-trip there stalled the whole run at `search_tool`.
+  // The refresh is also cheap: program-index only (no per-member getCreature
+  // fan-out), short-bounded, and never throws into the list handler.
+  const DISCOVERY_CACHE_MS = creatureNumber("DISCOVERY_CACHE_MS", 15000);
+  const DISCOVERY_REFRESH_TIMEOUT_MS = creatureNumber("DISCOVERY_REFRESH_TIMEOUT_MS", 4000);
   let lastToolDefs = toolDefs;
   let lastDiscoveryAt = Date.now();
   let refreshInFlight = null;
-  const refreshCatalog = async () => {
-    // If a fresh (< TTL) result exists, hand it back without a round-trip.
-    if (Date.now() - lastDiscoveryAt < DISCOVERY_CACHE_MS) return lastToolDefs;
-    // Collapse concurrent refreshes onto one node call.
-    if (refreshInFlight) return refreshInFlight;
+  const startBackgroundRefresh = () => {
+    if (!bridge || refreshInFlight) return;
+    if (Date.now() - lastDiscoveryAt < DISCOVERY_CACHE_MS) return;
     refreshInFlight = (async () => {
       try {
-        let liveCatalog = tools;
-        if (bridge) {
-          try {
-            const discovered = await discoverSpaceCatalog(bridge, task, {
-              log: () => {}, // don't spam the boot log on every search_tool
-            });
-            if (discovered.length) liveCatalog = mergeCatalogs(tools, discovered);
-          } catch {
-            // Discovery is best-effort — a slow node keeps the previous catalog
-            // rather than blanking the model's tool list.
-            return lastToolDefs;
-          }
-        }
+        const discovered = await discoverSpaceCatalog(bridge, task, {
+          log: () => {}, // don't spam the boot log on every search_tool
+          programIndexOnly: true,
+          timeoutMs: DISCOVERY_REFRESH_TIMEOUT_MS,
+        });
+        const liveCatalog = discovered.length ? mergeCatalogs(tools, discovered) : tools;
         const rebuilt = buildToolDefinitions(liveCatalog);
-        // Mutate the invoker's byName in place so calls to freshly-discovered
-        // tools work without swapping the reference the ToolInvoker holds.
+        // Swap the invoker's byName in place so freshly-discovered tools are
+        // callable without replacing the reference the ToolInvoker holds.
         byName.clear();
         for (const [k, v] of rebuilt.byName) byName.set(k, v);
         lastToolDefs = rebuilt.tools;
         lastDiscoveryAt = Date.now();
-        return lastToolDefs;
+      } catch {
+        // Best-effort: a slow/failed node refresh keeps the previous catalog.
+        lastDiscoveryAt = Date.now(); // back off so we don't hammer a sick node
       } finally {
         refreshInFlight = null;
       }
     })();
-    return refreshInFlight;
+  };
+  // Return immediately with what we have; kick the refresh off for NEXT time.
+  const refreshCatalog = () => {
+    startBackgroundRefresh();
+    return lastToolDefs;
   };
   let invoker = null;
   let socketServer = null;
