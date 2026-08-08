@@ -37,7 +37,17 @@ const PROVIDERS = [
     aliases: ["open-ai", "chatgpt"],
     label: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
-    apiBackend: "chat_completions",
+    // OpenAI's newer reasoning models (gpt-5.x, o1-*, o3-*, luna, sol) reject
+    // `/v1/chat/completions` when function tools are attached together with a
+    // non-none `reasoning_effort`:
+    //     "Function tools with reasoning_effort are not supported for
+    //      gpt-5.6-sol in /v1/chat/completions. To use function tools, use
+    //      /v1/responses or set reasoning_effort to 'none'."
+    // The Responses API is a superset that works for both reasoning and
+    // non-reasoning models, so defaulting the provider to it fixes the
+    // reasoning-model case without breaking older gpt-4o / gpt-4-turbo runs.
+    // An operator (or an agent's `llm.api_backend`) can still override.
+    apiBackend: "responses",
   },
   {
     id: "anthropic",
