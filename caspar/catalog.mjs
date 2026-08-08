@@ -50,12 +50,72 @@ function properties(entry) {
 }
 
 /**
+ * Enumerate the operations a multi-function creature (per-space sandbox:
+ * exec/write/read/…, github: clone/commit/push/…) accepts. Historical entries
+ * only carried the *default* function so the model had to guess the rest and
+ * routinely tried `use_tool("caspar__vercel_sandbox_exec", …)` — a compound
+ * tool name that does not exist — which came back as "no such tool" and the
+ * model paraphrased as "doesn't have access to that action". Sources, in
+ * priority order (most explicit first):
+ *
+ *   1. `entry.functions` — an explicit list, already respected upstream.
+ *   2. `entry.arg_schema.function.enum` — the standard JSON-Schema way to
+ *      declare it.
+ *   3. `entry.tools[].name` — every checked-in creature descriptor lists its
+ *      operations in a `tools[]` array (see e.g. the vercel_sandbox / github
+ *      `point.metadata.json`); this is the source of truth today.
+ *   4. Parse `entry.arg_schema.function.description` for the pattern
+ *      "`exec` (default) | `write` | `read`" — the human-readable form the
+ *      descriptors already use as a fallback for older ones.
+ */
+export function extractFunctions(entry) {
+  if (!entry || typeof entry !== "object") return [];
+  const push = (list, arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const item of arr) {
+      if (typeof item === "string" && item.trim() && !list.includes(item.trim())) list.push(item.trim());
+    }
+  };
+  const out = [];
+  push(out, entry.functions);
+  const schema = entry.arg_schema && typeof entry.arg_schema === "object" ? entry.arg_schema : entry.argSchema;
+  push(out, schema?.function?.enum);
+  push(
+    out,
+    Array.isArray(entry.tools)
+      ? entry.tools.map((t) => (t && typeof t === "object" ? t.name || t.function : null))
+      : null,
+  );
+  const desc = String(schema?.function?.description || "");
+  if (desc && !out.length) {
+    // Match `word` (possibly with a "(default)" tag) inside the pipe-separated
+    // operation list the descriptors use, e.g.
+    //   "operation: exec (default) | write | read | …"
+    // Also accept bareword pipes without backticks for looser descriptors.
+    const inside = desc.replace(/`([^`]+)`/g, "$1");
+    const parts = inside.split(/[|,]/);
+    for (const raw of parts) {
+      const cleaned = raw
+        .replace(/\(default\)/gi, "")
+        .replace(/^[^A-Za-z0-9_]*/, "")
+        .replace(/[^A-Za-z0-9_]*$/, "");
+      // Skip narrative prefixes like "operation: exec" — keep only the word.
+      const token = cleaned.split(/[\s:]+/).pop();
+      if (token && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(token) && !out.includes(token)) {
+        out.push(token);
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * A multi-function creature (the per-space sandbox: exec/write/read/…) is one
  * catalog entry whose function comes from the model's arguments. Expose that
  * explicitly so the model can pick a function instead of guessing.
  */
 function withFunctionArg(props, entry) {
-  const functions = Array.isArray(entry.functions) ? entry.functions.filter((f) => typeof f === "string" && f) : [];
+  const functions = extractFunctions(entry);
   if (!functions.length || props.function) return props;
   return {
     ...props,
