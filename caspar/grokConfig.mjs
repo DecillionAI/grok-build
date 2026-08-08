@@ -63,6 +63,22 @@ export function renderConfigToml({ mcpServers = {}, model, defaultModel } = {}) 
     if (model.apiBackend) lines.push(`api_backend = ${tomlString(model.apiBackend)}`);
     if (model.authScheme && model.authScheme !== "bearer") lines.push(`auth_scheme = ${tomlString(model.authScheme)}`);
     if (Number.isFinite(model.contextWindow) && model.contextWindow > 0) lines.push(`context_window = ${Math.floor(model.contextWindow)}`);
+    // `stream_tool_calls` affects request *shape*, not just sampling. The OpenAI
+    // Responses API frames tool-call streaming differently from Chat
+    // Completions; leaving grok's tool-call streaming on against Responses makes
+    // the stream wait for deltas that never arrive in the expected shape, so a
+    // step hangs until the idle timeout — the "randomly stuck on diverse steps"
+    // symptom. When a provider opts out (openai → false), we emit it explicitly.
+    if (model.streamToolCalls === false) lines.push("stream_tool_calls = false");
+    else if (model.streamToolCalls === true) lines.push("stream_tool_calls = true");
+    // Bound a stalled inference so it aborts + retries instead of hanging the
+    // whole run on one wedged request.
+    if (Number.isFinite(model.inferenceIdleTimeoutSec) && model.inferenceIdleTimeoutSec > 0) {
+      lines.push(`inference_idle_timeout_secs = ${Math.floor(model.inferenceIdleTimeoutSec)}`);
+    }
+    if (Number.isFinite(model.maxRetries) && model.maxRetries >= 0) {
+      lines.push(`max_retries = ${Math.floor(model.maxRetries)}`);
+    }
     const headers = tomlInlineTable(model.headers);
     if (headers) lines.push(`extra_headers = ${headers}`);
     lines.push("");

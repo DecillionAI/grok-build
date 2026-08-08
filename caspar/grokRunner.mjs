@@ -183,6 +183,21 @@ export function applyLlmOverride(env, llm) {
     authScheme: resolved.authScheme,
     headers: resolved.headers,
     contextWindow: Number(llm.context_window || llm.contextWindow || 0) || undefined,
+    // Request-shape + resilience knobs. The agent may override
+    // `stream_tool_calls` explicitly; otherwise the provider default applies
+    // (openai → false, to avoid the Responses tool-call-streaming stall). The
+    // idle timeout + retries bound a wedged inference so one stalled request
+    // aborts and retries instead of hanging the whole run on a step.
+    streamToolCalls:
+      typeof llm.stream_tool_calls === "boolean"
+        ? llm.stream_tool_calls
+        : typeof llm.streamToolCalls === "boolean"
+          ? llm.streamToolCalls
+          : resolved.streamToolCalls,
+    inferenceIdleTimeoutSec:
+      Number(llm.inference_idle_timeout_secs || llm.inferenceIdleTimeoutSec || 0) ||
+      creatureNumber("INFERENCE_IDLE_TIMEOUT", 180, env),
+    maxRetries: Number.isFinite(Number(llm.max_retries)) ? Number(llm.max_retries) : creatureNumber("LLM_MAX_RETRIES", 4, env),
   };
   return { model: modelId, modelConfig, warning: undefined, provider: resolved.id, credential: `agent:${resolved.id}` };
 }

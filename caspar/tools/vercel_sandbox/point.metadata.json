@@ -25,6 +25,7 @@
   "autoAttach": true,
   "function": "exec",
   "requiredArgs": ["function"],
+  "maxExecSeconds": 600,
   "categories": [
     "execution"
   ],

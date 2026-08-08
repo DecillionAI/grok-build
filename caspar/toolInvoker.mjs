@@ -26,7 +26,29 @@ import { mergeArgs } from "./catalog.mjs";
 /** Default reply window: a cold spawn under gVisor routinely takes >1 min. */
 import { creatureNumber } from "./env.mjs";
 
-const DEFAULT_TIMEOUT_SECONDS = creatureNumber("TOOL_TIMEOUT", 240);
+/**
+ * Default reply window for a tool signal, raised to comfortably exceed the
+ * longest a served tool can legitimately take to answer.
+ *
+ * This is the waiter on the backbone→tool hop. It MUST be longer than the
+ * tool's own internal work budget, or the invoker gives up while the tool is
+ * still running and the model sees a dead call. The per-space sandbox is the
+ * binding case: its `exec` runs up to VERCEL_SANDBOX_EXEC_TIMEOUT_MS (300s)
+ * with an HTTP read timeout of exec+HTTP_TIMEOUT (~360s), so a 240s waiter was
+ * shorter than the work — `npm install` / a build / a large push would stall.
+ * A catalog entry may still shorten (or lengthen) this per tool via
+ * `max_exec_seconds`.
+ */
+const DEFAULT_TIMEOUT_SECONDS = creatureNumber("TOOL_TIMEOUT", 420);
+
+/** Greppable one-line trace of a tool call's lifecycle, for the VM logs. */
+function traceToolCall(event) {
+  try {
+    process.stdout.write(`GROK_TOOL_CALL ${JSON.stringify(event)}\n`);
+  } catch {
+    /* logging must never break a tool call */
+  }
+}
 
 export class ToolInvoker {
   /**
@@ -96,16 +118,24 @@ export class ToolInvoker {
     };
 
     const timeoutMs = Number(entry.max_exec_seconds || entry.maxExecSeconds || DEFAULT_TIMEOUT_SECONDS) * 1000;
+    const startedAt = Date.now();
+    // Trace at start: which tool, which function, the waiter budget, the target.
+    // A run that stalls on a tool call is now pinpointed from the VM logs — the
+    // matching GROK_TOOL_CALL "done"/"timeout" line (same correlationId) shows
+    // whether the tool replied and how long it took, instead of guessing.
+    traceToolCall({ phase: "start", tool: name, function: String(fn), target: String(target), timeoutMs, correlationId });
     const settled = new Promise((resolve) => this.waiters.set(correlationId, resolve));
     let ack;
     try {
       ack = await this.bridge.signalUser("creatures/signal", String(target), packet);
     } catch (err) {
       this.waiters.delete(correlationId);
+      traceToolCall({ phase: "signal_failed", tool: name, correlationId, ms: Date.now() - startedAt, error: String(err?.message || err) });
       return { ok: false, error: `bridge signal failed: ${err.message}` };
     }
     if (ack && typeof ack === "object" && ack.ok === false) {
       this.waiters.delete(correlationId);
+      traceToolCall({ phase: "node_rejected", tool: name, correlationId, ms: Date.now() - startedAt });
       return { ok: false, error: "node rejected the tool signal", ack };
     }
 
@@ -117,8 +147,10 @@ export class ToolInvoker {
       const result = await Promise.race([settled, timedOut]);
       if (result === TIMED_OUT) {
         this.waiters.delete(correlationId);
+        traceToolCall({ phase: "timeout", tool: name, function: String(fn), correlationId, ms: Date.now() - startedAt });
         return { ok: false, error: `tool creature ${name} did not reply within ${timeoutMs / 1000}s` };
       }
+      traceToolCall({ phase: "done", tool: name, function: String(fn), correlationId, ms: Date.now() - startedAt });
       return { ok: true, tool: name, function: String(fn), response: result };
     } finally {
       clearTimeout(timer);

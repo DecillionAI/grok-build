@@ -156,6 +156,13 @@ export function entryFromDescriptor(d, routing) {
     arg_schema: argSchema,
     ...(Array.isArray(d.requiredArgs) ? { required: d.requiredArgs } : {}),
     ...(d.function ? { function: d.function } : {}),
+    // How long the backbone's ToolInvoker should wait for this creature to
+    // reply before giving up. The sandbox needs a generous window (long
+    // installs/builds/pushes); without it the invoker falls to its 420s
+    // default. Carried through so a slow-but-legitimate op isn't killed.
+    ...(Number(d.maxExecSeconds || d.max_exec_seconds) > 0
+      ? { max_exec_seconds: Number(d.maxExecSeconds || d.max_exec_seconds) }
+      : {}),
     // The descriptor's per-action listing is what tells the model which
     // operations it can pass in `function`. Carrying `tools` (and any
     // explicit `functions` array the descriptor provides) through unchanged
