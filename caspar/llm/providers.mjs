@@ -48,6 +48,12 @@ const PROVIDERS = [
     // reasoning-model case without breaking older gpt-4o / gpt-4-turbo runs.
     // An operator (or an agent's `llm.api_backend`) can still override.
     apiBackend: "responses",
+    // The Responses API frames tool-call streaming differently from Chat
+    // Completions; with grok's tool-call streaming ON against Responses the
+    // stream stalls waiting for deltas that never come in the expected shape,
+    // which surfaced as runs "randomly getting stuck on diverse steps". Turn
+    // it off for OpenAI so each step's inference completes deterministically.
+    streamToolCalls: false,
   },
   {
     id: "anthropic",
@@ -152,5 +158,9 @@ export function resolveProvider(id, { env = process.env, baseUrlOverride = "", a
     authScheme: known?.authScheme || "bearer",
     headers: { ...(known?.headers || {}) },
     native: Boolean(known?.native),
+    // Request-shape hint carried into the model config (see grokConfig). Only
+    // set when the provider table pins it; undefined otherwise so grok keeps
+    // its own default.
+    streamToolCalls: known?.streamToolCalls,
   };
 }
