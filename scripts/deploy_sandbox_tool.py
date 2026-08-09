@@ -28,9 +28,9 @@ Environment
       CASPAR_OPERATOR_ID / CASPAR_OPERATOR_PRIVATE_KEY   inject it explicitly
       CASPAR_DEPLOY_USER            first-login username only (default davinci_admin)
 
-    SANDBOX_REUSE_PROGRAM_ID  redeploy onto this existing program id instead of
-                              minting a new creature — what CI passes on every run
-                              after the first, so the ids Nest recorded stay valid
+    (the program is resolved deterministically by the tool's stable machine
+     username — see caspar_deploy_common.ensure_docker_program — so there is no
+     reuse-id env and no re-mint: a redeploy always re-finds its own program.)
     SANDBOX_TOOL_ENTITY_ID    entity id (default vercel_sandbox)
     SANDBOX_RUN_ENTITY        1 (default) to start it serving after the deploy
     SANDBOX_VM_RAM_MB / _DISK_GB / _CPUS / _MAX_SECONDS   VM resources
@@ -41,7 +41,7 @@ Environment
 
 Output (stdout, machine-readable — the CI greps these):
     SANDBOX_TOOL_PROGRAM_ID=<id>
-    SANDBOX_TOOL_CREATURE_ID=<id>     (empty on a redeploy onto an existing program)
+    SANDBOX_TOOL_CREATURE_ID=<id>
     SANDBOX_TOOL_ENTITY_ID=vercel_sandbox
     SANDBOX_TOOL_VM_ID=<vmId>         (when the standalone runEntity start succeeds)
 """
@@ -64,6 +64,7 @@ from caspar_deploy_common import (  # noqa: E402
     b64_file,
     bad,
     bake_snippet,
+    ensure_docker_program,
     image_built_for_context,
     docker_image_id,
     env_any,
@@ -177,33 +178,20 @@ def compose_dockerfile(files: Dict[str, str]):
 
 def main() -> int:
     entity_id = env_any("SANDBOX_TOOL_ENTITY_ID", default=TOOL_ID)
-    reuse_pid = env_any("SANDBOX_REUSE_PROGRAM_ID", "SANDBOX_TOOL_PROGRAM_ID")
 
     info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT}")
     client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=180).connect()
-    # Authenticate as the ONE durable deploy operator, so this redeploy owns the
-    # sandbox program it minted before and never has to mint a fresh one.
-    resolve_operator(client)
-
-    import os
-
-    def mint_creature() -> "tuple[str, str]":
-        """Mint a fresh machine creature + docker program owned by THIS login."""
-        suffix = os.urandom(4).hex()
-        cid = client.create_machine_creature(f"m-tool-{TOOL_ID}-{suffix}")
-        pid = client.create_program(cid, f"/tools/{TOOL_ID}", "docker", f"tool {TOOL_ID}")
-        info(f"created machine creature {cid} and program {pid}")
-        return cid, pid
-
-    creature_id = ""
-    prev_image_id = ""
-    reminted = False
-    program_id = reuse_pid
-    if program_id:
-        info(f"redeploying the {TOOL_ID} entity onto existing program {program_id} — no new creature")
-        prev_image_id = docker_image_id(program_id, entity_id)
-    else:
-        creature_id, program_id = mint_creature()
+    # Authenticate as the ONE deploy operator and resolve this tool's program
+    # deterministically: re-find the machine by its stable username (reuse its
+    # program), or create it on the first deploy. No recorded-id reuse, no re-mint.
+    operator_id = resolve_operator(client)
+    creature_id, program_id = ensure_docker_program(
+        client, operator_id,
+        machine_name=f"m-tool-{TOOL_ID}",
+        program_path=f"/tools/{TOOL_ID}",
+        comment=f"tool {TOOL_ID}",
+    )
+    prev_image_id = docker_image_id(program_id, entity_id)
 
     files = build_context()
     dockerfile, digest = compose_dockerfile(files)
@@ -211,41 +199,13 @@ def main() -> int:
     # LABEL, because the node names images by machine id, not program id.
     already_current = image_built_for_context(digest)
 
-    def push(pid: str) -> None:
-        client.deploy(pid, entity_id, "docker", b64_bytes(dockerfile), files_b64=files,
-                      metadata={"decillion": descriptor()})
-
     try:
-        push(program_id)
+        client.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile), files_b64=files,
+                      metadata={"decillion": descriptor()})
     except Exception as exc:  # noqa: BLE001
-        # Owner drift: the recorded program was minted by a DIFFERENT identity (an
-        # e2e run / an earlier operator), so the node refuses this login deploy
-        # onto it ("access to vm denied"). Re-mint ONCE onto a fresh login-owned
-        # program and carry on — the Nest deployer hits the same wall and resolves
-        # it the same way (server deployer.ts operatorOwnsProgram → re-mint).
-        #
-        # This is emphatically NOT a per-run mint: CI records the new id in the
-        # manifest, so the NEXT deploy reuses it, this login owns it, the redeploy
-        # succeeds, and no further creature is ever minted. A fresh creature is
-        # created only on the single deploy that discovers the drift.
-        denied = "access to vm denied" in str(exc) or "denied" in str(exc).lower()
-        if reuse_pid and denied:
-            warn(f"redeploy onto {reuse_pid} refused (owner drift): {exc}")
-            warn("re-minting a fresh login-owned sandbox program ONCE and rebinding to it")
-            creature_id, program_id = mint_creature()
-            prev_image_id = ""
-            already_current = False
-            reminted = True
-            try:
-                push(program_id)
-            except Exception as exc2:  # noqa: BLE001
-                bad(f"deploy failed after re-mint: {exc2}")
-                client.close()
-                return 1
-        else:
-            bad(f"deploy failed: {exc}")
-            client.close()
-            return 1
+        bad(f"deploy failed: {exc}")
+        client.close()
+        return 1
 
     if already_current:
         ok("image already built from this exact context — no rebuild to wait for")
@@ -254,12 +214,6 @@ def main() -> int:
                        prev_image_id=prev_image_id, expect_context=digest, client=client)
     ok(f"{TOOL_ID} creature deployed: program={program_id} entity={entity_id}")
 
-    if reminted:
-        # CI keys on this marker to adopt the new id in place of the reuse target
-        # instead of failing the deploy (its normal "reuse must not change id" guard).
-        warn(f"sandbox program re-minted due to owner drift: {reuse_pid} → {program_id} "
-             "(CI records the new id; existing spaces rebind from the manifest)")
-        print("SANDBOX_TOOL_REMINTED=1", flush=True)
     print("SANDBOX_TOOL_PROGRAM_ID=" + program_id, flush=True)
     print("SANDBOX_TOOL_CREATURE_ID=" + creature_id, flush=True)
     print("SANDBOX_TOOL_ENTITY_ID=" + entity_id, flush=True)
