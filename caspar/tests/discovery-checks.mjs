@@ -175,21 +175,19 @@ async function main() {
     for (const off of ["run_terminal_cmd", "read_file", "write", "search_replace", "apply_patch", "list_dir", "grep"]) {
       assert.ok(denied.includes(off), `${off} must be denied — it is local shell/filesystem work`);
     }
-    // planning / web / delegation tools are NOT denied — and neither are the MCP
-    // meta-tools, which are the ONLY way the agent reaches the space's creatures.
-    // `get_task_output` / `kill_task` are NOT denied either: the grok binary
-    // requires them whenever `task` is present, so denying them while keeping
-    // `task` on made session init fail with RequirementError { tool: task }.
-    for (const keep of ["todo_write", "enter_plan_mode", "exit_plan_mode", "web_search", "web_fetch", "task", "get_task_output", "kill_task", "use_tool", "search_tool"]) {
+    // planning / web tools are NOT denied — and neither are the MCP meta-tools,
+    // which are the ONLY way the agent reaches the space's creatures.
+    for (const keep of ["todo_write", "enter_plan_mode", "exit_plan_mode", "web_search", "web_fetch", "use_tool", "search_tool"]) {
       assert.ok(!denied.includes(keep), `${keep} must stay enabled`);
     }
-    // the `task` requirement invariant: task enabled ⟹ its required companions
-    // (get_task_output + kill_task) must not be in the deny list.
-    assert.ok(!denied.includes("task"), "task stays enabled");
-    assert.ok(
-      !denied.includes("get_task_output") && !denied.includes("kill_task"),
-      "task's required companions must never be denied while task is enabled",
-    );
+    // the `task` requirement invariant: the grok binary rejects a toolset that has
+    // `task` without `get_task_output` + `kill_task`. The monitors are not in the
+    // base toolset for us to keep, so the whole background-task family is denied as
+    // a unit when there is no sandbox — never a subset, which would fail init with
+    // RequirementError { tool: GrokBuild:task }.
+    for (const fam of ["task", "get_task_output", "kill_task"]) {
+      assert.ok(denied.includes(fam), `${fam} must be denied without a sandbox (background-task family off as a unit)`);
+    }
     // operator can disable the enforcement or override the list
     assert.deepEqual(disallowedBuiltinTools({ env: { GROK_CREATURE_FORCE_SANDBOX_FS: "0" } }), []);
     assert.deepEqual(disallowedBuiltinTools({ env: { GROK_CREATURE_DISALLOWED_TOOLS: "run_terminal_cmd, foo" } }), ["run_terminal_cmd", "foo"]);

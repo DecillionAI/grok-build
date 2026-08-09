@@ -268,19 +268,21 @@ export function credentialSource(env) {
  * files and output. So these built-ins are turned OFF (`--disallowed-tools`)
  * unconditionally — they must not even be a silent fallback.
  *
- * Planning, web and delegation tools (`todo_write`, plan mode, `web_search`,
- * `web_fetch`, `task`, …) are deliberately NOT here — only shell + files.
+ * Planning and web tools (`todo_write`, plan mode, `web_search`, `web_fetch`)
+ * are deliberately NOT here — only shell + files, plus the background-task family.
  *
- * `get_task_output` / `kill_task` are also deliberately NOT here even though they
- * look task-ish: they are the subagent-monitoring companions of `task` (which we
- * keep enabled), and the grok binary REQUIRES them whenever `task` is present
- * ("task requires get_task_output and kill_task so spawned background subagents
- * can be monitored and cancelled"). Denying them while leaving `task` on makes
- * session init fail with `RequirementError { tool: GrokBuild:task }`. They do no
- * shell/filesystem work — `task`'s subagents inherit this same deny list — so
- * leaving them on is safe and is what keeps `task` usable without a sandbox. The
- * background-*bash* monitors (`get_terminal_command_output`/`kill_terminal_command`)
- * stay denied: their producer (`run_terminal_cmd`) is denied too.
+ * The background-task family — `task` (spawn a subagent) and its monitors
+ * `get_task_output` / `kill_task` / `wait_tasks` / `monitor` — IS denied here as a
+ * unit. The grok binary couples them: `task` is rejected at session init unless
+ * `get_task_output` AND `kill_task` are also in the toolset ("task requires … so
+ * spawned background subagents can be monitored and cancelled"), and those
+ * monitors are not present in the base toolset for us to keep — so the only
+ * self-consistent no-sandbox state is *all of them off*. Denying just the
+ * monitors (leaving `task` on) — or just `task` (leaving a dangling monitor on) —
+ * makes init fail with `RequirementError { tool: GrokBuild:task }`. A subagent
+ * without a sandbox would have no shell/filesystem anyway, so losing delegation
+ * in the no-sandbox path costs nothing. With a sandbox the whole deny list is
+ * skipped (`disallowedBuiltinTools` returns []), so `task` stays on where it works.
  */
 export const DEFAULT_BUILTIN_FS_TOOLS = [
   "run_terminal_cmd",
@@ -288,6 +290,9 @@ export const DEFAULT_BUILTIN_FS_TOOLS = [
   "bash",
   "get_terminal_command_output",
   "kill_terminal_command",
+  "task",
+  "get_task_output",
+  "kill_task",
   "wait_tasks",
   "monitor",
   "read_file",
