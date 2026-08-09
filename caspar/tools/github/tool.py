@@ -983,15 +983,17 @@ def _read_platform_registry() -> List[Dict[str, Any]]:
 
 
 def _registry_entry_is_sandbox(entry: Dict[str, Any]) -> bool:
-    """True when a platform-registry entry is the execution sandbox (never us)."""
+    """True when a platform-registry entry is the execution sandbox (never us).
+
+    Matched on identity (key/name) or an execution descriptor — deliberately not
+    on ``autoAttach`` alone, so a future auto-attach platform tool that is not the
+    sandbox (the manifest already carries a `nest` tool) is never mis-routed."""
     key = str(entry.get("key") or "").lower()
     name = str(entry.get("name") or "").lower()
     if "github" in key or "github" in name:
         return False
     d = entry.get("descriptor") if isinstance(entry.get("descriptor"), dict) else None
     if d and _is_sandbox_descriptor(d):
-        return True
-    if bool(entry.get("autoAttach")):
         return True
     return "sandbox" in key or "sandbox" in name or "vercel_sandbox" in key
 
