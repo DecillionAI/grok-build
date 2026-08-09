@@ -317,6 +317,31 @@ class CasparSignalingClient:
                "programId": program_id, "entityId": entity_id, "temp": False}
         return self._signal_await_result("/creatures/signal", req, correlation_id, timeout)
 
+    def signal_wasm_endpoint(self, *, creature_id: str, program_id: str, action: str,
+                             payload: Dict[str, Any], entity: str = "main",
+                             timeout: float = 20.0) -> Dict[str, Any]:
+        """Signal a **WASM per-route endpoint** (e.g. ``market/registerPlatform``) and
+        await its correlated result.
+
+        This is the exact envelope Nest's ``CasparService.*Action`` builds for a
+        signal-compatible WASM endpoint (see the server's ``caspar-client.signal`` /
+        ``openSignal``): a ``/creatures/signal`` (pvp) whose ``data`` double-wraps the
+        action — ``{programId, entity, payload: JSON(inner)}`` where ``inner`` is
+        ``{action, payload, correlationId}``. The endpoint peels it with the shared
+        ``unwrapSignal`` ABI and signals a correlated ``creatures/signal/result`` back,
+        matched here by ``correlationId``.
+
+        Reuses the same correlated-response loop as ``signal_entity_await`` — only the
+        request envelope differs — so there is no duplicated response handling. Returns
+        ``{ok, result|error, steps}``; ``result`` is the endpoint's own output object.
+        """
+        correlation_id = uuid.uuid4().hex
+        inner = {"action": action, "payload": dict(payload or {}), "correlationId": correlation_id}
+        data = json.dumps({"programId": program_id, "entity": entity, "payload": json.dumps(inner)})
+        req = {"type": "pvp", "creatureId": creature_id, "programId": program_id,
+               "entityId": entity, "temp": False, "data": data}
+        return self._signal_await_result("/creatures/signal", req, correlation_id, timeout)
+
     def _signal_await_result(self, path: str, payload: Dict[str, Any],
                              correlation_id: str, timeout: float) -> Dict[str, Any]:
         if self.sock is None:
