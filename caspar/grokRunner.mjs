@@ -270,15 +270,24 @@ export function credentialSource(env) {
  *
  * Planning, web and delegation tools (`todo_write`, plan mode, `web_search`,
  * `web_fetch`, `task`, …) are deliberately NOT here — only shell + files.
+ *
+ * `get_task_output` / `kill_task` are also deliberately NOT here even though they
+ * look task-ish: they are the subagent-monitoring companions of `task` (which we
+ * keep enabled), and the grok binary REQUIRES them whenever `task` is present
+ * ("task requires get_task_output and kill_task so spawned background subagents
+ * can be monitored and cancelled"). Denying them while leaving `task` on makes
+ * session init fail with `RequirementError { tool: GrokBuild:task }`. They do no
+ * shell/filesystem work — `task`'s subagents inherit this same deny list — so
+ * leaving them on is safe and is what keeps `task` usable without a sandbox. The
+ * background-*bash* monitors (`get_terminal_command_output`/`kill_terminal_command`)
+ * stay denied: their producer (`run_terminal_cmd`) is denied too.
  */
 export const DEFAULT_BUILTIN_FS_TOOLS = [
   "run_terminal_cmd",
   "run_terminal_command",
   "bash",
   "get_terminal_command_output",
-  "get_task_output",
   "kill_terminal_command",
-  "kill_task",
   "wait_tasks",
   "monitor",
   "read_file",
