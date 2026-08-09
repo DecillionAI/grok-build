@@ -305,6 +305,164 @@ CA_SNIPPET = (
 )
 
 
+# ── on-chain platform-tool registry (market creature) ────────────────────────
+# A platform tool (the per-space sandbox, the github tool) is announced into the
+# `market` creature's on-chain `platform` bucket at DEPLOY time — by the operator
+# that just deployed it, the "whoever deploys a tool registers it" mechanism — so
+# nothing about which tools exist is stored or seeded by the running Nest server.
+# `spaces/create` reads that bucket to attach every `autoAttach` tool to new
+# spaces, and the client's addable-tools list reads it via `market/listPlatform`.
+# register/unregister/list are three separate WASM endpoints sharing one on-chain
+# bucket; each is resolved from the manifest by its `<ns>/<action>` key.
+
+# The descriptor fields the discovery/planning layer reads back — the same subset
+# Nest's `descriptor.fromMetadata` produced, so the on-chain entry is identical
+# whether it was written by the old boot seeder or by this deploy path.
+_DESCRIPTOR_FIELDS = (
+    "kind", "name", "username", "avatar", "pricing", "category", "usecases",
+    "howToTalk", "argSchema", "requiredArgs", "function", "functions", "tools",
+    "maxExecSeconds", "outputSchema", "skill", "requiresNetwork", "risk",
+)
+
+
+def load_manifest() -> Dict[str, Any]:
+    """The Decillion deploy manifest (``CASPAR_MANIFEST``) as a dict, or ``{}``."""
+    path = env_any("CASPAR_MANIFEST")
+    if not path:
+        return {}
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def manifest_endpoint(manifest: Dict[str, Any], key: str) -> Optional[Dict[str, str]]:
+    """The ``{creatureId, programId, entityId}`` record for a per-route endpoint
+    (e.g. ``market/registerPlatform``), or ``None`` when the manifest lacks it."""
+    eps = manifest.get("endpoints") if isinstance(manifest, dict) else None
+    rec = eps.get(key) if isinstance(eps, dict) else None
+    return rec if isinstance(rec, dict) and rec.get("programId") else None
+
+
+def normalize_descriptor(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """The tool's ``point.metadata.json`` reduced to the discovery descriptor —
+    the exact subset ``descriptor.fromMetadata`` keeps (nested ``decillion`` block
+    unwrapped when present, else the flat metadata itself)."""
+    if not isinstance(meta, dict):
+        return {}
+    d = meta
+    pub = meta.get("public")
+    if isinstance(pub, dict) and isinstance(pub.get("decillion"), dict):
+        d = pub["decillion"]
+    elif isinstance(meta.get("decillion"), dict):
+        d = meta["decillion"]
+    out: Dict[str, Any] = {}
+    for f in _DESCRIPTOR_FIELDS:
+        if d.get(f) is not None:
+            out[f] = d[f]
+    out.setdefault("usecases", d.get("usecases") or [])
+    out.setdefault("howToTalk", d.get("howToTalk") or "")
+    return out
+
+
+def register_platform_tool(client, manifest: Dict[str, Any], *, key: str,
+                           program_id: str, creature_id: str, entity_id: str,
+                           metadata: Dict[str, Any]) -> bool:
+    """Announce a just-deployed platform tool into the market creature's registry,
+    then VERIFY it landed. Returns True only when a follow-up ``listPlatform`` shows
+    the program — so an untested-against-a-live-node signal fails LOUDLY at deploy
+    time instead of silently leaving new spaces without the tool.
+
+    Best-effort about the *manifest*: with no ``market/registerPlatform`` endpoint
+    (a node that predates the split market endpoints) it warns and returns False,
+    leaving the tool deployed but unregistered — the caller decides whether that is
+    fatal."""
+    reg = manifest_endpoint(manifest, "market/registerPlatform")
+    if not reg:
+        warn("no market/registerPlatform endpoint in the manifest — cannot register "
+             f"the {key} platform tool on-chain (is the market creature deployed?)")
+        return False
+    d = normalize_descriptor(metadata)
+    display = str(d.get("name") or key)
+    auto_attach = bool(d.get("autoAttach") if "autoAttach" in d else metadata.get("autoAttach", False))
+    payload = {
+        "key": key,
+        "name": display,
+        "programId": program_id,
+        "creatureId": creature_id,
+        "entityId": entity_id or key,
+        "autoAttach": auto_attach,
+        "descriptor": d,
+    }
+    res = client.signal_wasm_endpoint(
+        creature_id=reg["creatureId"], program_id=reg["programId"],
+        action="registerPlatform", payload=payload,
+    )
+    if not res.get("ok"):
+        warn(f"registerPlatform signal for {key} did not confirm: {res.get('error') or res}")
+        # fall through to the verify — the write may have applied even if the reply
+        # was missed; only a listPlatform miss is treated as failure.
+    if platform_registered(client, manifest, program_id):
+        ok(f"registered platform tool {key} (program {program_id}, autoAttach={auto_attach})")
+        return True
+    warn(f"platform tool {key} is NOT in the on-chain registry after registerPlatform "
+         f"(program {program_id}) — new spaces will not attach it until this is fixed")
+    return False
+
+
+def platform_registered(client, manifest: Dict[str, Any], program_id: str) -> bool:
+    """Whether ``program_id`` appears in the market creature's ``platform`` bucket."""
+    for row in list_platform_registry(client, manifest):
+        if str(row.get("programId") or "") == program_id:
+            return True
+    return False
+
+
+def list_platform_registry(client, manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The current on-chain platform bucket as a list of entry dicts (or ``[]``)."""
+    lp = manifest_endpoint(manifest, "market/listPlatform")
+    if not lp:
+        return []
+    res = client.signal_wasm_endpoint(
+        creature_id=lp["creatureId"], program_id=lp["programId"],
+        action="listPlatform", payload={},
+    )
+    result = res.get("result") if isinstance(res, dict) else None
+    rows = result.get("platform") if isinstance(result, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def reconcile_platform_registry(client, manifest: Dict[str, Any],
+                                current_program_ids: List[str]) -> None:
+    """Remove any stale entry whose programId is not among the currently-deployed
+    tools — a churned id, or the old Nest backend that used to be registered here.
+    Guarded on a non-empty current set so a failed list can never wipe the registry.
+
+    This is the reconcile the Nest boot seeder used to do; it belongs to the deploy
+    (which knows exactly which tools it just deployed) now that seeding does."""
+    current = {p for p in current_program_ids if p}
+    if not current:
+        warn("platform reconcile skipped — no current tool program ids to compare against")
+        return
+    unreg = manifest_endpoint(manifest, "market/unregisterPlatform")
+    if not unreg:
+        return
+    for row in list_platform_registry(client, manifest):
+        pid = str(row.get("programId") or "")
+        if not pid or pid in current:
+            continue
+        res = client.signal_wasm_endpoint(
+            creature_id=unreg["creatureId"], program_id=unreg["programId"],
+            action="unregisterPlatform", payload={"programId": pid},
+        )
+        label = row.get("key") or row.get("name") or pid
+        if res.get("ok") or not platform_registered(client, manifest, pid):
+            ok(f"unregistered stale platform entry {label} (program {pid})")
+        else:
+            warn(f"could not unregister stale platform entry {label} (program {pid}): "
+                 f"{res.get('error') or res}")
+
+
 def b64_bytes(data: bytes) -> str:
     return base64.b64encode(data).decode()
 

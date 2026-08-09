@@ -72,7 +72,9 @@ from caspar_deploy_common import (  # noqa: E402
     docker_image_id,
     env_any,
     info,
+    load_manifest,
     ok,
+    register_platform_tool,
     resolve_operator,
     stamp_context,
     truthy,
@@ -242,6 +244,16 @@ def main() -> int:
 
     # Ship the downloadable Victor front-end onto the same program (best-effort).
     deploy_frontend(client, program_id)
+
+    # Announce the tool into the on-chain platform registry (the market creature),
+    # as the deploying operator — no running Nest server involved. MarketService's
+    # addable-tools list reads this bucket via market/listPlatform. Verifies the
+    # write landed so a wire failure surfaces here rather than as a missing tool.
+    register_platform_tool(
+        client, load_manifest(),
+        key=TOOL_ID, program_id=program_id, creature_id=creature_id,
+        entity_id=entity_id, metadata=descriptor(),
+    )
 
     # Start it as a long-lived serving creature so signals hit a warm container.
     if truthy(env_any("GITHUB_RUN_ENTITY", default="1")):
