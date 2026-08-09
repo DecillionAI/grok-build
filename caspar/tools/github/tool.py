@@ -956,6 +956,46 @@ def _program_is_sandbox(rec: Dict[str, Any]) -> bool:
     return "sandbox" in name or "vercel_sandbox" in name
 
 
+def _read_platform_registry() -> List[Dict[str, Any]]:
+    """The platform-tool registry (the market creature's ``platform`` bucket).
+
+    This is the *same* global, space-independent source ``spaces/create`` reads to
+    decide which tools to auto-attach — a docker tool's ``getJson`` and a WASM
+    creature's ``putJson`` share the node's global JSON keyspace. Every entry is
+    ``{key, name, programId, creatureId, entityId, descriptor, autoAttach}``."""
+    try:
+        resp = _bridge().call(
+            "getJson", {"key": "Json::CreatureNamespace::market", "path": "platform"}, timeout=15)
+    except Exception:  # noqa: BLE001
+        return []
+    data: Any = None
+    if isinstance(resp, dict):
+        data = resp.get("data")
+        if not isinstance(data, dict):
+            for k in ("obj", "result"):
+                v = resp.get(k)
+                if isinstance(v, dict) and isinstance(v.get("data"), dict):
+                    data = v.get("data")
+                    break
+    if not isinstance(data, dict):
+        return []
+    return [v for v in data.values() if isinstance(v, dict) and v]
+
+
+def _registry_entry_is_sandbox(entry: Dict[str, Any]) -> bool:
+    """True when a platform-registry entry is the execution sandbox (never us)."""
+    key = str(entry.get("key") or "").lower()
+    name = str(entry.get("name") or "").lower()
+    if "github" in key or "github" in name:
+        return False
+    d = entry.get("descriptor") if isinstance(entry.get("descriptor"), dict) else None
+    if d and _is_sandbox_descriptor(d):
+        return True
+    if bool(entry.get("autoAttach")):
+        return True
+    return "sandbox" in key or "sandbox" in name or "vercel_sandbox" in key
+
+
 def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:
     """Resolve the space's sandbox creature routing, cached briefly."""
     now = time.monotonic()
@@ -994,6 +1034,25 @@ def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:
                      "entity_id": m["entity_id"] or SANDBOX_ENTITY}
             _SANDBOX_CACHE[space_id] = (route, now + _SANDBOX_TTL)
             return route
+    # 3) Fallback: the global platform registry. One sandbox creature serves every
+    #    space (the space is bound by the pinned `space_id`, not by a distinct
+    #    per-space program), so the registry entry is enough to route to it even
+    #    when this space's on-chain index was never populated — e.g. the space was
+    #    created before the sandbox was registered, so `attachPlatformTools` never
+    #    added it. Without this, such a space can never reach its sandbox.
+    for entry in _read_platform_registry():
+        pid = _pick(entry, ["programId", "program_id"])
+        if not pid or pid == self_pid:
+            continue
+        if not _registry_entry_is_sandbox(entry):
+            continue
+        route = {
+            "program_id": pid,
+            "creature_id": _pick(entry, ["creatureId", "creature_id"]),
+            "entity_id": _pick(entry, ["entityId", "entity_id"]) or SANDBOX_ENTITY,
+        }
+        _SANDBOX_CACHE[space_id] = (route, now + _SANDBOX_TTL)
+        return route
     return None
 
 
