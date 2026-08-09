@@ -269,6 +269,13 @@ def bake_env() -> Dict[str, str]:
     if truthy(os.environ.get("GROK_BAKE_PROXY", "")):
         names += list(PROXY_ENV_NAMES)
     env = {name: os.environ[name].strip() for name in names if os.environ.get(name, "").strip()}
+    # Per-provider PLATFORM keys from the admin panel's agent settings, baked as
+    # GROK_CREATURE_LLM_KEY_<PROVIDER>. An agent that selects an admin-configured
+    # model without its own key runs on the admin's key for that provider (see
+    # grokRunner.applyLlmOverride → platformKeyFor). Baked, never sent in a signal.
+    for name, value in os.environ.items():
+        if name.startswith("GROK_CREATURE_LLM_KEY_") and value.strip():
+            env[name] = value.strip()
     # A default (non-xAI) backbone for agents that bring no provider of their own:
     # the same {provider, model, api_key} shape a per-agent override uses, so the
     # creature serves it through exactly one code path.

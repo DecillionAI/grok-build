@@ -156,17 +156,34 @@ export function applyLlmOverride(env, llm) {
     };
   }
 
-  // The native provider with no key of its own: the image's credential serves it,
-  // and the model id is passed straight through to the built-in catalog.
-  if (resolved.native && !apiKey) return { ...none, model: modelId, provider: resolved.id };
+  // A per-agent api_key always wins. With none, fall back to the PLATFORM key the
+  // admin configured for this provider — baked at deploy as
+  // `GROK_CREATURE_LLM_KEY_<PROVIDER>` from the admin panel's agent settings — so an
+  // agent that just picks an admin-configured model runs on the admin's key rather
+  // than the creature's single default env credential.
+  const platformKey = platformKeyFor(resolved.id, env);
+  const effectiveKey = apiKey || platformKey;
+  const keyOrigin = apiKey ? "agent" : "platform";
 
-  if (!apiKey) {
+  // The native provider (xAI): its credential is the image's XAI_API_KEY unless the
+  // agent or the admin supplied one; the model id passes straight to the catalog.
+  if (resolved.native) {
+    if (effectiveKey) {
+      takeOver();
+      env.XAI_API_KEY = effectiveKey;
+      return { ...none, model: modelId, provider: resolved.id, credential: `${keyOrigin}:XAI_API_KEY` };
+    }
+    return { ...none, model: modelId, provider: resolved.id };
+  }
+
+  if (!effectiveKey) {
     return {
       ...none,
       provider: resolved.id,
       warning:
-        `LLM provider "${resolved.id}" was selected but the agent carries no api_key — ` +
-        "this run used the creature's default backbone instead.",
+        `LLM provider "${resolved.id}" was selected but there is no api_key for it — ` +
+        "neither the agent nor the platform (admin settings) supplies one, so this run " +
+        "used the creature's default backbone instead.",
     };
   }
 
@@ -178,7 +195,7 @@ export function applyLlmOverride(env, llm) {
     name: modelId,
     model: modelId,
     baseUrl: resolved.baseUrl,
-    apiKey,
+    apiKey: effectiveKey,
     apiBackend: resolved.apiBackend,
     authScheme: resolved.authScheme,
     headers: resolved.headers,
@@ -199,7 +216,20 @@ export function applyLlmOverride(env, llm) {
       creatureNumber("INFERENCE_IDLE_TIMEOUT", 180, env),
     maxRetries: Number.isFinite(Number(llm.max_retries)) ? Number(llm.max_retries) : creatureNumber("LLM_MAX_RETRIES", 4, env),
   };
-  return { model: modelId, modelConfig, warning: undefined, provider: resolved.id, credential: `agent:${resolved.id}` };
+  return { model: modelId, modelConfig, warning: undefined, provider: resolved.id, credential: `${keyOrigin}:${resolved.id}` };
+}
+
+/**
+ * The platform (admin-configured) api_key for a provider, baked at deploy as
+ * `GROK_CREATURE_LLM_KEY_<PROVIDER>` from the admin panel's agent settings. This is
+ * the fallback for an agent that selects an admin-configured model without giving
+ * its own key — the admin's key serves it, not the creature's single default env
+ * credential. Empty when the admin configured no key for this provider.
+ */
+export function platformKeyFor(providerId, env = process.env) {
+  const norm = String(providerId || "").toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+  if (!norm) return "";
+  return String(creatureEnv(`LLM_KEY_${norm}`, env) || "").trim();
 }
 
 /**
