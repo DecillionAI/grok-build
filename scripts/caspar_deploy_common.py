@@ -219,6 +219,69 @@ def resolve_operator(client) -> str:
     info(f"persisted the deploy operator identity to {path} — future redeploys reuse this exact account")
     return client.user_id
 
+# --------------------------------------------------------------------------- #
+# Deterministic docker-tool program: discover-or-create, never re-mint
+# --------------------------------------------------------------------------- #
+#
+# A docker tool creature (the per-space sandbox, the github tool) must land on the
+# SAME program across deploys, or every space that added it ends up pointing at a
+# dead id. The reliable way to guarantee that is the one the Nest deployer already
+# uses for its WASM endpoints — and the reason those never churn: give the tool's
+# machine creature a STABLE username and re-find it by that username each run,
+# rather than trusting a recorded program id that a node reset can strand under a
+# different owner.
+#
+# There is deliberately NO re-mint fallback. With one operator that owns what it
+# created, a redeploy always finds its own machine. A stable-named machine owned
+# by someone else is a real misconfiguration (two operators, or a hand-minted
+# program) — we fail loudly so it gets fixed, instead of silently minting an
+# ever-climbing new id every deploy (the churn this replaces).
+
+
+def ensure_docker_program(
+    client,
+    operator_id: str,
+    *,
+    machine_name: str,
+    program_path: str,
+    comment: str,
+) -> Tuple[str, str]:
+    """Resolve ``(creature_id, program_id)`` for a docker tool, deterministically.
+
+    * Re-find the tool's machine by its stable username; reuse its docker program.
+    * Create the machine + program only when it does not exist yet (first deploy /
+      a freshly-reproduced node).
+    * Never re-mint: a stable-named machine owned by a different account is fatal.
+    """
+    source = operator_id.split("@", 1)[1] if "@" in operator_id else "global"
+    username = f"{machine_name}@{source}"
+    existing = client.get_by_username(username)
+    if existing:
+        creature_id = str(existing.get("id") or "")
+        owner = str(existing.get("ownerId") or existing.get("owner_id") or "")
+        if owner != operator_id:
+            raise RuntimeError(
+                f"machine {username} exists but is owned by {owner!r}, not the deploy operator "
+                f"{operator_id!r}. Refusing to re-mint. Deploy as the owning operator (one operator for "
+                f"the backbone and every tool), or wipe the node so its state is reproduced under it."
+            )
+        for prog in client.list_programs():
+            if str(prog.get("machineId") or prog.get("machine_id") or "") == creature_id:
+                program_id = str(prog.get("id") or "")
+                if program_id:
+                    info(f"reusing {machine_name}: creature {creature_id} program {program_id} (owned by operator)")
+                    return creature_id, program_id
+        # The machine exists but carries no program yet (an interrupted first
+        # deploy) — add the program to the machine we already own.
+        program_id = client.create_program(creature_id, program_path, "docker", comment)
+        info(f"reusing machine {creature_id}, created its program {program_id}")
+        return creature_id, program_id
+    creature_id = client.create_machine_creature(machine_name)
+    program_id = client.create_program(creature_id, program_path, "docker", comment)
+    info(f"created machine creature {creature_id} and program {program_id} (first deploy of {machine_name})")
+    return creature_id, program_id
+
+
 # The node has no true "unlimited" exec cap (`runEntity` clamps <= 0 to 60 and
 # always spawns a reaper), so "unlimited" is a very large but i64-safe value.
 VM_MAX_UNLIMITED = 10_000_000_000

@@ -190,6 +190,30 @@ class CasparSignalingClient:
             raise RuntimeError(f"create program failed: {r}")
         return r.get("program", {}).get("id", "")
 
+    def get_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        """The creature stored under ``username`` (``<name>@<source>``), or None.
+
+        This is the deterministic way a redeploy re-finds the machine it created —
+        the same lookup the Nest deployer uses for its WASM endpoints (which is why
+        those never re-mint). The returned dict carries at least ``id`` and the
+        owner (``ownerId``)."""
+        r = self.send("/creatures/getByUsername", {"username": username})
+        if r.get("_res_code", -1) != 0:
+            return None  # "user not found" (or any error) — treat as absent
+        user = r.get("user")
+        return user if isinstance(user, dict) else None
+
+    def list_programs(self, offset: int = 0, count: int = 100000) -> List[Dict[str, Any]]:
+        """Every program on the node as ``{id, machineId, …}`` rows.
+
+        Used to resolve a machine creature's docker program by its ``machineId``,
+        so a redeploy lands on the same program the machine already owns."""
+        r = self.send("/programs/list", {"offset": offset, "count": count})
+        if not isinstance(r, dict):
+            return []
+        rows = r.get("machines")
+        return rows if isinstance(rows, list) else []
+
     def deploy(self, program_id: str, entity_id: str, entity_type: str,
                primary_b64: str, files_b64: Optional[Dict[str, str]] = None,
                metadata: Optional[Dict[str, Any]] = None,
