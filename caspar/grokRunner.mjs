@@ -232,6 +232,39 @@ export function platformKeyFor(providerId, env = process.env) {
   return String(creatureEnv(`LLM_KEY_${norm}`, env) || "").trim();
 }
 
+/** Providers whose admin-configured platform key we hydrate from the secret store. */
+export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter"];
+
+/**
+ * Hydrate the admin-configured platform LLM keys from the on-chain **secret
+ * store** into this process's env, once at boot, so the per-run key resolution
+ * (`platformKeyFor`) reads them from env exactly as before — but the key was
+ * never baked into the creature image. Each key is a secret owned by the deploy
+ * operator (`SECRET_OWNER`) that granted this backbone creature read access; we
+ * fetch it with the `secretGet` host call (authenticated as this creature).
+ *
+ * Best-effort and non-fatal: no `SECRET_OWNER`, no bridge, or a missing/ungranted
+ * secret simply leaves that provider without a platform key (same as an operator
+ * who configured none). A value already present in env (a baked key, or a prior
+ * hydrate) is left untouched, so this never overrides an explicit config.
+ */
+export async function hydratePlatformKeys(bridge, env = process.env) {
+  const owner = String(creatureEnv("SECRET_OWNER", env) || "").trim();
+  if (!owner || !bridge || typeof bridge.call !== "function") return;
+  for (const provider of PLATFORM_KEY_PROVIDERS) {
+    const norm = provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+    const envName = `GROK_CREATURE_LLM_KEY_${norm}`;
+    if (String(env[envName] || "").trim()) continue; // explicit/baked value wins
+    try {
+      const res = await bridge.call("secretGet", { owner, name: `LLM_KEY_${norm}` });
+      const value = res && res.ok && typeof res.value === "string" ? res.value.trim() : "";
+      if (value) env[envName] = value;
+    } catch {
+      /* no grant / not found / transient — that provider just has no platform key */
+    }
+  }
+}
+
 /**
  * The creature's own default backbone, as an `llm` block.
  *
