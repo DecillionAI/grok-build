@@ -297,6 +297,28 @@ export function defaultLlm(env = process.env) {
   return { provider, api_key: apiKey, ...(model ? { models: [model] } : {}), ...(baseUrl ? { base_url: baseUrl } : {}) };
 }
 
+/**
+ * Run-wide model resilience defaults, written into the `[models]` global block
+ * so they apply to EVERY model — crucially the native/default backbone, which
+ * writes no per-model `[model.<id>]` entry and would otherwise inherit grok's
+ * 600s idle window with no retry tuning. A wedged inference on any backbone then
+ * aborts and retries instead of hanging the whole run on one step (the "agent
+ * randomly gets stuck on a step" symptom). A per-model `[model.<id>]` value still
+ * wins (grok folds these as `get_or_insert`), so an agent that brought its own
+ * provider is unchanged. The knobs mirror the per-model ones in `applyLlmOverride`
+ * so there is one idle-timeout/retry story across every run; set
+ * `GROK_CREATURE_INFERENCE_IDLE_TIMEOUT` / `GROK_CREATURE_LLM_MAX_RETRIES` to 0 to
+ * drop back to grok's own defaults for a given knob.
+ */
+export function runWideModelDefaults(env = process.env) {
+  const idle = creatureNumber("INFERENCE_IDLE_TIMEOUT", 180, env);
+  const retries = creatureNumber("LLM_MAX_RETRIES", 4, env);
+  return {
+    inferenceIdleTimeoutSec: Number.isFinite(idle) && idle > 0 ? idle : undefined,
+    maxRetries: Number.isFinite(retries) && retries >= 0 ? retries : undefined,
+  };
+}
+
 /** True when the task carried no usable per-agent LLM override. */
 function hasAgentLlm(llm) {
   if (!llm || typeof llm !== "object") return false;
@@ -571,7 +593,14 @@ export async function runGrok(opts) {
     try {
       writeGrokHome(
         grokHome,
-        { mcpServers: mcpServers || {}, model: modelConfig, defaultModel: modelConfig ? modelConfig.name : undefined },
+        {
+          mcpServers: mcpServers || {},
+          model: modelConfig,
+          defaultModel: modelConfig ? modelConfig.name : undefined,
+          // Applies to native/default-backbone runs too (no `[model.<id>]` entry);
+          // a per-model entry overrides it. See `runWideModelDefaults`.
+          modelDefaults: runWideModelDefaults(env),
+        },
         drop ? { uid: drop.uid, gid: drop.gid } : {},
       );
       seedAuth(grokHome, { env, uid: drop?.uid, gid: drop?.gid });
