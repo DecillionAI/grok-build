@@ -214,6 +214,22 @@ class CasparSignalingClient:
         rows = r.get("machines")
         return rows if isinstance(rows, list) else []
 
+    def list_creatures(self, offset: int = 0, count: int = 100000) -> List[Dict[str, Any]]:
+        """Every creature on the node as ``{id, username, ownerId}`` rows.
+
+        ``getByUsername`` cannot reliably re-find a machine creature: the node
+        stores the username qualified with its own ``source`` and enforces
+        uniqueness on that qualified form, but ``getByUsername`` looks the raw
+        argument up, so a redeploy misses the machine it created and then collides
+        on create (``creature username already exists``). Enumerating and matching
+        the unqualified local part sidesteps that — the same fix the Nest wasm
+        deployer uses (see ``deployer.ts`` ``creatureNames``)."""
+        r = self.send("/creatures/list", {"offset": offset, "count": count})
+        if not isinstance(r, dict):
+            return []
+        rows = r.get("creatures")
+        return rows if isinstance(rows, list) else []
+
     def deploy(self, program_id: str, entity_id: str, entity_type: str,
                primary_b64: str, files_b64: Optional[Dict[str, str]] = None,
                metadata: Optional[Dict[str, Any]] = None,

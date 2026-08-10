@@ -110,21 +110,38 @@ def main() -> int:
         #     independent of the accounts directory. A fresh deploy has an empty
         #     directory (the app only upserts it on sign-in), so matching admins by
         #     the directory alone (step 2) would seed nobody but the operator, and
-        #     the configured admin's own signed calls would fail requireAdmin. The
-        #     global registry is populated the moment a user logs in, so getByUsername
-        #     resolves them regardless. (Idempotent — a set.)
-        for uname in sorted(extra_usernames):
+        #     the configured admin's own signed calls would then fail requireAdmin.
+        #     Enumerate creatures and match the UNQUALIFIED local part — getByUsername
+        #     can't reliably re-find a user either (the node stores the username
+        #     qualified with its own source, e.g. "keyhmoham@<node-source>", which
+        #     getByUsername does not match), so a raw lookup misses the very admin we
+        #     are trying to seed. Matching the local part is how it's actually found.
+        if extra_usernames:
+            wanted = {u for u in extra_usernames}
+            found: Dict[str, str] = {}
             try:
-                user = client.get_by_username(uname)
-            except Exception as exc:  # noqa: BLE001 — a missing user is not fatal
-                warn(f"could not resolve admin username {uname!r}: {exc}")
-                continue
-            uid = str((user or {}).get("id") or "")
-            if uid:
-                admins.add(uid)
-                info(f"admin username {uname!r} → {uid} (from the global registry)")
-            else:
-                warn(f"admin username {uname!r} not found on the network yet — they must sign in once")
+                for c in client.list_creatures():
+                    uname_raw = str(c.get("username") or "")
+                    local = uname_raw.split("@", 1)[0].lower()
+                    cid = str(c.get("id") or "")
+                    if cid and local in wanted:
+                        found[local] = cid
+            except Exception as exc:  # noqa: BLE001 — fall back to per-name probes
+                warn(f"could not enumerate creatures to resolve admins: {exc}")
+            for uname in sorted(wanted):
+                uid = found.get(uname)
+                if not uid:
+                    # Last resort: the raw getByUsername probe (covers a node that
+                    # doesn't support /creatures/list).
+                    try:
+                        uid = str((client.get_by_username(uname) or {}).get("id") or "")
+                    except Exception:  # noqa: BLE001
+                        uid = ""
+                if uid:
+                    admins.add(uid)
+                    info(f"admin username {uname!r} → {uid}")
+                else:
+                    warn(f"admin username {uname!r} not found on the network yet — they must sign in once")
 
         # 3) Replace the whole set with the desired admins.
         final = _set_admins(client, set_ep, sorted(admins))
