@@ -249,18 +249,29 @@ export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "
  * hydrate) is left untouched, so this never overrides an explicit config.
  */
 export async function hydratePlatformKeys(bridge, env = process.env) {
-  const owner = String(creatureEnv("SECRET_OWNER", env) || "").trim();
-  if (!owner || !bridge || typeof bridge.call !== "function") return;
-  for (const provider of PLATFORM_KEY_PROVIDERS) {
-    const norm = provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
-    const envName = `GROK_CREATURE_LLM_KEY_${norm}`;
+  if (!bridge || typeof bridge.call !== "function") return;
+  // Discover the secrets granted to THIS backbone creature (secretListGranted),
+  // then read each LLM_KEY_<PROVIDER> — owner-independent, so whoever stored the
+  // key (the deploy operator, or an admin from the panel) works the same, without
+  // a hardcoded SECRET_OWNER or provider list.
+  let grants;
+  try {
+    const res = await bridge.call("secretListGranted", {});
+    grants = res && res.ok && Array.isArray(res.grants) ? res.grants : [];
+  } catch {
+    return;
+  }
+  for (const grant of grants) {
+    const name = String(grant?.name || "");
+    if (!name.startsWith("LLM_KEY_")) continue;
+    const envName = `GROK_CREATURE_LLM_KEY_${name.slice("LLM_KEY_".length)}`;
     if (String(env[envName] || "").trim()) continue; // explicit/baked value wins
     try {
-      const res = await bridge.call("secretGet", { owner, name: `LLM_KEY_${norm}` });
+      const res = await bridge.call("secretGet", { owner: grant.owner, name });
       const value = res && res.ok && typeof res.value === "string" ? res.value.trim() : "";
       if (value) env[envName] = value;
     } catch {
-      /* no grant / not found / transient — that provider just has no platform key */
+      /* not found / transient — that provider just has no usable platform key */
     }
   }
 }
