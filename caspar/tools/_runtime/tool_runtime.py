@@ -397,6 +397,73 @@ def _run_once_offline() -> int:
     return 0
 
 
+def _run_http_server(handler, port: int) -> None:
+    """Serve `handler` over plain HTTP on `0.0.0.0:port` in a daemon thread. The
+    node's VM HTTP ingress proxies inbound requests
+    (`{node}/{creatureId}/{programId}/{entityId}/{vmId}/{path}`) to this port, so a
+    tool can answer a browser redirect (e.g. an OAuth callback) itself. `handler`
+    is `(method, path, query{str:str}, headers{str:str}, body: bytes) ->
+    (status:int, content_type:str, body: str|bytes)`."""
+    import threading
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _serve(self, method: str) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length > 0 else b""
+            try:
+                status, ctype, out = handler(method, parsed.path, query, dict(self.headers), body)
+            except Exception as exc:  # noqa: BLE001 — never leak a stack to the browser
+                status, ctype, out = 500, "text/plain; charset=utf-8", "internal error"
+                print("TOOL_HTTP_HANDLER_ERROR " + json.dumps({"error": str(exc)}), flush=True)
+            if isinstance(out, str):
+                out = out.encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("Content-Type", ctype or "application/octet-stream")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def do_GET(self):  # noqa: N802
+            self._serve("GET")
+
+        def do_POST(self):  # noqa: N802
+            self._serve("POST")
+
+        def log_message(self, *args):  # noqa: N802 — silence default stderr logging
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+
+def _maybe_start_http_server() -> None:
+    """If the tool module defines `http_handler`, serve it on CASPAR_VM_HTTP_PORT
+    so the node's VM HTTP ingress can proxy inbound requests into the tool. Most
+    tools define no handler and get no server."""
+    try:
+        port = int(os.environ.get("CASPAR_VM_HTTP_PORT") or 0)
+    except ValueError:
+        return
+    if port <= 0:
+        return
+    try:
+        impl = _load_tool_module()
+    except Exception:  # noqa: BLE001
+        impl = None
+    handler = getattr(impl, "http_handler", None)
+    if not callable(handler):
+        return
+    try:
+        _run_http_server(handler, port)
+        print("TOOL_HTTP_LISTENING " + json.dumps({"tool_id": TOOL_ID or "unknown", "port": port}), flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print("TOOL_HTTP_ERROR " + json.dumps({"error": str(exc)}), flush=True)
+
+
 def main() -> int:
     # The single gateway connection is the tool's only channel to the outside
     # world. When present, the tool runs as a long-lived standalone creature that
@@ -413,6 +480,9 @@ def main() -> int:
         "bridge_module": _bridge_mod is not None,
     }), flush=True)
     bridge = _connect_bridge()
+    # Start the optional inbound-HTTP server (e.g. the github tool's OAuth
+    # callback) once the identity/env is up; it runs independently of the serve loop.
+    _maybe_start_http_server()
     if bridge is not None:
         # Serve, reconnecting whenever the gateway link drops, so the creature
         # stays reachable across idle periods and transient blips instead of
