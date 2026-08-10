@@ -163,6 +163,54 @@ await check("a payload-string envelope (the CLI convention) unwraps, keeping pro
   assert.equal(decoded.correlationId, "c9");
 });
 
+await check("the agent's injected config.llm (proxy inject) survives the payload-string unwrap", () => {
+  // The real wire shape: the app/Nest send the prompt double-wrapped — the inner
+  // task travels as a JSON *string* under `payload` — and the node's proxy entity
+  // deep-merges the agent's stored `inject` (`{config:{llm:{provider,model,apiKey}}}`)
+  // onto the OUTER envelope, because it cannot reach inside the string. The inner
+  // prompt itself carries no config.llm (the on-chain prompt path relies entirely
+  // on the inject). The backbone must carry that injected config across the unwrap.
+  const inner = {
+    prompt: "summarize the repo",
+    objective: "summarize the repo",
+    config: { tools: ["caspar__sandbox"] }, // caller's own config — no llm here
+  };
+  const wrapper = {
+    programId: "prog-agent",
+    entity: "agent",
+    payload: JSON.stringify(inner),
+    // stamped by the node's proxy entity on the way through:
+    skill: "You are Tina.",
+    correlationId: "corr-llm",
+    replyTo: "8@global",
+    proxyProgramId: "8@global",
+    proxyEntityId: "agent",
+    // deep-merged from the agent's proxy.inject onto the outer envelope:
+    config: { llm: { provider: "openai", models: ["gpt-5"], api_key: "sk-AGENT" } },
+  };
+  const decoded = decodeTaskSignal("creatures/signal", { data: JSON.stringify(wrapper) });
+  assert.ok(decoded, "the delivery should decode as a task");
+  assert.equal(decoded.task.config?.llm?.provider, "openai", "injected provider reaches the task");
+  assert.equal(decoded.task.config?.llm?.models?.[0], "gpt-5", "injected model reaches the task");
+  assert.equal(decoded.task.config?.llm?.api_key, "sk-AGENT", "the agent's own key reaches the task");
+  assert.equal(decoded.task.config?.tools?.[0], "caspar__sandbox", "the caller's tools are preserved");
+  assert.equal(decoded.task.skill, "You are Tina.", "the skill still rides the envelope");
+});
+
+await check("the injected config.llm wins over a caller-supplied one", () => {
+  // A client cannot forge another provider/key: the proxy's injected config wins.
+  const inner = { prompt: "hi", config: { llm: { provider: "attacker", api_key: "sk-FORGED" }, tools: ["t1"] } };
+  const wrapper = {
+    payload: JSON.stringify(inner),
+    correlationId: "c",
+    config: { llm: { provider: "openai", models: ["gpt-5"], api_key: "sk-AGENT" } },
+  };
+  const decoded = decodeTaskSignal("creatures/signal", { data: JSON.stringify(wrapper) });
+  assert.equal(decoded.task.config.llm.provider, "openai", "agent provider wins");
+  assert.equal(decoded.task.config.llm.api_key, "sk-AGENT", "agent key wins");
+  assert.equal(decoded.task.config.tools[0], "t1", "caller's other config fields are kept");
+});
+
 await check("signals that are not prompts are ignored", () => {
   assert.equal(decodeTaskSignal("creatures/signal", { data: JSON.stringify({ kind: "tools/result", correlationId: "x", result: {} }) }), null);
   assert.equal(decodeTaskSignal("creatures/signal", { data: JSON.stringify({ kind: "davinci/step", correlationId: "x" }) }), null);

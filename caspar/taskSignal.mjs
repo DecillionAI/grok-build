@@ -28,6 +28,21 @@ const PROXY_KEYS = [
   "proxyEntityId",
 ];
 
+/**
+ * Deep-merge `src` onto `base`: nested objects merge recursively, and any
+ * non-object value in `src` overwrites `base`. Mirrors the node proxy's own
+ * `deep_merge` (`caspar/node/src/drivers/vmm/proxy.rs`) so the agent's injected
+ * config wins over a caller-supplied one, exactly as it does on the wire.
+ */
+function deepMerge(base, src) {
+  if (src === null || typeof src !== "object" || Array.isArray(src)) return src;
+  const out = base && typeof base === "object" && !Array.isArray(base) ? { ...base } : {};
+  for (const [k, v] of Object.entries(src)) {
+    out[k] = v && typeof v === "object" && !Array.isArray(v) ? deepMerge(out[k], v) : v;
+  }
+  return out;
+}
+
 function parseMaybeJson(value) {
   if (typeof value !== "string") return value;
   const text = value.trim();
@@ -113,6 +128,18 @@ function mergeEnvelope(payload, wrapper) {
   const merged = { ...payload };
   for (const k of PROXY_KEYS) {
     if (k in wrapper && !(k in merged)) merged[k] = wrapper[k];
+  }
+  // The agent's own LLM config (its provider/model/**apiKey**) reaches us as the
+  // proxy entity's `inject`, which the node deep-merges into the forwarded packet
+  // (see proxy.rs). But the requester's real payload travels as a JSON *string*
+  // under `payload`, so the node can only merge the inject onto the OUTER
+  // envelope — `config` lands on the wrapper, not inside this unwrapped inner.
+  // Carry it across, with the injected value winning over any caller-supplied
+  // `config` (same precedence as the node's own deep-merge). Without this the
+  // agent's key is silently dropped and every run falls back to the creature's
+  // default backbone — the exact "agents ignore my LLM key" bug.
+  if (wrapper && typeof wrapper.config === "object" && wrapper.config !== null && !Array.isArray(wrapper.config)) {
+    merged.config = deepMerge(merged.config, wrapper.config);
   }
   return merged;
 }
