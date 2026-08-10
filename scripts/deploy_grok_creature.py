@@ -527,11 +527,32 @@ def main() -> int:
         client.close()
         return 1
 
+    # The backbone's owning machine creature (Program.machineId). deploy() only
+    # knows it on a fresh create; on the common redeploy path it reuses an existing
+    # program, so resolve it from the program row. This is the creature the docker
+    # container authenticates as at run time (the node stamps it via get_vm_context),
+    # so it is exactly who the platform LLM keys must be granted to — CI records it
+    # as davinci.agent.creatureId and deploy_llm_secrets grants against it.
+    creature_id = str(deployed.get("creature_id") or "")
+    if not creature_id:
+        try:
+            for prog in client.list_programs():
+                if str(prog.get("id") or "") == deployed["program_id"]:
+                    creature_id = str(prog.get("machineId") or prog.get("machine_id") or "")
+                    break
+        except Exception as exc:  # noqa: BLE001 — non-fatal; grant step will warn
+            warn(f"could not resolve the backbone's owning creature: {exc}")
+
     # Machine-readable markers. Both spellings are printed so this script is a
     # drop-in for the davinci deploy entrypoint the Decillion CI greps.
     for prefix in ("DAVINCI", "GROK"):
         print(f"{prefix}_PROGRAM_ID=" + deployed["program_id"], flush=True)
         print(f"{prefix}_ENTITY_ID=" + deployed["entity_id"], flush=True)
+        if creature_id:
+            print(f"{prefix}_CREATURE_ID=" + creature_id, flush=True)
+    if not creature_id:
+        warn("could not determine the backbone's owning creature id — platform LLM "
+             "key grants will be skipped until davinci.agent.creatureId is recorded")
 
     if truthy(env_any("GROK_RUN_ENTITY", "DAVINCI_RUN_ENTITY", default="1")):
         ram = int(env_any("GROK_VM_RAM_MB", "DAVINCI_VM_RAM_MB", default="2048"))
