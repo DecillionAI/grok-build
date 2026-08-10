@@ -255,7 +255,34 @@ def ensure_docker_program(
     """
     source = operator_id.split("@", 1)[1] if "@" in operator_id else "global"
     username = f"{machine_name}@{source}"
-    existing = client.get_by_username(username)
+    # Re-find the machine by enumerating creatures and matching the unqualified
+    # local part — getByUsername can't (the node stores + uniquely indexes the
+    # username qualified with its own source, which getByUsername doesn't match),
+    # so a redeploy would miss the machine it already owns and then collide on
+    # create with "creature username already exists". Prefer an operator-owned
+    # match; remember a foreign-owned one so the ownership guard below can report
+    # it clearly. Fall back to the raw getByUsername probe only if listing fails.
+    want = machine_name[:32]
+    existing = None
+    foreign = None
+    try:
+        for c in client.list_creatures():
+            uname = str(c.get("username") or "")
+            if uname.split("@", 1)[0] != want and uname != want:
+                continue
+            cid = str(c.get("id") or "")
+            if not cid:
+                continue
+            owner = str(c.get("ownerId") or c.get("owner_id") or "")
+            entry = {"id": cid, "ownerId": owner}
+            if owner == operator_id:
+                existing = entry
+                break
+            foreign = foreign or entry
+    except Exception:  # noqa: BLE001 — fall through to the raw probe
+        existing = None
+    if existing is None:
+        existing = foreign or client.get_by_username(username) or client.get_by_username(want)
     if existing:
         creature_id = str(existing.get("id") or "")
         owner = str(existing.get("ownerId") or existing.get("owner_id") or "")
