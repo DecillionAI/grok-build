@@ -6,3 +6,7 @@
 /bin/grok
 /out
 /.protoc-cache
+
+# Python bytecode caches
+__pycache__/
+*.pyc
