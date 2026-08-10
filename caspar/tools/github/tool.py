@@ -498,6 +498,45 @@ def _oauth_exchange(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "shared": conn["shared"], "scopes": conn["scopes"]}
 
 
+def _oauth_result_html(title: str, message: str) -> str:
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{title}</title>"
+        "<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0b0f;"
+        "color:#e7e7ea;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}"
+        ".card{max-width:420px;padding:32px;text-align:center}h1{font-size:20px;margin:0 0 12px}"
+        "p{color:#a1a1aa;line-height:1.5}</style></head>"
+        f'<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>'
+    )
+
+
+def http_handler(method, path, query, headers, body):
+    """The GitHub OAuth callback, served over HTTP by the node's VM HTTP ingress
+    (proxied straight into this container) — no Nest route involved. GitHub
+    redirects the browser here with ``?code&state``; we swap the code for a token
+    and store the connection. The space + owner come from the stored handshake,
+    never the request, so this cannot be steered. Only this one route is served."""
+    if method == "GET" and path.rstrip("/").endswith("/oauth/callback"):
+        err = str(query.get("error_description") or query.get("error") or "").strip()
+        if err:
+            return (400, "text/html; charset=utf-8", _oauth_result_html("Connection failed", err))
+        code = str(query.get("code") or "").strip()
+        state = str(query.get("state") or "").strip()
+        try:
+            _oauth_exchange("", {"code": code, "state": state})
+            return (200, "text/html; charset=utf-8",
+                    _oauth_result_html("GitHub connected",
+                                       "You can close this tab and return to Decillion."))
+        except GithubError as exc:
+            return (int(getattr(exc, "status", 400) or 400), "text/html; charset=utf-8",
+                    _oauth_result_html("Connection failed", str(exc)))
+        except Exception:  # noqa: BLE001 — never leak internals to the browser
+            return (500, "text/html; charset=utf-8",
+                    _oauth_result_html("Connection failed", "An unexpected error occurred."))
+    return (404, "text/plain; charset=utf-8", "not found")
+
+
 def _oauth_wait(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Server-paced wait for the callback to land, so the front-end needs no
     timer: block until the token is stored (the exchange ran), the handshake

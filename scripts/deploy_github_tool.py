@@ -200,6 +200,30 @@ def compose_dockerfile(files: Dict[str, str]):
     return stamp_context(dockerfile, files)
 
 
+def _log_oauth_callback_url(creature_id: str, program_id: str, entity_id: str, vm_id: str) -> None:
+    """Record the node VM-HTTP-ingress URL that reaches the github tool's OAuth
+    callback, so the operator can point a Caddy path (the OAuth app's registered
+    redirect URI) at it — the callback runs INSIDE the container now, not on Nest.
+
+    The path segment is stable per (creature, program, entity); the base is the
+    node's public ingress host (GITHUB_VM_HTTP_INGRESS_BASE /
+    CASPAR_VM_HTTP_INGRESS_BASE) and the vm id changes when the container is
+    recreated, so re-read the logged file on redeploy and re-point Caddy if it moved."""
+    ingress_path = f"/{creature_id}/{program_id}/{entity_id}/{vm_id}/oauth/callback"
+    base = env_any("GITHUB_VM_HTTP_INGRESS_BASE", "CASPAR_VM_HTTP_INGRESS_BASE", default="").rstrip("/")
+    full = (base + ingress_path) if base else ingress_path
+    print("GITHUB_OAUTH_CALLBACK_INGRESS=" + full, flush=True)
+    info(f"github OAuth callback is served in-container; point Caddy (the OAuth app's redirect URI) at: {full}")
+    manifest = env_any("CASPAR_MANIFEST", default="")
+    if manifest:
+        try:
+            out = Path(manifest).resolve().parent / ".github-oauth-callback-url"
+            out.write_text(full + "\n")
+            ok(f"github OAuth callback ingress URL written to {out}")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"could not write github OAuth callback url file: {exc}")
+
+
 def main() -> int:
     entity_id = env_any("GITHUB_TOOL_ENTITY_ID", default=TOOL_ID)
 
@@ -269,6 +293,7 @@ def main() -> int:
             if vm_id:
                 ok(f"{TOOL_ID} VM entity running: {vm_id}")
                 print("GITHUB_TOOL_VM_ID=" + vm_id, flush=True)
+                _log_oauth_callback_url(creature_id, program_id, entity_id, vm_id)
             else:
                 warn("runEntity returned no vmId")
         except Exception as exc:  # noqa: BLE001 — the program is deployed regardless

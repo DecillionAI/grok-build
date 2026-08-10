@@ -269,13 +269,15 @@ def bake_env() -> Dict[str, str]:
     if truthy(os.environ.get("GROK_BAKE_PROXY", "")):
         names += list(PROXY_ENV_NAMES)
     env = {name: os.environ[name].strip() for name in names if os.environ.get(name, "").strip()}
-    # Per-provider PLATFORM keys from the admin panel's agent settings, baked as
-    # GROK_CREATURE_LLM_KEY_<PROVIDER>. An agent that selects an admin-configured
-    # model without its own key runs on the admin's key for that provider (see
-    # grokRunner.applyLlmOverride → platformKeyFor). Baked, never sent in a signal.
-    for name, value in os.environ.items():
-        if name.startswith("GROK_CREATURE_LLM_KEY_") and value.strip():
-            env[name] = value.strip()
+    # The admin-configured per-provider PLATFORM keys are NO LONGER baked into the
+    # image. They live in the on-chain secret store (owned by the operator, granted
+    # to this backbone) and are hydrated at boot with the `secretGet` host call —
+    # see caspar/grokRunner.hydratePlatformKeys and scripts/deploy_llm_secrets.py.
+    # We bake only SECRET_OWNER (a non-secret creature id) so the backbone knows
+    # which owner to read those secrets from.
+    secret_owner = env_any("SECRET_OWNER", default="")
+    if secret_owner:
+        env["SECRET_OWNER"] = secret_owner
     # A default (non-xAI) backbone for agents that bring no provider of their own:
     # the same {provider, model, api_key} shape a per-agent override uses, so the
     # creature serves it through exactly one code path.
@@ -495,7 +497,12 @@ def main() -> int:
     # Authenticate as the ONE durable deploy operator (the same account the tool
     # deploys use), so this redeploy owns the agent program it minted before and
     # keeps every deployed agent proxy pointing at the same backbone.
-    resolve_operator(client)
+    operator_id = resolve_operator(client)
+    # The operator owns the platform LLM-key secrets (stored by deploy_llm_secrets.py)
+    # and grants this backbone read access; bake its id so the backbone knows which
+    # owner to read them from at boot (SECRET_OWNER). Never a secret itself.
+    if operator_id and not env_any("SECRET_OWNER", default=""):
+        os.environ["SECRET_OWNER"] = operator_id
 
     # Stop mode: bring a running entity down gracefully, then exit. The Decillion
     # CI uses this before restarting the node, so the VM is not yanked with it.

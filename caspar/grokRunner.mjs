@@ -232,6 +232,50 @@ export function platformKeyFor(providerId, env = process.env) {
   return String(creatureEnv(`LLM_KEY_${norm}`, env) || "").trim();
 }
 
+/** Providers whose admin-configured platform key we hydrate from the secret store. */
+export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter"];
+
+/**
+ * Hydrate the admin-configured platform LLM keys from the on-chain **secret
+ * store** into this process's env, once at boot, so the per-run key resolution
+ * (`platformKeyFor`) reads them from env exactly as before — but the key was
+ * never baked into the creature image. Each key is a secret owned by the deploy
+ * operator (`SECRET_OWNER`) that granted this backbone creature read access; we
+ * fetch it with the `secretGet` host call (authenticated as this creature).
+ *
+ * Best-effort and non-fatal: no `SECRET_OWNER`, no bridge, or a missing/ungranted
+ * secret simply leaves that provider without a platform key (same as an operator
+ * who configured none). A value already present in env (a baked key, or a prior
+ * hydrate) is left untouched, so this never overrides an explicit config.
+ */
+export async function hydratePlatformKeys(bridge, env = process.env) {
+  if (!bridge || typeof bridge.call !== "function") return;
+  // Discover the secrets granted to THIS backbone creature (secretListGranted),
+  // then read each LLM_KEY_<PROVIDER> — owner-independent, so whoever stored the
+  // key (the deploy operator, or an admin from the panel) works the same, without
+  // a hardcoded SECRET_OWNER or provider list.
+  let grants;
+  try {
+    const res = await bridge.call("secretListGranted", {});
+    grants = res && res.ok && Array.isArray(res.grants) ? res.grants : [];
+  } catch {
+    return;
+  }
+  for (const grant of grants) {
+    const name = String(grant?.name || "");
+    if (!name.startsWith("LLM_KEY_")) continue;
+    const envName = `GROK_CREATURE_LLM_KEY_${name.slice("LLM_KEY_".length)}`;
+    if (String(env[envName] || "").trim()) continue; // explicit/baked value wins
+    try {
+      const res = await bridge.call("secretGet", { owner: grant.owner, name });
+      const value = res && res.ok && typeof res.value === "string" ? res.value.trim() : "";
+      if (value) env[envName] = value;
+    } catch {
+      /* not found / transient — that provider just has no usable platform key */
+    }
+  }
+}
+
 /**
  * The creature's own default backbone, as an `llm` block.
  *

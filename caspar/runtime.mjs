@@ -41,7 +41,7 @@ import { bridgeFromEnv } from "./bridge.mjs";
 import { materializeAttachments } from "./attachments.mjs";
 import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
-import { disallowedBuiltinTools, runGrok, runTempDir } from "./grokRunner.mjs";
+import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
@@ -100,6 +100,18 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   const started = Date.now();
   const objective = taskObjective(task);
   const sessionId = threadSessionId(task, bridge ? `grok-${bridge.sessionId ?? "vm"}` : "grok-offline");
+  // Ensure the admin-configured platform LLM keys are loaded from the on-chain
+  // secret store into env before we build the run's key config. Cheap after the
+  // first success (providers already in env are skipped), and robust to deploy
+  // ordering — a key stored/granted after this creature booted is picked up on the
+  // first task that needs it, not only after a re-boot.
+  if (bridge) {
+    try {
+      await hydratePlatformKeys(bridge);
+    } catch (err) {
+      log("GROK_BOOT", { hydrate_keys_error: String(err?.message || err) });
+    }
+  }
   const { config, tools } = catalogFromTask(task);
 
   // The space's employable creatures. The backend sends `config.tools`, and —
@@ -562,6 +574,20 @@ export async function main() {
     program_id: bridge.programId,
     creature_id: bridge.creatureId,
   });
+
+  // Warm the admin-configured platform LLM keys from the on-chain secret store
+  // into env now (best-effort); each task also ensures this before building its
+  // key config, so a key stored after boot is still picked up. See
+  // hydratePlatformKeys / handleTask.
+  try {
+    await hydratePlatformKeys(bridge);
+    const hydrated = PLATFORM_KEY_PROVIDERS.filter(
+      (p) => String(process.env[`GROK_CREATURE_LLM_KEY_${p.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`] || "").trim(),
+    );
+    log("GROK_SECRETS", { platform_keys: hydrated });
+  } catch (err) {
+    log("GROK_BOOT", { hydrate_keys_error: String(err?.message || err) });
+  }
 
   const serveForever = creatureFlag("SERVE_FOREVER", true);
   const idleWaitMs = creatureNumber("TASK_WAIT", 600) * 1000;
