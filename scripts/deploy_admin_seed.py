@@ -106,6 +106,26 @@ def main() -> int:
         else:
             warn("no accounts/list endpoint — seeding only the operator as admin")
 
+        # 2b) Resolve ADMIN_USERNAMES against the node's GLOBAL creature registry,
+        #     independent of the accounts directory. A fresh deploy has an empty
+        #     directory (the app only upserts it on sign-in), so matching admins by
+        #     the directory alone (step 2) would seed nobody but the operator, and
+        #     the configured admin's own signed calls would fail requireAdmin. The
+        #     global registry is populated the moment a user logs in, so getByUsername
+        #     resolves them regardless. (Idempotent — a set.)
+        for uname in sorted(extra_usernames):
+            try:
+                user = client.get_by_username(uname)
+            except Exception as exc:  # noqa: BLE001 — a missing user is not fatal
+                warn(f"could not resolve admin username {uname!r}: {exc}")
+                continue
+            uid = str((user or {}).get("id") or "")
+            if uid:
+                admins.add(uid)
+                info(f"admin username {uname!r} → {uid} (from the global registry)")
+            else:
+                warn(f"admin username {uname!r} not found on the network yet — they must sign in once")
+
         # 3) Replace the whole set with the desired admins.
         final = _set_admins(client, set_ep, sorted(admins))
         if final.get("ok"):
