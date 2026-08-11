@@ -42,8 +42,10 @@ function tomlInlineTable(record) {
  * @param opts.mcpServers `{ [name]: { command, args, env, startupTimeoutSec, toolTimeoutSec } }`
  * @param opts.model      `{ name, model, baseUrl, apiKey, apiBackend, authScheme, headers, contextWindow }`
  * @param opts.defaultModel model name for `[models].default`
+ * @param opts.modelDefaults run-wide `[models]` scalar defaults
+ *   `{ inferenceIdleTimeoutSec, maxRetries, streamToolCalls }` — see below.
  */
-export function renderConfigToml({ mcpServers = {}, model, defaultModel } = {}) {
+export function renderConfigToml({ mcpServers = {}, model, defaultModel, modelDefaults } = {}) {
   const lines = [
     "# Generated per prompt by the Caspar creature bridge — do not edit.",
     "# It carries this run's MCP tool server and, when the agent brought its own",
@@ -51,8 +53,26 @@ export function renderConfigToml({ mcpServers = {}, model, defaultModel } = {}) 
     "",
   ];
 
-  if (defaultModel) {
-    lines.push("[models]", `default = ${tomlString(defaultModel)}`, "");
+  // `[models]` holds this run's default model AND the run-wide resilience
+  // defaults grok folds into EVERY model (`apply_global_scalar_defaults`). This
+  // is the only place the native/default backbone — which writes no per-model
+  // `[model.<id>]` entry — can get a bounded inference idle timeout and retries:
+  // without them a wedged inference on that backbone inherits grok's 600s idle
+  // window with no retry tuning, so one stuck step hangs the whole run (the
+  // "agent randomly gets stuck on a step" symptom). A per-model `[model.<id>]`
+  // value still wins (grok applies these as `get_or_insert`).
+  const modelsLines = [];
+  if (defaultModel) modelsLines.push(`default = ${tomlString(defaultModel)}`);
+  if (modelDefaults && typeof modelDefaults === "object") {
+    const idle = Number(modelDefaults.inferenceIdleTimeoutSec);
+    const retries = Number(modelDefaults.maxRetries);
+    if (Number.isFinite(idle) && idle > 0) modelsLines.push(`inference_idle_timeout_secs = ${Math.floor(idle)}`);
+    if (Number.isFinite(retries) && retries >= 0) modelsLines.push(`max_retries = ${Math.floor(retries)}`);
+    if (modelDefaults.streamToolCalls === false) modelsLines.push("stream_tool_calls = false");
+    else if (modelDefaults.streamToolCalls === true) modelsLines.push("stream_tool_calls = true");
+  }
+  if (modelsLines.length) {
+    lines.push("[models]", ...modelsLines, "");
   }
 
   if (model && model.name) {

@@ -34,6 +34,7 @@ import path from "node:path";
 
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildToolDefinitions, mergeArgs } from "../catalog.mjs";
+import { renderConfigToml } from "../grokConfig.mjs";
 import { applyLlmOverride, buildChildEnv, defaultLlm } from "../grokRunner.mjs";
 import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
@@ -322,11 +323,16 @@ await check("an agent's own API key takes over the run from the image's credenti
 await check("a per-agent LLM override becomes a native endpoint entry, per provider", () => {
   const env = { PATH: "/usr/bin", GROK_SESSION_ID: "leaked" };
 
-  // The native provider: the model id goes straight to the built-in catalog.
-  const xai = buildChildEnv({ env, llm: { provider: "xai", models: ["grok-4.5"], api_key: "xai-agent" } });
+  // The native provider (xAI): the model id goes straight to grok's built-in
+  // catalog and the agent's own key takes over the run's env credential — so it
+  // needs no generated `[model.<id>]` endpoint. Its per-run resilience (idle
+  // timeout, retries) therefore rides the run-wide `[models]` block instead (see
+  // runWideModelDefaults), not a per-model entry.
+  const xai = buildChildEnv({ env: { ...env, XAI_API_KEY: "xai-image" }, llm: { provider: "xai", models: ["grok-4.5"], api_key: "xai-agent" } });
   assert.equal(xai.model, "grok-4.5");
-  assert.equal(xai.modelConfig.baseUrl, "https://api.x.ai/v1");
-  assert.equal(xai.modelConfig.apiBackend, "chat_completions");
+  assert.equal(xai.modelConfig, undefined, "the native backbone needs no generated [model.<id>] endpoint");
+  assert.equal(xai.env.XAI_API_KEY, "xai-agent", "the agent's own xAI key takes over from the image's");
+  assert.equal(xai.credential, "agent:XAI_API_KEY");
   assert.equal(xai.env.GROK_SESSION_ID, undefined, "the parent's session id must not leak into the child");
 
   // Anthropic speaks the Messages API and authenticates with x-api-key, not a
@@ -336,12 +342,25 @@ await check("a per-agent LLM override becomes a native endpoint entry, per provi
   assert.equal(anthropic.modelConfig.authScheme, "x_api_key");
   assert.equal(anthropic.modelConfig.headers["anthropic-version"], "2023-06-01");
 
-  // OpenAI-compatible providers: one shape, different endpoints.
-  for (const [provider, host] of [["openai", "api.openai.com"], ["gemini", "generativelanguage.googleapis.com"], ["openrouter", "openrouter.ai"]]) {
+  // OpenAI-compatible providers: one shape, different endpoints. OpenAI itself
+  // defaults to the Responses API — its reasoning models reject
+  // chat/completions when function tools ride with a non-none reasoning_effort —
+  // and pins tool-call streaming OFF to avoid the Responses stall that surfaced
+  // as "randomly stuck on a step". The others speak Chat Completions.
+  for (const [provider, host, backend] of [
+    ["openai", "api.openai.com", "responses"],
+    ["gemini", "generativelanguage.googleapis.com", "chat_completions"],
+    ["openrouter", "openrouter.ai", "chat_completions"],
+  ]) {
     const built = buildChildEnv({ env, llm: { provider, models: ["some-model"], api_key: "k" } });
     assert.ok(built.modelConfig.baseUrl.includes(host), `${provider} → ${host}`);
-    assert.equal(built.modelConfig.apiBackend, "chat_completions");
+    assert.equal(built.modelConfig.apiBackend, backend, `${provider} → ${backend}`);
   }
+  assert.equal(
+    buildChildEnv({ env, llm: { provider: "openai", models: ["gpt-5"], api_key: "k" } }).modelConfig.streamToolCalls,
+    false,
+    "OpenAI pins tool-call streaming off to avoid the Responses stall",
+  );
 
   // An agent may point a provider at its own gateway.
   const custom = buildChildEnv({ env, llm: { provider: "openai", models: ["m"], api_key: "k", base_url: "https://gw.example/v1" } });
@@ -717,6 +736,39 @@ await check("a space's creatures are wired into the run as an MCP server", async
   assert.match(invocation.config, /\[mcp_servers\.caspar\]/);
   assert.match(invocation.config, /mcpStdioServer\.mjs/);
   assert.match(invocation.config, /CASPAR_TOOL_SOCKET = "/);
+});
+
+await check("a native/default-backbone run still gets a bounded idle timeout + retries", async () => {
+  // The prior stall fix only wrote resilience knobs into the per-agent
+  // `[model.<id>]` block, so an agent on the creature's own backbone (no
+  // config.llm → no `[model.<id>]` entry) inherited grok's 600s idle window with
+  // no retry tuning — the path where "the agent randomly gets stuck on a step"
+  // still bit. The run-wide `[models]` defaults must cover it.
+  const { invocation } = await serveWithFakeCli({ scenario: successScenario() });
+  assert.match(invocation.config, /\[models\]/, "a native run still writes a [models] block");
+  assert.match(invocation.config, /inference_idle_timeout_secs = 180/, "a wedged inference on the default backbone aborts, not hangs");
+  assert.match(invocation.config, /max_retries = 4/, "and retries instead of failing the whole run");
+  assert.equal(/\[model\./.test(invocation.config), false, "no per-model endpoint is written for the native backbone");
+
+  // Operator override: 0 disables the knob, dropping back to grok's own default.
+  const off = await serveWithFakeCli({ scenario: successScenario(), envOverrides: { GROK_CREATURE_INFERENCE_IDLE_TIMEOUT: "0" } });
+  assert.equal(/inference_idle_timeout_secs/.test(off.invocation.config), false, "INFERENCE_IDLE_TIMEOUT=0 drops the global idle timeout");
+  assert.match(off.invocation.config, /max_retries = 4/, "the retry default is independent of the idle-timeout knob");
+});
+
+await check("run-wide [models] defaults do not override a per-agent endpoint's own knobs", () => {
+  // A per-agent provider writes its own `[model.<id>]` block; grok applies the
+  // global `[models]` scalars as get_or_insert, so the endpoint's own idle
+  // timeout still wins. Both blocks are present and the per-model one is intact.
+  const config = renderConfigToml({
+    defaultModel: "gpt-5",
+    modelDefaults: { inferenceIdleTimeoutSec: 180, maxRetries: 4 },
+    model: { name: "gpt-5", model: "gpt-5", baseUrl: "https://api.openai.com/v1", apiKey: "k", apiBackend: "responses", streamToolCalls: false, inferenceIdleTimeoutSec: 120, maxRetries: 6 },
+  });
+  assert.match(config, /\[models\]/);
+  assert.match(config, /\[model\.gpt-5\]/);
+  assert.match(config, /inference_idle_timeout_secs = 120/, "the per-model idle timeout is written verbatim");
+  assert.match(config, /stream_tool_calls = false/, "the openai Responses stream opt-out survives");
 });
 
 await check("tools added to a space appear on the next prompt (dynamic catalog)", async () => {
