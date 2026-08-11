@@ -47,6 +47,7 @@ import { TrajectoryMapper } from "./events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask } from "./spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -316,6 +317,33 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   //    work inside its private container.
   const sandboxActive = Boolean(sandboxBridge);
   const disallowedTools = disallowedBuiltinTools({ sandboxActive });
+
+  // Fetch the space's group-chat transcript ourselves, creature→creature, by
+  // signalling the decillion `spaces/history` creature. The client sends only
+  // that creature's address (`task.historyEndpoint`), never the transcript, so
+  // the agent always reasons over the authoritative on-chain thread — and sees
+  // the whole group chat (every human message + every agent's final answer), not
+  // just what was aimed at it. Best-effort and bounded: a miss leaves the run
+  // with whatever history the task already carried (usually none). Skipped when
+  // the client already inlined `history` (back-compat) or there is no space.
+  if (bridge && !Array.isArray(task.history)) {
+    const endpoint = historyEndpointFromTask(task);
+    const spaceId = task.spaceId || task.storeId || task.space_id;
+    if (endpoint && spaceId) {
+      try {
+        const records = await fetchSpaceHistoryRecords(bridge, {
+          endpoint,
+          spaceId,
+          selfId: bridge.machineId || bridge.programId || "",
+        });
+        task.history = buildHistoryTurns(records, task.self, { excludeText: objective });
+        log("GROK_HISTORY", { spaceId, fetched: records.length, turns: task.history.length });
+      } catch (err) {
+        log("GROK_HISTORY", { error: String(err?.message || err) });
+      }
+    }
+  }
+
   const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds) || creatureNumber("MAX_WALL_SECONDS", 900);

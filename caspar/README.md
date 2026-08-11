@@ -44,11 +44,19 @@ progress, employing sibling creatures — rides that connection.
 
 | Direction | Key | Packet |
 |---|---|---|
-| in | `creatures/signal` | `{prompt\|objective, skill, history, self, roster, groupChat, sessionId, spaceId, streamTo, correlationId, replyTo, attachments, config:{tools, llm, max_wall_seconds}}` |
+| in | `creatures/signal` | `{prompt\|objective, skill, self, roster, groupChat, sessionId, spaceId, historyEndpoint, streamTo, correlationId, replyTo, attachments, config:{tools, llm, max_wall_seconds}}` |
 | out (per step) | `creatures/signal` | `{kind:"davinci/step", correlationId, seq, channel, event, stream:true, final:false}` |
 | out (terminal) | `creatures/signal` | `{kind:"davinci/result", correlationId, result, stream:false, final:true}` |
 | out (tool call) | `creatures/signal` | `{kind:"invoke", entityId, correlationId, reply_to, tool_id, function, payload}` |
 | in (tool reply) | `creatures/signal` | `{kind:"tools/result", correlationId, result}` |
+| out (history fetch) | `creatures/signal` | `{action:"single", user:{id:self}, store:{id:spaceId}, data, entityId, correlationId}` → `spaces/history` |
+| in (history reply) | `creatures/signal` | `{namespace:"spaces", action:"history", correlationId, history:[…]}` |
+
+The group-chat **history is not sent in the prompt** — the client passes only
+`historyEndpoint` (the `spaces/history` creature's address), and this creature
+signals that endpoint for the thread itself before building the prompt
+(`spaceHistory.mjs`). The reply comes back on `creatures/signal` (not
+`creatures/signal/result`, which the node never delivers to a docker creature).
 
 `channel` is one of `status · plan · thought · action · observation · final · trace`
 — what the Expo client renders as the live trajectory. The `result` carries
@@ -70,6 +78,7 @@ which the node relays while keeping the correlation open.
 | `bridge.mjs` | The docker-host bridge gateway client: chunked framing, HELLO/WELCOME, host calls (`signalUser`, `dbOp`, `httpRequest`), pushed signals. |
 | `taskSignal.mjs` | Peels the StoresSend / `payload` / proxy envelopes into a task; derives the conversation thread key. |
 | `prompt.mjs` | Composes what Grok is given: the agent's skill as persona, the group-chat preamble and roster, the thread's history with `[From → To]` annotations. |
+| `spaceHistory.mjs` | Fetches the space's group-chat transcript creature→creature (signals `spaces/history`) and turns the persisted records into the annotated history turns `prompt.mjs` renders. |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
 | `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time — the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`) — and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
 | `toolInvoker.mjs` | Employs a tool creature over the gateway and awaits its correlated `tools/result`. |

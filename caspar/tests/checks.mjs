@@ -40,6 +40,7 @@ import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
 import { normalizeUsage } from "../result.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryRecords } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
 import { ToolInvoker } from "../toolInvoker.mjs";
 import { ToolSocketServer } from "../toolSocket.mjs";
@@ -922,6 +923,71 @@ for (const cleanup of cleanups) {
     /* best effort */
   }
 }
+
+await check("space history records become annotated group-chat turns for the running agent", () => {
+  const self = { id: "res-a", name: "Ada", handle: "ada" };
+  const meMention = [{ id: "res-a", kind: "agent", name: "Ada", handle: "ada" }];
+  const records = [
+    { id: "00000000000000000001", from: "user", fromName: "Grace", text: "hi @ada", mentions: meMention, at: "2026-01-01T00:00:00Z" },
+    { id: "00000000000000000002", from: "agent", agentName: "Ada", text: "hello Grace", mentions: [], at: "2026-01-01T00:00:01Z" },
+    { id: "00000000000000000003", from: "agent", agentName: "Babbage", text: "@ada take a look", mentions: meMention, at: "2026-01-01T00:00:02Z" },
+    { id: "00000000000000000004", from: "user", fromName: "Grace", text: "current message", mentions: [], at: "2026-01-01T00:00:03Z" },
+  ];
+  const turns = buildHistoryTurns(records, self, { excludeText: "current message" });
+  assert.equal(turns.length, 3, "the current message is excluded; the rest are kept oldest-first");
+  // A human turn addressed to me.
+  assert.deepEqual(turns[0], { role: "user", content: "hi @ada", from: "Grace", to: [{ name: "Ada", handle: "ada" }], directedToMe: true });
+  // My own past answer renders as the assistant ("you"), aimed at nobody.
+  assert.equal(turns[1].role, "assistant", "the running agent's own turns are the assistant");
+  assert.equal(turns[1].from, "Ada");
+  assert.equal(turns[1].directedToMe, false);
+  // Another agent's turn is a "user" turn from my perspective, and it @mentions me.
+  assert.equal(turns[2].role, "user", "another agent's turn is not 'you'");
+  assert.equal(turns[2].from, "Babbage");
+  assert.equal(turns[2].directedToMe, true);
+});
+
+await check("the backbone fetches space history by signalling the spaces/history creature", async () => {
+  const endpoint = { creatureId: "9@global", programId: "90@global", entityId: "main" };
+  const gateway = await new FakeGateway({
+    onCall: (op, input, gw) => {
+      if (op !== "signalUser" || input.key !== "creatures/signal") return { ok: true };
+      if (input.userId !== endpoint.programId) return { ok: true };
+      const packet = JSON.parse(input.packet);
+      // The endpoint peels data → payload(json) → { action, correlationId, payload:{storeId} },
+      // exactly as the app's shell signal does — assert we reproduced that envelope.
+      const layer1 = JSON.parse(packet.data);
+      const inner = JSON.parse(layer1.payload);
+      assert.equal(inner.action, "history");
+      assert.equal(inner.payload.storeId, "space-9");
+      // Reply the way the patched history creature does: on `creatures/signal`
+      // (a docker creature never receives `creatures/signal/result`).
+      setTimeout(() => {
+        gw.pushSignal("creatures/signal", {
+          ok: true,
+          namespace: "spaces",
+          action: "history",
+          correlationId: packet.correlationId,
+          history: [{ id: "00000000000000000001", from: "user", fromName: "Grace", text: "hi team", mentions: [] }],
+        });
+      }, 5);
+      return { ok: true };
+    },
+  }).listen();
+  const bridge = await bridgeFromEnv({ env: { CASPAR_GATEWAY_HOST: "127.0.0.1", CASPAR_GATEWAY_PORT: String(gateway.port) }, timeoutMs: 5000 });
+  try {
+    const records = await fetchSpaceHistoryRecords(bridge, { endpoint, spaceId: "space-9", selfId: bridge.machineId, timeoutMs: 2000 });
+    assert.equal(records.length, 1, "the signalled history reply is received and returned");
+    assert.equal(records[0].text, "hi team");
+    const sent = gateway.signals().find((s) => s.userId === endpoint.programId);
+    assert.ok(sent, "a signal was sent to the history program");
+    assert.equal(sent.packet.store.id, "space-9", "the originating store is stamped on the envelope");
+    assert.equal(sent.packet.user.id, bridge.machineId, "the reply is addressed back to this creature's machine id");
+  } finally {
+    bridge.close();
+    await gateway.close();
+  }
+});
 
 console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
 process.exit(failures.length ? 1 : 0);
