@@ -39,6 +39,7 @@ import path from "node:path";
 
 import { bridgeFromEnv } from "./bridge.mjs";
 import { materializeAttachments, mediaContentBlocks } from "./attachments.mjs";
+import { extractAttachmentTexts } from "./extract.mjs";
 import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
 import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
@@ -141,6 +142,13 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // file too). Non-media stays file-only.
   const mediaBlocks = mediaContentBlocks(attachments, { log: (info) => log("GROK_MEDIA", info) });
   if (mediaBlocks.length) log("GROK_MEDIA", { inlined: mediaBlocks.length });
+  // Non-image attachments (PDFs, documents, audio) can't reach the model as
+  // media, so extract/transcribe them to text and inline it.
+  const extractedTexts = await extractAttachmentTexts(attachments, {
+    llm: config.llm,
+    log: (info) => log("GROK_EXTRACT", info),
+  });
+  if (extractedTexts.length) log("GROK_EXTRACT", { extracted: extractedTexts.map((d) => ({ name: d.name, kind: d.kind, chars: d.text.length })) });
 
   const mapper = new TrajectoryMapper({ traceAll: creatureFlag("TRACE_ALL", false) });
   // Steps ride the channel the backend named; the terminal result always goes
@@ -351,7 +359,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   }
 
   const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
-  const prompt = buildUserPrompt(task, { objective, attachments, workspace });
+  const prompt = buildUserPrompt(task, { objective, attachments, extractedTexts, workspace });
   // With inline media, the turn becomes ACP content blocks: the composed text
   // first, then each image/audio block. Without any, `promptBlocks` stays null and
   // the run uses the plain-text prompt exactly as before.

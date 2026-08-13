@@ -338,7 +338,7 @@ export function renderHistory(task) {
  * The user turn handed to Grok: the thread's history, the files that came
  * with the prompt, and the current message to answer.
  */
-export function buildUserPrompt(task, { objective, attachments = [], workspace }) {
+export function buildUserPrompt(task, { objective, attachments = [], extractedTexts = [], workspace }) {
   const parts = [];
   const history = renderHistory(task);
   if (history) parts.push(history);
@@ -350,6 +350,17 @@ export function buildUserPrompt(task, { objective, attachments = [], workspace }
           .join("\n") +
         "\n=== END FILES ===\n",
     );
+  }
+  // The model's message content is text + image only: an audio clip or a PDF/
+  // document is not an image and the model cannot open the materialised file, so
+  // its content is extracted (or transcribed) here and inlined as text — that is
+  // what makes the agent able to answer about a PDF or an audio recording.
+  if (Array.isArray(extractedTexts) && extractedTexts.length) {
+    for (const doc of extractedTexts) {
+      if (!doc || !doc.text) continue;
+      const label = doc.kind === "transcript" ? "TRANSCRIPT OF" : "CONTENT OF";
+      parts.push(`=== ${label} ${doc.name} ===\n${doc.text}\n=== END ${doc.name} ===\n`);
+    }
   }
   if (workspace) {
     parts.push(`Your working directory for this conversation is ${workspace} (it persists between turns).`);

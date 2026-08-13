@@ -764,10 +764,9 @@ await check("an image/audio attachment reaches the model inline as ACP content b
   assert.equal(image.mimeType, "image/png");
   assert.equal(image.data, png, "the image bytes are carried verbatim to the model");
 
-  const audio = blocks.find((b) => b.type === "audio");
-  assert.ok(audio, "the audio clip is inlined as an audio content block");
-  assert.equal(audio.mimeType, "audio/wav");
-  assert.equal(audio.data, wav);
+  // Audio is NOT inlined as a block (the model drops audio blocks); it is handled
+  // by transcription instead. With no STT configured here, it stays file-only.
+  assert.equal(blocks.some((b) => b.type === "audio"), false, "audio is not inlined as a content block");
 
   // Non-media stays file-only — never inlined as a block.
   assert.equal(blocks.some((b) => b.type !== "text" && b.mimeType === "application/pdf"), false, "a PDF is not inlined as a content block");
@@ -779,6 +778,80 @@ await check("an image/audio attachment reaches the model inline as ACP content b
     : [];
   assert.ok(attachDir.some((p) => p.endsWith("shot.png")), "the image is also materialised into the workspace");
   assert.ok(attachDir.some((p) => p.endsWith("notes.pdf")), "the non-media file is materialised for the agent to open");
+});
+
+await check("a PDF and a text document are extracted to text the model can read", async () => {
+  // The model's content is text + image only, so a PDF/doc must be inlined as
+  // text — otherwise the agent "can't understand" it. Build a tiny real PDF.
+  const zlib = await import("node:zlib");
+  const content = Buffer.from("BT (Invoice total is 42 dollars) Tj ET", "latin1");
+  const deflated = zlib.deflateSync(content);
+  const pdf = Buffer.concat([
+    Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Length ${deflated.length} /Filter /FlateDecode >>\nstream\n`, "latin1"),
+    deflated,
+    Buffer.from("\nendstream\nendobj\n", "latin1"),
+  ]);
+
+  const { result, invocation } = await serveWithFakeCli({
+    scenario: successScenario("The invoice total is 42 dollars."),
+    delivery: proxyDelivery({
+      prompt: "what is the total?",
+      extra: {
+        attachments: [
+          { name: "invoice.pdf", mime_type: "application/pdf", data: pdf.toString("base64") },
+          { name: "readme.md", mime_type: "text/markdown", data: Buffer.from("# Title\nBudget: 100 USD.").toString("base64") },
+        ],
+      },
+    }),
+  });
+
+  assert.equal(result.success, true);
+  // No image/audio here, so the turn stays plain text.
+  const promptPath = invocation.argv[invocation.argv.indexOf("--prompt-file") + 1] || "";
+  assert.ok(promptPath.endsWith("prompt.txt"), "a document-only turn is still a plain-text prompt");
+  assert.match(invocation.prompt, /CONTENT OF invoice\.pdf/, "the PDF's text is inlined");
+  assert.match(invocation.prompt, /Invoice total is 42 dollars/, "the extracted PDF text reaches the model");
+  assert.match(invocation.prompt, /CONTENT OF readme\.md/, "the markdown doc is inlined");
+  assert.match(invocation.prompt, /Budget: 100 USD/, "the document's content reaches the model");
+});
+
+await check("audio is transcribed to text via a Whisper-compatible endpoint", async () => {
+  const http = await import("node:http");
+  let sawUpload = false;
+  const stt = http.createServer((req, res) => {
+    sawUpload = req.url.includes("/audio/transcriptions");
+    let body = [];
+    req.on("data", (c) => body.push(c));
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ text: "Hello from the recording." }));
+    });
+  });
+  await new Promise((r) => stt.listen(0, "127.0.0.1", r));
+  const { port } = stt.address();
+  try {
+    const { result, invocation } = await serveWithFakeCli({
+      scenario: successScenario("You said hello."),
+      envOverrides: {
+        GROK_CREATURE_STT_API_KEY: "sk-test",
+        GROK_CREATURE_STT_BASE_URL: `http://127.0.0.1:${port}`,
+      },
+      delivery: proxyDelivery({
+        prompt: "what did I say?",
+        extra: {
+          attachments: [
+            { name: "voice.wav", mime_type: "audio/wav", data: "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=" },
+          ],
+        },
+      }),
+    });
+    assert.equal(result.success, true);
+    assert.ok(sawUpload, "the audio was POSTed to the transcription endpoint");
+    assert.match(invocation.prompt, /TRANSCRIPT OF voice\.wav/, "the transcript is inlined as text");
+    assert.match(invocation.prompt, /Hello from the recording/, "the transcript reaches the model");
+  } finally {
+    stt.close();
+  }
 });
 
 await check("a URL-referenced image is fetched and inlined (the Expo client's frame-safe path)", async () => {

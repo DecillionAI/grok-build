@@ -59,16 +59,31 @@ signals that endpoint for the thread itself before building the prompt
 `creatures/signal/result`, which the node never delivers to a docker creature).
 
 **Multimodal attachments.** `attachments` on the task carries files the person
-sent with the message (`[{name, mime_type, data|path, description}]`, `data`
-base64). Every attachment is materialised into the session workspace so the agent
-can open, run or edit it. In addition, **image/audio** attachments are handed to
-the model *inline*: `runtime.mjs` reads them back as ACP content blocks
-(`{type:"image"|"audio", data, mimeType}`, `mediaContentBlocks`) and the turn is
-written to `grok`'s `--prompt-file` as a `.json` array (`[{type:"text",text},
-…media]`) instead of `prompt.txt` — so the model actually sees the picture / hears
-the clip, not just a path. Non-media (video, archives, documents, binaries) stays
-file-only. Oversized media (`MAX_INLINE_MEDIA_BYTES`, default 16 MiB) is left
-file-only too.
+sent with the message (`[{name, mime_type, data|path|url, description}]`, `data`
+base64; the Decillion client sends a small `url` reference and the backbone
+fetches the bytes, keeping the prompt signal under the node's frame limit). Every
+attachment is materialised into the session workspace so the agent can open, run
+or edit it.
+
+The model's message content is **text + image only**, so how an attachment
+reaches the model depends on its type:
+
+* **Images** are handed to the model *inline* as ACP image content blocks
+  (`{type:"image", data, mimeType}`, `mediaContentBlocks`); the turn is written to
+  `grok`'s `--prompt-file` as a `.json` array (`[{type:"text",text}, …images]`)
+  instead of `prompt.txt`, so the model actually sees the picture — not just a
+  path. Oversized images (`MAX_INLINE_MEDIA_BYTES`, default 16 MiB) stay file-only.
+* **PDFs and text documents** (`text/*`, json/xml/csv/yaml, source code, …) are
+  **extracted to text** and inlined (`extract.mjs` — a pure-Node PDF text
+  extractor + UTF-8 read; `=== CONTENT OF <name> ===` block). This is what lets
+  the agent answer about a PDF it cannot open with its own (in-space disabled)
+  file tools.
+* **Audio** is **transcribed to text** via a Whisper-compatible endpoint when one
+  is configured (`GROK_CREATURE_STT_API_KEY` [+ `_STT_BASE_URL`/`_STT_MODEL`], or
+  the agent's own OpenAI-compatible provider key), inlined as a
+  `=== TRANSCRIPT OF <name> ===` block. Without an STT endpoint the clip stays
+  file-only (the model has no audio input).
+* Everything else (video, archives, binaries) stays file-only.
 
 `channel` is one of `status · plan · thought · action · observation · final · trace`
 — what the Expo client renders as the live trajectory. The `result` carries
@@ -101,7 +116,8 @@ which the node relays while keeping the correlation open.
 | `env.mjs` | The `GROK_CREATURE_*` knobs (legacy `CLAUDE_CREATURE_*` names still read). |
 | `events.mjs` | Maps `streaming-messages-json` lines onto the platform's step channels; masks credentials. |
 | `result.mjs` | Builds the terminal reply (answer, billable usage, plan, budget). |
-| `attachments.mjs` | Materialises prompt attachments into the session workspace, and turns image/audio ones into inline ACP content blocks for the model. |
+| `attachments.mjs` | Materialises prompt attachments into the session workspace, and turns image ones into inline ACP image blocks for the model. |
+| `extract.mjs` | Extracts non-image attachments to text: PDF/document text, and audio transcription (Whisper-compatible), so the model can read them. |
 | `build/imageBuild.sh` | Builds/verifies the binary inside the image. |
 | `Dockerfile.fetch` | The creature image the deploy uses: the build downloads the published bundle. |
 | `Dockerfile` / `Dockerfile.prebuilt` | The other two image shapes: in-image compile (or published-CLI download), and a bundle already in the build context (what the GHCR image is built from). |
