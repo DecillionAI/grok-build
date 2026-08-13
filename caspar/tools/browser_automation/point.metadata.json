@@ -1,0 +1,136 @@
+{
+  "isMcp": true,
+  "kind": "tool",
+  "tool_id": "browser_automation",
+  "name": "browser_automation",
+  "vm_name": "browser-automation-vm",
+  "machine_id": "browser-automation-machine",
+  "image_name": "browser-automation-tool:latest",
+  "container_name": "tool-browser-automation",
+  "category": "automation",
+  "description": "Drive a real headless Chromium browser: open pages, read the rendered text and HTML, click, type into and submit forms, run JavaScript, follow links, scroll, take screenshots, and export the page as a PDF. Use it for JavaScript-rendered sites, multi-step flows and forms — anything a plain HTTP fetch cannot do. State is kept in a browsing session so a sequence of steps shares cookies and the current page.",
+  "usecases": [
+    "you need to read a page that only renders its content with JavaScript (a plain fetch returns an empty shell)",
+    "you need to interact with a site: click buttons, fill and submit a form, log in, step through a flow",
+    "you need a screenshot of a page (or an element), or the page exported as a PDF",
+    "you need to run JavaScript in the page and read the result, or extract data after the page settles",
+    "you need to follow a multi-step navigation while keeping cookies/session between steps"
+  ],
+  "howToTalk": "Signal it with `function` naming the operation. Start with `navigate` (`url`). Then read with `text` (rendered text, optional `selector`), `content` (HTML), `links`, or `screenshot` (returns base64 `image`; `format`=jpeg|png, `full_page`, `selector`). Interact with `click` (`selector`), `fill`/`type` (`selector`+`text`, optional `enter`), `press` (`key`), `scroll` (`to`=top|bottom or `dy`), `evaluate` (`script` = a JS expression). Navigation: `back`, `forward`, `reload`, `wait_for` (`selector` or `wait_until`), `set_viewport`. `current` reports the URL+title; `sessions` lists open sessions; `close` ends one. All steps in one space share a session (its own cookies and current page); pass `session` for a second parallel tab.",
+  "prompt": "Use this to drive a real browser when a plain web fetch is not enough — JS-rendered pages, logins, forms, multi-step flows, screenshots. `navigate` to a URL, then `text`/`content`/`links`/`screenshot` to read it and `click`/`fill`/`press`/`evaluate` to interact. Steps share a browsing session (cookies + current page) so you can log in once and keep going. Selectors are CSS (or Playwright text= selectors). Screenshots come back as base64.",
+  "request_point": "tool::browser_automation::request",
+  "response_point": "tool::browser_automation::response",
+  "risk_level": "medium",
+  "risk": "medium",
+  "requires_network": true,
+  "requiresNetwork": true,
+  "bindSpace": false,
+  "autoAttach": false,
+  "function": "navigate",
+  "requiredArgs": ["function"],
+  "categories": ["automation", "web"],
+  "routes": { "automation": "navigate", "web": "navigate" },
+  "argSchema": {
+    "function": { "type": "string", "description": "operation: navigate (default) | text | content | links | screenshot | click | fill | type | press | evaluate | scroll | wait_for | back | forward | reload | set_viewport | current | pdf | sessions | close" },
+    "url": { "type": "string", "description": "for navigate: the page URL to open" },
+    "selector": { "type": "string", "description": "a CSS/text selector, for text/click/fill/press/screenshot/wait_for" },
+    "text": { "type": "string", "description": "for fill/type: the text to enter into the selected field" },
+    "key": { "type": "string", "description": "for press: a key or chord, e.g. \"Enter\", \"Control+A\"" },
+    "script": { "type": "string", "description": "for evaluate: a JavaScript expression to run in the page" },
+    "format": { "type": "string", "description": "for screenshot: jpeg (default) | png" },
+    "full_page": { "type": "bool", "description": "for screenshot: capture the whole scrollable page" },
+    "enter": { "type": "bool", "description": "for fill: press Enter after typing (submit)" },
+    "to": { "type": "string", "description": "for scroll: top | bottom (or use dy for a pixel delta)" },
+    "session": { "type": "string", "description": "name a parallel browsing session (tab); default is one shared session" }
+  },
+  "tools": [
+    {
+      "name": "navigate",
+      "desc": "open a URL in the session's page and wait for it to load; the usual first step",
+      "args": {
+        "url": { "type": "STRING", "desc": "the page URL to open" },
+        "wait_until": { "type": "STRING", "desc": "load (default) | domcontentloaded | networkidle" }
+      }
+    },
+    {
+      "name": "text",
+      "desc": "return the rendered (visible) text of the page or a selected element",
+      "args": { "selector": { "type": "STRING", "desc": "optional CSS selector (default: whole body)" } }
+    },
+    {
+      "name": "content",
+      "desc": "return the page's current HTML (after JavaScript has run)",
+      "args": {}
+    },
+    {
+      "name": "links",
+      "desc": "list the page's outbound links as {text, url}",
+      "args": { "limit": { "type": "NUMBER", "desc": "how many (default 100, max 500)" } }
+    },
+    {
+      "name": "screenshot",
+      "desc": "capture the page (or an element) and return a base64 image",
+      "args": {
+        "format": { "type": "STRING", "desc": "jpeg (default) | png" },
+        "full_page": { "type": "BOOL", "desc": "capture the whole scrollable page" },
+        "selector": { "type": "STRING", "desc": "optional element to capture instead of the viewport" }
+      }
+    },
+    {
+      "name": "click",
+      "desc": "click the element matching a selector",
+      "args": { "selector": { "type": "STRING", "desc": "CSS or text= selector to click" } }
+    },
+    {
+      "name": "fill",
+      "desc": "type text into an input/textarea (optionally pressing Enter to submit)",
+      "args": {
+        "selector": { "type": "STRING", "desc": "the field selector" },
+        "text": { "type": "STRING", "desc": "the text to enter" },
+        "enter": { "type": "BOOL", "desc": "press Enter after typing" }
+      }
+    },
+    {
+      "name": "press",
+      "desc": "press a keyboard key or chord (on a selector, or the focused element)",
+      "args": {
+        "key": { "type": "STRING", "desc": "e.g. Enter, Escape, Control+A" },
+        "selector": { "type": "STRING", "desc": "optional target selector" }
+      }
+    },
+    {
+      "name": "evaluate",
+      "desc": "run a JavaScript expression in the page and return its result",
+      "args": { "script": { "type": "STRING", "desc": "a JS expression, e.g. document.title" } }
+    },
+    {
+      "name": "scroll",
+      "desc": "scroll the page (to top/bottom, or by a pixel delta)",
+      "args": { "to": { "type": "STRING", "desc": "top | bottom" }, "dy": { "type": "NUMBER", "desc": "pixels to scroll by" } }
+    },
+    {
+      "name": "wait_for",
+      "desc": "wait for a selector to appear (or a load state / a fixed delay)",
+      "args": {
+        "selector": { "type": "STRING", "desc": "selector to wait for" },
+        "state": { "type": "STRING", "desc": "visible (default) | attached | hidden | detached" }
+      }
+    },
+    { "name": "back", "desc": "go back in history", "args": {} },
+    { "name": "forward", "desc": "go forward in history", "args": {} },
+    { "name": "reload", "desc": "reload the current page", "args": {} },
+    {
+      "name": "set_viewport",
+      "desc": "resize the browser viewport",
+      "args": { "width": { "type": "NUMBER", "desc": "px" }, "height": { "type": "NUMBER", "desc": "px" } }
+    },
+    { "name": "current", "desc": "report the session's current URL and title", "args": {} },
+    { "name": "pdf", "desc": "render the current page to a PDF and return it as base64", "args": {} },
+    { "name": "sessions", "desc": "list the open browsing sessions", "args": {} },
+    {
+      "name": "close",
+      "desc": "close a browsing session (frees the browser context)",
+      "args": { "session": { "type": "STRING", "desc": "the session name (default: the shared one)" } }
+    }
+  ]
+}

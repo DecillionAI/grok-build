@@ -1,0 +1,81 @@
+{
+  "isMcp": true,
+  "kind": "tool",
+  "tool_id": "web_search",
+  "name": "web_search",
+  "vm_name": "web-search-vm",
+  "machine_id": "web-search-machine",
+  "image_name": "web-search-tool:latest",
+  "container_name": "tool-web-search",
+  "category": "research",
+  "description": "Search the live internet and read web pages. Run a web or news search and get back a ranked list of results (title, URL, snippet), a short synthesised answer with its sources, or the readable article text of any URL. Backed by a configurable search provider (Tavily/Brave/SerpAPI/Bing/Google), with a keyless DuckDuckGo fallback.",
+  "usecases": [
+    "you need current information from the internet — recent events, prices, docs, releases, anything past your training data",
+    "you need to check a fact or find sources before answering",
+    "you need the latest news on a topic",
+    "you have a URL and need to read what is actually on the page (article text, docs, an API reference)",
+    "you need a quick synthesised answer to a question plus the sources it came from"
+  ],
+  "howToTalk": "Signal it with `function` naming the operation. `search` (default) takes `query` and returns `results` = [{title, url, snippet, published?}]; pass `count` (1-25) to size the list. `news` is the same but recent-news-scoped. `answer` takes `query` and returns a short `answer` plus its `sources`. `fetch` (alias `read`) takes `url` and returns the page `title`, readable `text` and outbound `links`. `providers` reports which search provider is active. No space id, token, or credentials — the provider key is baked into the creature.",
+  "prompt": "Use this to look things up on the live web and to read pages. `search`/`news` return ranked results; `answer` returns a short synthesised answer with sources; `fetch` (a.k.a. `read`) downloads a URL and returns its readable article text plus links. Prefer `fetch` to actually read a result you found with `search`. Everything is global — there is no space binding and nothing to configure per call.",
+  "request_point": "tool::web_search::request",
+  "response_point": "tool::web_search::response",
+  "risk_level": "low",
+  "risk": "low",
+  "requires_network": true,
+  "requiresNetwork": true,
+  "bindSpace": false,
+  "autoAttach": false,
+  "function": "search",
+  "requiredArgs": ["function"],
+  "categories": ["research", "web"],
+  "routes": { "research": "search", "web": "search" },
+  "argSchema": {
+    "function": { "type": "string", "description": "operation: search (default) | news | answer | fetch | read | providers" },
+    "query": { "type": "string", "description": "for search/news/answer: what to search for" },
+    "url": { "type": "string", "description": "for fetch/read: the page URL to download and read" },
+    "count": { "type": "number", "description": "for search/news: how many results to return (1-25, default 10)" },
+    "topic": { "type": "string", "description": "for search: set to \"news\" to bias toward recent news" },
+    "freshness": { "type": "string", "description": "for news (brave/bing): recency window, e.g. pd (day), pw (week), pm (month)" },
+    "days": { "type": "number", "description": "for news (tavily): only results from the last N days" }
+  },
+  "tools": [
+    {
+      "name": "search",
+      "desc": "run a web search and return a ranked list of {title, url, snippet}; the default and most-used operation",
+      "args": {
+        "query": { "type": "STRING", "desc": "what to search for" },
+        "count": { "type": "NUMBER", "desc": "how many results (1-25, default 10)" }
+      }
+    },
+    {
+      "name": "news",
+      "desc": "search recent news for a topic and return dated results",
+      "args": {
+        "query": { "type": "STRING", "desc": "the news topic to search for" },
+        "count": { "type": "NUMBER", "desc": "how many results (1-25, default 10)" },
+        "freshness": { "type": "STRING", "desc": "recency window: pd | pw | pm (brave/bing)" }
+      }
+    },
+    {
+      "name": "answer",
+      "desc": "return a short synthesised answer to a question plus the sources it is drawn from",
+      "args": { "query": { "type": "STRING", "desc": "the question to answer" } }
+    },
+    {
+      "name": "fetch",
+      "desc": "download a URL and return its readable text (HTML stripped to article text), title and outbound links",
+      "args": { "url": { "type": "STRING", "desc": "the page URL to read" } }
+    },
+    {
+      "name": "read",
+      "desc": "alias of fetch — read the readable content of a URL",
+      "args": { "url": { "type": "STRING", "desc": "the page URL to read" } }
+    },
+    {
+      "name": "providers",
+      "desc": "report which search provider is active and which are configured",
+      "args": {}
+    }
+  ]
+}
