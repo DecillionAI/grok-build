@@ -121,7 +121,7 @@ which the node relays while keeping the correlation open.
 | `build/imageBuild.sh` | Builds/verifies the binary inside the image. |
 | `Dockerfile.fetch` | The creature image the deploy uses: the build downloads the published bundle. |
 | `Dockerfile` / `Dockerfile.prebuilt` | The other two image shapes: in-image compile (or published-CLI download), and a bundle already in the build context (what the GHCR image is built from). |
-| `tools/` | The platform's docker tool creatures: the per-space `vercel_sandbox` and the `github` tool, plus their shared runtime. |
+| `tools/` | The platform's docker tool creatures: the per-space `vercel_sandbox`, the `github` tool, the `web_search` tool (internet search + page reading), the `browser_automation` tool (a real headless Chromium via Playwright), plus their shared runtime. Each tool is one program with a docker back-end + a downloadable Victor front-end, driven over the Caspar signalling API by both agents and the tool's mini-app; see each tool's `README.md`. |
 | `tests/` | Checks — see *Testing*. |
 
 Session state: each conversation thread (`space:<spaceId>:<agentId>`) gets its own
