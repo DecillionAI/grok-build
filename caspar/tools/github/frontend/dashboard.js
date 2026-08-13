@@ -18,9 +18,11 @@
 //     the space id — no secrets, no identity.
 //
 // Conservative JS (var, function expressions, no template literals, no string[i]
-// indexing) to stay comfortably inside js2elpian. No text inputs, no timers: the
-// whole dashboard is button-driven and the connect wait is server-paced (the
-// back-end long-polls `oauth_wait`, so a "pending" reply just re-invokes).
+// indexing) to stay comfortably inside js2elpian. Almost entirely button-driven
+// and timer-free — the connect wait is server-paced (the back-end long-polls
+// `oauth_wait`, so a "pending" reply just re-invokes). The one text input is the
+// commit message on the Changes tab; it uses `defaultValue` so a full re-render
+// (root.clear) restores what was typed from state (S.commitMsg).
 
 import 'reactnative.js';
 
@@ -95,10 +97,14 @@ var S = {
   repos: [],
   reposLoading: false,
   repo: null,           // the open repo row
-  tab: 'branches',      // branches | commits | pulls
+  tab: 'branches',      // branches | commits | pulls | changes
   detail: [],           // rows for the active tab
   detailLoading: false,
   cloned: {},           // full_name -> true (locally cloned in this space)
+  changes: [],          // structured git_status rows for the Changes tab
+  changesLoading: false,
+  changesBranch: null,  // current branch, shown on the Changes tab
+  commitMsg: '',        // the in-progress commit message (Changes tab input)
   toast: null,          // transient status line at the bottom
   settingsOpen: false
 };
@@ -280,6 +286,7 @@ function refreshCloned() {
 }
 
 function loadDetail(tab) {
+  if (tab === 'changes') { loadChanges(); return; }
   S.tab = tab;
   S.detail = [];
   S.detailLoading = true;
@@ -294,6 +301,96 @@ function loadDetail(tab) {
       S.detail = res.branches || res.commits || res.pulls || [];
     }
     render();
+  });
+}
+
+// The Changes tab: the clone's working-tree status (staged vs unstaged), with
+// per-file stage/unstage and a commit box. Reads `git_status`, whose structured
+// `files` carry a `staged`/`unstaged`/`untracked` breakdown.
+function loadChanges() {
+  S.tab = 'changes';
+  S.changesLoading = true;
+  render();
+  hostCall('git_status', { repo: S.repo.full_name }, function (err, res) {
+    S.changesLoading = false;
+    if (err != null || res == null || res.ok === false) {
+      toast((res && res.error) ? res.error : 'could not load changes', true);
+      S.changes = [];
+    } else {
+      S.changes = res.files || [];
+      S.changesBranch = res.branch || null;
+    }
+    render();
+  });
+}
+
+function stagedList() {
+  var out = [];
+  var i = 0;
+  while (i < S.changes.length) { if (S.changes[i].staged) out.push(S.changes[i]); i = i + 1; }
+  return out;
+}
+
+function unstagedList() {
+  var out = [];
+  var i = 0;
+  while (i < S.changes.length) { if (S.changes[i].unstaged) out.push(S.changes[i]); i = i + 1; }
+  return out;
+}
+
+// path === null → act on everything (git add -A / git reset).
+function stagePath(path) {
+  S.busy = true; render();
+  var payload = { repo: S.repo.full_name };
+  if (path != null) payload.files = [path];
+  hostCall('stage', payload, function (err, res) {
+    S.busy = false;
+    if (err != null || res == null || res.ok === false) {
+      toast((res && res.error) ? res.error : 'stage failed', true);
+      render();
+    } else {
+      if (res.files != null) { S.changes = res.files; S.changesBranch = res.branch || S.changesBranch; }
+      toast(path != null ? ('staged ' + path) : 'staged all changes', false);
+      render();
+    }
+  });
+}
+
+function unstagePath(path) {
+  S.busy = true; render();
+  var payload = { repo: S.repo.full_name };
+  if (path != null) payload.files = [path];
+  hostCall('unstage', payload, function (err, res) {
+    S.busy = false;
+    if (err != null || res == null || res.ok === false) {
+      toast((res && res.error) ? res.error : 'unstage failed', true);
+      render();
+    } else {
+      if (res.files != null) { S.changes = res.files; S.changesBranch = res.branch || S.changesBranch; }
+      toast(path != null ? ('unstaged ' + path) : 'unstaged everything', false);
+      render();
+    }
+  });
+}
+
+function commitStaged() {
+  var msg = ('' + (S.commitMsg == null ? '' : S.commitMsg));
+  // trim without String.trim ambiguity in the VM
+  while (msg.length > 0 && (msg.charAt(0) === ' ' || msg.charAt(0) === '\n')) msg = msg.substring(1);
+  while (msg.length > 0 && (msg.charAt(msg.length - 1) === ' ' || msg.charAt(msg.length - 1) === '\n')) msg = msg.substring(0, msg.length - 1);
+  if (msg.length === 0) { toast('enter a commit message first', true); return; }
+  if (stagedList().length === 0) { toast('stage some changes to commit', true); return; }
+  S.busy = true; render();
+  hostCall('commit', { repo: S.repo.full_name, message: msg, staged_only: true }, function (err, res) {
+    S.busy = false;
+    if (err != null || res == null || res.ok === false) {
+      toast((res && (res.stderr || res.error)) ? (firstLine(res.stderr || res.error)) : 'commit failed', true);
+      render();
+    } else {
+      S.commitMsg = '';
+      toast('committed on ' + (S.changesBranch || 'this branch'), false);
+      loadChanges();
+    }
   });
 }
 
@@ -635,14 +732,23 @@ function viewRepo(root) {
   bar.add(btn('Open on GitHub', function () { openUrl('https://github.com/' + r.full_name); }, null));
   root.add(bar);
 
-  // Tabs.
-  var tabs = RN.row({ style: { paddingHorizontal: 10, paddingVertical: 8, backgroundColor: T.bg } });
+  // Tabs. The Changes tab (working-tree stage/commit) only applies once cloned.
+  var tabs = RN.scroll({
+    horizontal: true,
+    style: { maxHeight: 46, paddingHorizontal: 10, paddingVertical: 8, backgroundColor: T.bg }
+  });
   tabs.add(chip('Branches', tabHandler('branches'), S.tab === 'branches'));
   tabs.add(chip('Commits', tabHandler('commits'), S.tab === 'commits'));
   tabs.add(chip('Pull requests', tabHandler('pulls'), S.tab === 'pulls'));
+  if (isCloned) tabs.add(chip('Changes', tabHandler('changes'), S.tab === 'changes'));
   root.add(tabs);
 
   var list = RN.scroll({ style: { flex: 1, paddingHorizontal: 10, paddingTop: 4, backgroundColor: T.bg } });
+  if (S.tab === 'changes') {
+    changesView(list);
+    root.add(list);
+    return;
+  }
   if (S.detailLoading) {
     list.add(RN.spinner({ color: T.accent, style: { marginTop: 22 } }));
   } else if (S.detail.length === 0) {
@@ -661,6 +767,151 @@ function viewRepo(root) {
     list.add(RN.view({ style: { height: 24 } }));
   }
   root.add(list);
+}
+
+// --------------------------------------------------------------------------- //
+// Changes tab (stage / unstage / commit)                                       //
+// --------------------------------------------------------------------------- //
+
+function smallBtn(label, onPress, kind) {
+  var danger = kind === 'danger';
+  var b = RN.pressable({
+    onPress: onPress,
+    style: {
+      paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
+      backgroundColor: T.surfaceAlt, borderWidth: 1, borderColor: danger ? T.danger : T.line, marginLeft: 8
+    }
+  });
+  b.add(RN.text(label, { color: danger ? T.danger : T.text, fontSize: 12, fontWeight: '700' }));
+  return b;
+}
+
+function sectionLabel(text) {
+  return RN.text(text, { color: T.muted, fontSize: 11, fontWeight: '700', style: { marginTop: 10, marginBottom: 6, marginLeft: 2 } });
+}
+
+// A short, human status word for a file's XY porcelain code.
+function changeWord(f) {
+  if (f.untracked) return 'new';
+  var c = (f.staged ? f.index : f.worktree) || f.index || f.worktree || '';
+  if (c === 'M') return 'modified';
+  if (c === 'A') return 'added';
+  if (c === 'D') return 'deleted';
+  if (c === 'R') return 'renamed';
+  if (c === 'C') return 'copied';
+  if (c === 'U') return 'conflict';
+  return 'changed';
+}
+
+function stageHandler(path) { return function () { stagePath(path); }; }
+function unstageHandler(path) { return function () { unstagePath(path); }; }
+
+function changeFileRow(f, staged) {
+  var card = rowCard();
+  var row = RN.row({ style: { alignItems: 'center' } });
+  row.add(RN.text(staged ? '●' : (f.untracked ? '✚' : '○'),
+    { color: staged ? T.accent : T.muted, fontSize: 12, style: { marginRight: 10 } }));
+  var col = RN.column({ style: { flex: 1 } });
+  col.add(RN.text(f.path, { color: T.text, fontSize: 13, fontWeight: '600' }));
+  col.add(RN.text(changeWord(f), { color: T.muted, fontSize: 11, style: { marginTop: 2 } }));
+  row.add(col);
+  if (S.busy) {
+    // leave the buttons out while an action is in flight to avoid double-taps
+  } else if (staged) {
+    row.add(smallBtn('Unstage', unstageHandler(f.path)));
+  } else {
+    row.add(smallBtn('Stage', stageHandler(f.path)));
+  }
+  card.add(row);
+  return card;
+}
+
+function commitBox() {
+  var box = RN.column({
+    style: {
+      marginTop: 14, marginBottom: 8, padding: 12, borderRadius: 12,
+      backgroundColor: T.surface, borderWidth: 1, borderColor: T.line
+    }
+  });
+  var staged = stagedList();
+  box.add(RN.text('Commit ' + staged.length + (staged.length === 1 ? ' staged change' : ' staged changes'),
+    { color: T.text, fontSize: 13, fontWeight: '700' }));
+  box.add(RN.input({
+    placeholder: 'Commit message…',
+    placeholderTextColor: T.muted,
+    defaultValue: S.commitMsg,
+    onChangeText: function (v) { S.commitMsg = v; },
+    onSubmitEditing: commitStaged,
+    style: {
+      marginTop: 10, color: T.text, backgroundColor: T.surfaceAlt, borderWidth: 1, borderColor: T.line,
+      borderRadius: 10, paddingHorizontal: 12, paddingVertical: 9, fontSize: 13
+    }
+  }));
+  var row = RN.row({ style: { marginTop: 10, alignItems: 'center' } });
+  if (S.busy) {
+    row.add(RN.spinner({ color: T.accent }));
+  } else {
+    row.add(btn('Commit', commitStaged, staged.length > 0 ? 'primary' : null));
+    row.add(btn('Push', function () { gitAction('push', 'push'); }, null));
+  }
+  box.add(row);
+  return box;
+}
+
+function changesView(list) {
+  if (S.changesLoading) {
+    list.add(RN.spinner({ color: T.accent, style: { marginTop: 22 } }));
+    return;
+  }
+  var head = RN.row({ style: { alignItems: 'center', paddingVertical: 6 } });
+  head.add(RN.text('⑃ ' + (S.changesBranch || '—'), { color: T.muted, fontSize: 12, fontWeight: '700', style: { flex: 1 } }));
+  head.add(iconButton('⟳', loadChanges));
+  list.add(head);
+
+  var staged = stagedList();
+  var unstaged = unstagedList();
+
+  if (staged.length === 0 && unstaged.length === 0) {
+    var clean = RN.column({ style: { alignItems: 'center', paddingTop: 30 } });
+    clean.add(RN.text('✓', { color: T.accent, fontSize: 26 }));
+    clean.add(RN.text('Working tree clean', { color: T.muted, fontSize: 13, style: { marginTop: 8 } }));
+    list.add(clean);
+    list.add(RN.view({ style: { height: 24 } }));
+    return;
+  }
+
+  // Staged section.
+  var sHead = RN.row({ style: { alignItems: 'center' } });
+  sHead.add(sectionLabel('Staged (' + staged.length + ')'));
+  if (staged.length > 0 && !S.busy) {
+    var sSpacer = RN.view({ style: { flex: 1 } }); sHead.add(sSpacer);
+    sHead.add(smallBtn('Unstage all', function () { unstagePath(null); }));
+  }
+  list.add(sHead);
+  if (staged.length === 0) {
+    list.add(RN.text('Nothing staged yet', { color: T.muted, fontSize: 12, style: { marginLeft: 2, marginBottom: 4 } }));
+  } else {
+    var i = 0;
+    while (i < staged.length) { list.add(changeFileRow(staged[i], true)); i = i + 1; }
+  }
+
+  // Unstaged / untracked section.
+  var uHead = RN.row({ style: { alignItems: 'center' } });
+  uHead.add(sectionLabel('Changes (' + unstaged.length + ')'));
+  if (unstaged.length > 0 && !S.busy) {
+    var uSpacer = RN.view({ style: { flex: 1 } }); uHead.add(uSpacer);
+    uHead.add(smallBtn('Stage all', function () { stagePath(null); }));
+  }
+  list.add(uHead);
+  if (unstaged.length === 0) {
+    list.add(RN.text('No unstaged changes', { color: T.muted, fontSize: 12, style: { marginLeft: 2, marginBottom: 4 } }));
+  } else {
+    var j = 0;
+    while (j < unstaged.length) { list.add(changeFileRow(unstaged[j], false)); j = j + 1; }
+  }
+
+  list.add(commitBox());
+  list.add(RN.view({ style: { height: 24 } }));
 }
 
 function rowCard() {

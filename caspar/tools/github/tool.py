@@ -828,6 +828,17 @@ def _slug(s: str) -> str:
     return cleaned
 
 
+def _as_bool(val: Any, default: bool = False) -> bool:
+    """Coerce a payload flag to a bool, tolerating JSON bools and UI strings."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
 def _number(payload: Dict[str, Any]) -> int:
     for key in ("number", "pull_number", "issue_number", "pr"):
         val = payload.get(key)
@@ -1258,27 +1269,84 @@ def _a_fetch(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return _run_git(space_id, payload, "fetch", "fetch --all --prune", token)
 
 
+def _stage_args(payload: Dict[str, Any]) -> str:
+    """The ``git add`` argument list: the given `files`, or the whole tree."""
+    files = payload.get("files")
+    if isinstance(files, list) and files:
+        return "add -- " + " ".join(_sh(str(f)) for f in files)
+    return "add -A"
+
+
+def _a_stage(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage changes into the index without committing (``git add``).
+
+    Stages the given `files`, or every change when none are named. Returns the
+    resulting status so the caller (an agent or the Changes tab) can see exactly
+    what is now staged."""
+    token, _ = _require_use(space_id, payload)
+    out = _run_git(space_id, payload, "stage", _stage_args(payload), token)
+    if not out["ok"]:
+        raise GithubError(f"git add failed: {out.get('stderr') or out.get('stdout')}", status=502)
+    st = _a_git_status(space_id, payload)
+    out.update({"branch": st.get("branch"), "files": st.get("files"),
+                "staged": st.get("staged"), "unstaged": st.get("unstaged"),
+                "staged_count": st.get("staged_count"), "unstaged_count": st.get("unstaged_count")})
+    return out
+
+
+def _a_unstage(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove changes from the index without touching the working tree.
+
+    Unstages the given `files`, or everything when none are named — the working
+    tree keeps its edits, they simply leave the index (``git reset -q``). Returns
+    the resulting status."""
+    token, _ = _require_use(space_id, payload)
+    files = payload.get("files")
+    if isinstance(files, list) and files:
+        args = "reset -q -- " + " ".join(_sh(str(f)) for f in files)
+    else:
+        args = "reset -q"
+    out = _run_git(space_id, payload, "unstage", args, token)
+    if not out["ok"]:
+        raise GithubError(f"git reset failed: {out.get('stderr') or out.get('stdout')}", status=502)
+    st = _a_git_status(space_id, payload)
+    out.update({"branch": st.get("branch"), "files": st.get("files"),
+                "staged": st.get("staged"), "unstaged": st.get("unstaged"),
+                "staged_count": st.get("staged_count"), "unstaged_count": st.get("unstaged_count")})
+    return out
+
+
 def _a_commit(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Commit changes in the clone.
+
+    By default this stages before committing (``git add`` then ``git commit``), so
+    a one-shot "commit everything" still works as before. To commit **only what is
+    already staged** — the staging-then-committing flow — pass ``staged_only: true``
+    (or ``stage: false``); no ``git add`` is run and the working-tree changes are
+    left untouched. When staging is enabled, an explicit `files` list narrows the
+    ``git add`` to those paths."""
     token, _ = _require_use(space_id, payload)
     message = str(payload.get("message") or "").strip()
     if not message:
         raise GithubError("commit needs a `message`")
-    files = payload.get("files")
-    if isinstance(files, list) and files:
-        add = "add -- " + " ".join(_sh(str(f)) for f in files)
-    else:
-        add = "add -A"
+    do_stage = not _as_bool(payload.get("staged_only"))
+    if payload.get("stage") is not None:
+        do_stage = _as_bool(payload.get("stage"), True)
     full = _full_name(payload)
     rp = _repo_path(full)
-    # Stage then commit; the message rides in the environment to avoid quoting.
+    # Stage (unless committing the index as-is) then commit; the message rides in
+    # the environment to avoid quoting.
+    stage_step = f"{_git()}{_stage_args(payload)} && " if do_stage else ""
     cmd = (f"if [ ! -d {_sh(rp + '/.git')} ]; then echo __NOCLONE__ 1>&2; exit 3; fi && "
-           f"cd {_sh(rp)} && {_git()}{add} && {_git()}commit -m \"$GH_MSG\"")
+           f"cd {_sh(rp)} && {stage_step}{_git()}commit -m \"$GH_MSG\"")
     env = _git_env(token); env["GH_MSG"] = message
     res = _sbx_exec(space_id, payload, cmd, env=env)
     _scrub(res, token)
     if res.get("exit_code") == 3 and "__NOCLONE__" in (res.get("stderr") or ""):
         raise GithubError(f"{full} is not cloned into this space yet — clone it first", status=409)
-    return _exec_result(res, "commit", space_id, full)
+    out = _exec_result(res, "commit", space_id, full)
+    out["staged_only"] = not do_stage
+    return out
 
 
 def _a_push(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1318,6 +1386,37 @@ def _a_merge(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return _run_git(space_id, payload, "merge", f"merge {_slug(branch)}", token)
 
 
+def _porcelain_files(status: str) -> List[Dict[str, Any]]:
+    """Parse ``git status --porcelain=v1`` into structured, staged-aware rows.
+
+    Each porcelain line is ``XY<space>PATH`` where ``X`` is the index (staged)
+    state and ``Y`` the working-tree (unstaged) state; ``??`` marks an untracked
+    file. A file can be **both** staged and unstaged (e.g. ``MM`` — staged edits
+    plus newer unstaged edits), which the front-end's Changes tab needs to know so
+    it can show the file in both lists and commit the staged half only."""
+    files: List[Dict[str, Any]] = []
+    for ln in status.splitlines():
+        if len(ln) < 4 or not ln.strip():
+            continue
+        x, y, path = ln[0], ln[1], ln[3:].strip()
+        # Renames/copies read as "old -> new"; the new path is what git tracks now.
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        # Unquote git's C-style quoting of paths with special characters.
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        untracked = x == "?" and y == "?"
+        files.append({
+            "path": path,
+            "index": x if x != " " else "",
+            "worktree": y if y != " " else "",
+            "staged": (not untracked) and x != " ",
+            "unstaged": untracked or y != " ",
+            "untracked": untracked,
+        })
+    return files
+
+
 def _a_git_status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
     full = _full_name(payload)
@@ -1331,9 +1430,13 @@ def _a_git_status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raise GithubError(f"{full} is not cloned into this space yet — clone it first", status=409)
     out = res.get("stdout") or ""
     branch, _, status = out.partition("\n---\n")
-    body = [ln for ln in status.splitlines() if ln.strip()]
+    files = _porcelain_files(status)
+    staged = [f for f in files if f["staged"]]
+    unstaged = [f for f in files if f["unstaged"]]
     return {"ok": res.get("exit_code") == 0, "action": "git_status", "space_id": space_id,
-            "repo": full, "branch": branch.strip(), "status": status, "dirty": bool(body)}
+            "repo": full, "branch": branch.strip(), "status": status, "dirty": bool(files),
+            "files": files, "staged": staged, "unstaged": unstaged,
+            "staged_count": len(staged), "unstaged_count": len(unstaged)}
 
 
 def _a_git_log(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1452,6 +1555,8 @@ _ACTIONS = {
     # git (local per-space workspace)
     "clone": _a_clone, "pull": _a_pull, "git_pull": _a_pull, "fetch": _a_fetch,
     "push": _a_push, "commit": _a_commit,
+    "stage": _a_stage, "add": _a_stage, "git_add": _a_stage,
+    "unstage": _a_unstage, "git_reset": _a_unstage,
     "checkout": _a_checkout, "branch": _a_checkout, "merge": _a_merge,
     "git_status": _a_git_status, "status_repo": _a_git_status, "git_log": _a_git_log,
     "list_cloned": _a_list_cloned,

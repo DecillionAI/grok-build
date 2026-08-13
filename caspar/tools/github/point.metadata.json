@@ -8,14 +8,14 @@
   "image_name": "github-tool:latest",
   "container_name": "tool-github",
   "category": "development",
-  "description": "A full git + GitHub client bound to a Decillion space: connect a GitHub account (OAuth), then browse organizations and repositories and clone, branch, commit, push, pull, merge, open and merge pull requests, and manage issues.",
+  "description": "A full git + GitHub client bound to a Decillion space: connect a GitHub account (OAuth), then browse organizations and repositories and clone, branch, stage, commit, push, pull, merge, open and merge pull requests, and manage issues.",
   "usecases": [
     "you need to look at or change code in a GitHub repository the space is connected to — read files, branches, commits, diffs",
     "you need to clone a repository into the space and work on it, then commit and push your changes",
     "you need to open, review or merge a pull request, or create/close issues",
     "you need to see an organization's repositories and their state (open PRs, default branch, permissions)"
   ],
-  "howToTalk": "Signal it with `function` naming the operation. Connection: `status` (default), `orgs`, `disconnect`, `set_shared`. Read: `repos` (optionally `org`), `repo`, `branches`, `commits`, `pulls`, `get_pull`, `issues` — all take `repo` = \"owner/name\". Git on the space's shared sandbox machine: `clone`, `pull`, `push`, `commit` (needs `message`), `checkout` (`branch`, optional `create`), `merge` (`branch`), `git_status`, `git_log`, `read_file`/`write_file`/`delete_file`/`list_dir` (`path`), `list_cloned`. GitHub write: `create_pull` (`title`,`head`,`base`), `merge_pull` (`number`, optional `merge_method`), `update_pull`, `create_issue` (`title`). All filesystem/git work runs on the space's cloud sandbox (the same machine your other tools use), so clones are shared by the whole space. The space and the connected account are already bound — never pass a space id or a token.",
+  "howToTalk": "Signal it with `function` naming the operation. Connection: `status` (default), `orgs`, `disconnect`, `set_shared`. Read: `repos` (optionally `org`), `repo`, `branches`, `commits`, `pulls`, `get_pull`, `issues` — all take `repo` = \"owner/name\". Git on the space's shared sandbox machine: `clone`, `pull`, `push`, `stage` (aka `add`; optional `files`, default all), `unstage` (optional `files`, default all), `commit` (needs `message`; stages everything by default, or pass `staged_only: true` to commit only what you've already staged, or `files` to narrow the staging), `checkout` (`branch`, optional `create`), `merge` (`branch`), `git_status` (returns per-file staged/unstaged breakdown), `git_log`, `read_file`/`write_file`/`delete_file`/`list_dir` (`path`), `list_cloned`. A typical flow: edit files, `stage` the ones you want, then `commit` with `staged_only: true`, then `push`. GitHub write: `create_pull` (`title`,`head`,`base`), `merge_pull` (`number`, optional `merge_method`), `update_pull`, `create_issue` (`title`). All filesystem/git work runs on the space's cloud sandbox (the same machine your other tools use), so clones are shared by the whole space. The space and the connected account are already bound — never pass a space id or a token.",
   "prompt": "Use this to actually work with the space's GitHub: read and change code, and drive git and GitHub. Name the operation with `function`. The space is connected to one GitHub account by a human member; you act as that account. Repositories are addressed as `repo`=\"owner/name\". All clones and file changes happen on the space's shared cloud sandbox (the same machine as the Files tool), so clone a repo before running git on it and everyone in the space sees the same files.",
   "request_point": "tool::github::request",
   "response_point": "tool::github::response",
@@ -30,12 +30,14 @@
   "categories": ["development", "execution"],
   "routes": { "development": "status" },
   "argSchema": {
-    "function": { "type": "string", "description": "operation: status (default) | orgs | repos | repo | branches | commits | pulls | get_pull | issues | clone | pull | push | commit | checkout | merge | git_status | git_log | list_cloned | read_file | write_file | delete_file | list_dir | create_pull | merge_pull | update_pull | create_issue | disconnect | set_shared" },
+    "function": { "type": "string", "description": "operation: status (default) | orgs | repos | repo | branches | commits | pulls | get_pull | issues | clone | pull | push | stage | unstage | commit | checkout | merge | git_status | git_log | list_cloned | read_file | write_file | delete_file | list_dir | create_pull | merge_pull | update_pull | create_issue | disconnect | set_shared" },
     "repo": { "type": "string", "description": "target repository as \"owner/name\" (e.g. \"acme/website\")" },
     "org": { "type": "string", "description": "for repos: limit to one organization's repositories" },
     "branch": { "type": "string", "description": "a branch name, for checkout/push/pull/merge/commits" },
     "create": { "type": "bool", "description": "for checkout: create the branch" },
     "message": { "type": "string", "description": "for commit: the commit message" },
+    "files": { "type": "array", "description": "for stage/unstage/commit: the paths to act on (default: all changes)" },
+    "staged_only": { "type": "bool", "description": "for commit: commit only what is already staged, without staging first" },
     "path": { "type": "string", "description": "for read_file/write_file/list_dir: a path inside the cloned repo" },
     "content": { "type": "string", "description": "for write_file: the file content" },
     "title": { "type": "string", "description": "for create_pull/create_issue: the title" },
@@ -131,9 +133,19 @@
       "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "optional branch" } }
     },
     {
+      "name": "stage",
+      "desc": "stage changes into the index without committing (git add); returns the resulting staged/unstaged breakdown",
+      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "files": { "type": "ARRAY", "desc": "optional file list (default: stage all changes)" } }
+    },
+    {
+      "name": "unstage",
+      "desc": "remove changes from the index without discarding your edits (git reset); returns the resulting staged/unstaged breakdown",
+      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "files": { "type": "ARRAY", "desc": "optional file list (default: unstage all)" } }
+    },
+    {
       "name": "commit",
-      "desc": "stage and commit changes in the cloned repository",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "message": { "type": "STRING", "desc": "commit message" }, "files": { "type": "ARRAY", "desc": "optional file list (default: all changes)" } }
+      "desc": "commit changes in the cloned repository; stages everything first by default, or pass staged_only=true to commit only what is already staged",
+      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "message": { "type": "STRING", "desc": "commit message" }, "files": { "type": "ARRAY", "desc": "optional file list to stage (default: all changes)" }, "staged_only": { "type": "BOOL", "desc": "commit only what is already staged, staging nothing" } }
     },
     {
       "name": "push",
