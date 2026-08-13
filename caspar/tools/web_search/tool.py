@@ -67,9 +67,12 @@ RESULTS_CAP = int(os.environ.get("WEB_SEARCH_RESULTS_CAP", "25"))
 MAX_FETCH_BYTES = int(os.environ.get("WEB_SEARCH_MAX_FETCH_BYTES", "2000000"))
 MAX_TEXT_CHARS = int(os.environ.get("WEB_SEARCH_MAX_TEXT_CHARS", "40000"))
 
+# A real browser User-Agent by default: many sites (and DuckDuckGo's HTML
+# endpoint) 403 a request that advertises itself as a bot. Overridable.
 USER_AGENT = os.environ.get(
     "WEB_SEARCH_USER_AGENT",
-    "Mozilla/5.0 (compatible; DecillionSearchBot/1.0; +https://decillionai.com)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 )
 
 
@@ -153,7 +156,7 @@ def _active_provider() -> str:
 # --------------------------------------------------------------------------- #
 
 def _request(method: str, url: str, *, params: Optional[Dict[str, Any]] = None,
-             json_body: Any = None, headers: Optional[Dict[str, str]] = None,
+             json_body: Any = None, data: Any = None, headers: Optional[Dict[str, str]] = None,
              timeout: Optional[float] = None, stream: bool = False) -> requests.Response:
     hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if headers:
@@ -161,7 +164,7 @@ def _request(method: str, url: str, *, params: Optional[Dict[str, Any]] = None,
     try:
         return requests.request(
             method, url, params={k: v for k, v in (params or {}).items() if v not in (None, "")},
-            json=json_body, headers=hdrs, timeout=timeout or HTTP_TIMEOUT, stream=stream)
+            json=json_body, data=data, headers=hdrs, timeout=timeout or HTTP_TIMEOUT, stream=stream)
     except requests.RequestException as exc:
         raise SearchError(f"upstream request failed: {exc}", status=502)
 
@@ -312,45 +315,149 @@ def _search_google(query: str, count: int, payload: Dict[str, Any]) -> Tuple[Lis
 
 
 def _search_duckduckgo(query: str, count: int, payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Keyless fallback: the DuckDuckGo HTML endpoint, parsed for result rows.
+    """Keyless fallback: DuckDuckGo's no-JS HTML endpoints, parsed for result rows.
 
-    No API key exists for DuckDuckGo web results, so we request the lightweight
-    HTML page and extract the anchors. Best-effort — it is the safety net that
-    keeps the tool useful when no paid provider is configured."""
-    resp = _request("GET", "https://html.duckduckgo.com/html/", params={"q": query},
-                    headers={"Accept": "text/html"})
-    if resp.status_code >= 300:
-        raise SearchError(f"duckduckgo search failed ({resp.status_code})", status=resp.status_code)
-    text = resp.text or ""
+    No API key exists for DuckDuckGo web results, so we POST the search to its
+    lightweight HTML endpoints (a **POST** with form data + a real browser
+    User-Agent — a bare GET or a bot UA gets a 403) and extract the anchors. We
+    try `html.duckduckgo.com` first and fall back to the even simpler
+    `lite.duckduckgo.com`, so a 403/anti-bot block on one still returns results.
+    Best-effort — the safety net that keeps the tool useful with no paid provider.
+    """
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "https://duckduckgo.com/",
+        "Origin": "https://duckduckgo.com",
+    }
+    form = {"q": query, "kl": "us-en", "b": ""}
+    endpoints = ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/")
+    last_status = 0
+    last_err = ""
+    for url in endpoints:
+        try:
+            resp = _request("POST", url, data=form, headers=headers)
+        except SearchError as exc:
+            last_err = str(exc)
+            continue
+        last_status = resp.status_code
+        if resp.status_code >= 300:
+            continue
+        results = _parse_ddg_html(resp.text or "", count)
+        if results:
+            return results[:count], None
+    # Last keyless resort: DuckDuckGo's official Instant Answer JSON API. It does
+    # not return a full web-result page, but it rarely blocks datacenter IPs, so
+    # it keeps the tool returning *something* (a direct answer + related links)
+    # when the HTML endpoints are 403'd.
+    try:
+        ia_results, ia_answer = _ddg_instant_answer(query, count)
+        if ia_results or ia_answer:
+            return ia_results[:count], ia_answer
+    except SearchError as exc:
+        last_err = str(exc)
+    detail = f"HTTP {last_status}" if last_status else (last_err or "no response")
+    raise SearchError(
+        "duckduckgo (the keyless fallback) returned no results (" + detail + "); "
+        "DuckDuckGo rate-limits/blocks automated searches, so configure a search-provider "
+        "API key (TAVILY_API_KEY / BRAVE_API_KEY / SERPAPI_API_KEY / BING_SEARCH_API_KEY / "
+        "GOOGLE_CSE_KEY+GOOGLE_CSE_CX) on the web_search creature for reliable results",
+        status=last_status or 502)
+
+
+def _parse_ddg_html(text: str, count: int) -> List[Dict[str, Any]]:
+    """Extract result rows from either DuckDuckGo HTML endpoint's markup."""
     results: List[Dict[str, Any]] = []
-    # Each result is an <a class="result__a" href="…">title</a> with a following
-    # <a class="result__snippet">snippet</a>. Parse tolerantly with a soup.
     try:
         from bs4 import BeautifulSoup  # type: ignore
         soup = BeautifulSoup(text, "html.parser")
+        # html.duckduckgo.com: <a class="result__a">; snippet in .result__snippet.
         anchors = soup.select("a.result__a")
-        for a in anchors:
+        if anchors:
+            for a in anchors:
+                href = _ddg_unwrap(a.get("href") or "")
+                title = a.get_text(" ", strip=True)
+                snippet = ""
+                parent = a.find_parent(class_=re.compile("result"))
+                if parent is not None:
+                    sn = parent.select_one(".result__snippet")
+                    if sn is not None:
+                        snippet = sn.get_text(" ", strip=True)
+                if href and not href.startswith("https://duckduckgo.com"):
+                    results.append(_result(title, href, snippet))
+                if len(results) >= count:
+                    return results
+        # lite.duckduckgo.com: <a class="result-link"> rows + .result-snippet cells.
+        lite = soup.select("a.result-link")
+        for a in lite:
             href = _ddg_unwrap(a.get("href") or "")
             title = a.get_text(" ", strip=True)
             snippet = ""
-            parent = a.find_parent(class_=re.compile("result"))
-            if parent is not None:
-                sn = parent.select_one(".result__snippet")
-                if sn is not None:
-                    snippet = sn.get_text(" ", strip=True)
-            if href:
+            tr = a.find_parent("tr")
+            sn = None
+            if tr is not None and tr.find_next_sibling("tr") is not None:
+                sn = tr.find_next_sibling("tr").select_one(".result-snippet")
+            if sn is not None:
+                snippet = sn.get_text(" ", strip=True)
+            if href and not href.startswith("https://duckduckgo.com"):
                 results.append(_result(title, href, snippet))
             if len(results) >= count:
-                break
+                return results
     except Exception:  # noqa: BLE001 — regex fallback if bs4 is unavailable
-        for m in re.finditer(r'result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', text, re.S):
+        for m in re.finditer(r'result(?:__a|-link)"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', text, re.S):
             href = _ddg_unwrap(html.unescape(m.group(1)))
-            title = re.sub(r"<[^>]+>", "", m.group(2))
-            if href:
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if href and not href.startswith("https://duckduckgo.com"):
                 results.append(_result(html.unescape(title), href, ""))
             if len(results) >= count:
                 break
-    return results[:count], None
+    return results
+
+
+def _ddg_instant_answer(query: str, count: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """DuckDuckGo Instant Answer API (JSON, keyless, datacenter-friendly).
+
+    Returns a direct answer (``AbstractText``) when there is one, plus the
+    ``RelatedTopics`` flattened into result rows. Not a full web-result page, but
+    a reliable last resort when the HTML endpoints are blocked."""
+    resp = _request("GET", "https://api.duckduckgo.com/",
+                    params={"q": query, "format": "json", "no_html": "1",
+                            "no_redirect": "1", "t": "decillion"},
+                    headers={"Accept": "application/json"})
+    if resp.status_code >= 300:
+        raise SearchError(f"duckduckgo instant-answer failed ({resp.status_code})", status=resp.status_code)
+    try:
+        data = resp.json()
+    except ValueError:
+        return [], None
+    if not isinstance(data, dict):
+        return [], None
+    answer = str(data.get("AbstractText") or data.get("Answer") or "").strip() or None
+    results: List[Dict[str, Any]] = []
+    abstract_url = str(data.get("AbstractURL") or "").strip()
+    if abstract_url and answer:
+        results.append(_result(data.get("Heading") or query, abstract_url, answer))
+
+    def _flatten(topics: Any) -> None:
+        for t in topics if isinstance(topics, list) else []:
+            if not isinstance(t, dict):
+                continue
+            if isinstance(t.get("Topics"), list):
+                _flatten(t["Topics"])
+                continue
+            url = str(t.get("FirstURL") or "").strip()
+            text = str(t.get("Text") or "").strip()
+            if url and text:
+                # DDG "Text" is "Title description…"; split the first sentence-ish
+                # chunk as the title so rows aren't one long blob.
+                title = text.split(" - ", 1)[0][:120] if " - " in text else text[:120]
+                results.append(_result(title, url, text))
+            if len(results) >= count:
+                return
+
+    _flatten(data.get("RelatedTopics"))
+    return results[:count], answer
 
 
 def _ddg_unwrap(href: str) -> str:
