@@ -253,7 +253,8 @@ class CasparSignalingClient:
 
     def run_entity(self, program_id: str, entity_id: str, *, params: Optional[Dict[str, str]] = None,
                    ram_mb: int = 1024, disk_gb: int = 4, cpu_cores: int = 2,
-                   max_exec_seconds: int = 120, force_restart: bool = False) -> str:
+                   max_exec_seconds: int = 120, force_restart: bool = False,
+                   gateway_path: str = "") -> str:
         """Start the entity's standalone VM.
 
         ``force_restart`` is CRITICAL after a (re)deploy: the node's run_vm is
@@ -262,6 +263,13 @@ class CasparSignalingClient:
         freshly-built image. Passing it stops+removes the old container and
         creates a fresh one, so redeployed code actually runs. (The persistent
         per-VM /data mount survives either way.)
+
+        ``gateway_path`` binds a deterministic custom VM-gateway route to *this*
+        launched instance, so the entity's in-container HTTP server is reachable
+        at the fixed ``/{creatureUsername}/{gateway_path…}`` node-ingress URL. The
+        external URL never changes across redeploys — the node re-points the route
+        at the fresh instance each run — which is what lets a tool register a
+        single OAuth callback URL with the provider once (e.g. the github tool).
         """
         r = self.send("/programs/runEntity", {
             "programId": program_id, "machineId": program_id, "entityId": entity_id,
@@ -269,6 +277,7 @@ class CasparSignalingClient:
                           "maxExecTimeSeconds": max_exec_seconds},
             "params": params or {},
             "forceRestart": force_restart,
+            "gatewayPath": gateway_path,
         })
         if r.get("_res_code", -1) != 0:
             raise RuntimeError(f"runEntity failed: {r}")
