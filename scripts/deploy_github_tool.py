@@ -88,6 +88,11 @@ from caspar_signaling import CasparSignalingClient  # noqa: E402
 TOOL_ID = "github"
 TOOLS_DIR = REPO / "caspar" / "tools"
 
+# The tool's machine-creature name = the bare local part of its username. The
+# node aliases this to the creature id at gateway-route registration, so it is
+# what the fixed OAuth callback URL uses (`/{MACHINE_NAME}/{GATEWAY_PATH}/…`).
+MACHINE_NAME = f"m-tool-{TOOL_ID}"
+
 # The deterministic custom VM-gateway path the OAuth callback is served under.
 # Combined with the tool's machine-creature username it yields a FIXED node
 # ingress URL — `/{creatureUsername}/{GATEWAY_PATH}/oauth/callback` — that is
@@ -208,37 +213,32 @@ def compose_dockerfile(files: Dict[str, str]):
     return stamp_context(dockerfile, files)
 
 
-def _machine_username(client: "CasparSignalingClient", creature_id: str) -> str:
-    """The stored username of the tool's machine creature (``<name>@<source>``).
-
-    The custom gateway route is keyed by the creature id but reached from outside
-    by the creature's username, so the fixed callback URL needs it. Resolved from
-    the node (never guessed) by enumerating creatures and matching the id."""
-    try:
-        for c in client.list_creatures():
-            if str(c.get("id") or "") == creature_id:
-                return str(c.get("username") or "")
-    except Exception:  # noqa: BLE001 — fall through to empty
-        pass
-    return ""
-
-
-def _log_oauth_callback_url(client: "CasparSignalingClient", creature_id: str) -> None:
+def _log_oauth_callback_url(creature_id: str) -> None:
     """Record the FIXED node VM-HTTP-ingress URL that reaches the github tool's
     OAuth callback, so the operator registers it once as the GitHub OAuth app's
     callback URL (and as GITHUB_OAUTH_REDIRECT_URI). The callback runs INSIDE the
     container now, not on Nest.
 
-    The URL is deterministic — `/{creatureUsername}/{GATEWAY_PATH}/oauth/callback`
-    — and stable across redeploys: the node re-points the custom route at each
-    fresh serving instance, so this URL never changes and the OAuth app's
-    registered redirect URI never has to be updated again."""
-    username = _machine_username(client, creature_id)
-    if not username:
-        warn("could not resolve the github tool's machine username — cannot log the fixed OAuth callback URL")
-        return
-    ingress_path = f"/{username}/{GATEWAY_PATH}/oauth/callback"
+    The URL addresses the creature by the **bare local part of its username** —
+    the tool's machine name, `m-tool-github` — which is short, readable, and
+    path-safe. The node aliases that local part to the creature id at route
+    registration, so `/m-tool-github/{GATEWAY_PATH}/oauth/callback` resolves. This
+    avoids both the full username (whose `@http://host:port` source cannot go in a
+    URL path) and the opaque numeric id. It is deterministic and stable across
+    redeploys (the name never changes and the node re-points the route at each
+    fresh serving instance), so the OAuth app's registered redirect URI never has
+    to be updated again.
+
+    The base must be the node's PUBLIC VM-ingress origin — set
+    GITHUB_VM_HTTP_INGRESS_BASE / CASPAR_VM_HTTP_INGRESS_BASE (e.g.
+    https://api.decillionai.com) — and that origin must reverse-proxy to the
+    node's VM HTTP ingress port; otherwise the printed path is only a suffix."""
+    _ = creature_id  # the URL uses the machine name; the id is aliased to it on-chain
+    ingress_path = f"/{MACHINE_NAME}/{GATEWAY_PATH}/oauth/callback"
     base = env_any("GITHUB_VM_HTTP_INGRESS_BASE", "CASPAR_VM_HTTP_INGRESS_BASE", default="").rstrip("/")
+    if not base:
+        warn("GITHUB_VM_HTTP_INGRESS_BASE / CASPAR_VM_HTTP_INGRESS_BASE is unset — the OAuth callback URL "
+             "below is only the ingress path suffix; prefix it with the node's public VM-ingress origin")
     full = (base + ingress_path) if base else ingress_path
     print("GITHUB_OAUTH_CALLBACK_INGRESS=" + full, flush=True)
     info(f"github OAuth callback is served in-container at a FIXED url; register it as the OAuth app's "
@@ -264,7 +264,7 @@ def main() -> int:
     operator_id = resolve_operator(client)
     creature_id, program_id = ensure_docker_program(
         client, operator_id,
-        machine_name=f"m-tool-{TOOL_ID}",
+        machine_name=MACHINE_NAME,
         program_path=f"/tools/{TOOL_ID}",
         comment=f"tool {TOOL_ID}",
     )
@@ -328,7 +328,7 @@ def main() -> int:
                 ok(f"{TOOL_ID} VM entity running: {vm_id}")
                 print("GITHUB_TOOL_VM_ID=" + vm_id, flush=True)
                 info(f"bound fixed VM-gateway route '{GATEWAY_PATH}' → this instance for the OAuth callback")
-                _log_oauth_callback_url(client, creature_id)
+                _log_oauth_callback_url(creature_id)
             else:
                 warn("runEntity returned no vmId")
         except Exception as exc:  # noqa: BLE001 — the program is deployed regardless

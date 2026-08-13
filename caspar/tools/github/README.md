@@ -53,8 +53,10 @@ app uses, with **no code to type**:
 4. GitHub redirects the tab to the creature's own **fixed callback URL** with
    `?code&state`. The callback is served *inside the container* by the tool's
    `http_handler`, reached through the Caspar VM gateway at the deterministic
-   `/{creatureUsername}/{gatewayPath}/oauth/callback` ingress path (default
-   `gatewayPath` = `github`; bound at deploy via `deploy_github_tool.py`). The
+   `/{machineName}/{gatewayPath}/oauth/callback` ingress path (machine name
+   `m-tool-github`, default `gatewayPath` = `github`; bound at deploy via
+   `deploy_github_tool.py`). The node aliases the machine name to the creature id,
+   and also resolves the full username or the id if you prefer those. The
    handler swaps the code for a token and stores it — no Nest route involved. The
    URL is stable across redeploys (the node re-points the route at each fresh
    serving instance), so it is registered once as the OAuth app's callback URL
@@ -131,7 +133,7 @@ signal payload, so a prompt-injected agent cannot swap the OAuth app.
 |---|---|
 | `GITHUB_OAUTH_CLIENT_ID` | the GitHub OAuth App / GitHub App client id |
 | `GITHUB_OAUTH_CLIENT_SECRET` | **required** — the web flow signs the token exchange with it |
-| `GITHUB_OAUTH_REDIRECT_URI` | **required** — the creature's fixed in-container callback (`…/{creatureUsername}/{gatewayPath}/oauth/callback`, logged by `deploy_github_tool.py` as `GITHUB_OAUTH_CALLBACK_INGRESS`); must **exactly** match the OAuth app's "Authorization callback URL" |
+| `GITHUB_OAUTH_REDIRECT_URI` | **required** — the creature's fixed in-container callback (`…/m-tool-github/{gatewayPath}/oauth/callback`, logged by `deploy_github_tool.py` as `GITHUB_OAUTH_CALLBACK_INGRESS`); must **exactly** match the OAuth app's "Authorization callback URL" |
 | `GITHUB_OAUTH_SCOPES` | default `repo,read:org,workflow,read:user` |
 | `GITHUB_OAUTH_STATE_TTL_S` | how long a pending connect stays valid (default `900`) |
 
