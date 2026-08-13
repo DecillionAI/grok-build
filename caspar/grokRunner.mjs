@@ -517,6 +517,10 @@ export function newSessionId() {
  * Run one prompt to completion.
  *
  * @param opts.prompt         the user turn (written to a file: `--prompt-file`)
+ * @param opts.promptBlocks   optional ACP content blocks for a multimodal turn
+ *                            (text + inline image/audio). When present and
+ *                            non-empty, they are written as a `.json` prompt file
+ *                            and `opts.prompt` is ignored.
  * @param opts.systemPrompt   appended to Grok's own system prompt (`--rules`)
  * @param opts.cwd            the session workspace
  * @param opts.mcpServers     `{ [name]: {command,args,env} }` for the run's config.toml
@@ -622,8 +626,17 @@ export async function runGrok(opts) {
 
   fs.mkdirSync(cwd, { recursive: true });
   // Grok reads no prompt from stdin in headless mode, so the turn goes to a file.
-  const promptFile = path.join(runDir, "prompt.txt");
-  fs.writeFileSync(promptFile, String(prompt ?? ""), { mode: 0o600 });
+  // A plain turn is written as `.txt`; a multimodal turn (text + inline image/
+  // audio content blocks) is written as `.json`, which the CLI parses as ACP
+  // content blocks (`--prompt-file` dispatches on the extension). That is what
+  // lets the model actually see an image/hear a clip attached to the message.
+  const promptBlocks = Array.isArray(opts.promptBlocks) && opts.promptBlocks.length ? opts.promptBlocks : null;
+  const promptFile = path.join(runDir, promptBlocks ? "prompt.json" : "prompt.txt");
+  if (promptBlocks) {
+    fs.writeFileSync(promptFile, JSON.stringify(promptBlocks), { mode: 0o600 });
+  } else {
+    fs.writeFileSync(promptFile, String(prompt ?? ""), { mode: 0o600 });
+  }
 
   const { command, prefixArgs } = resolveCli(env);
   const args = [

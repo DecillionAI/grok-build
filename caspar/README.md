@@ -58,6 +58,18 @@ signals that endpoint for the thread itself before building the prompt
 (`spaceHistory.mjs`). The reply comes back on `creatures/signal` (not
 `creatures/signal/result`, which the node never delivers to a docker creature).
 
+**Multimodal attachments.** `attachments` on the task carries files the person
+sent with the message (`[{name, mime_type, data|path, description}]`, `data`
+base64). Every attachment is materialised into the session workspace so the agent
+can open, run or edit it. In addition, **image/audio** attachments are handed to
+the model *inline*: `runtime.mjs` reads them back as ACP content blocks
+(`{type:"image"|"audio", data, mimeType}`, `mediaContentBlocks`) and the turn is
+written to `grok`'s `--prompt-file` as a `.json` array (`[{type:"text",text},
+…media]`) instead of `prompt.txt` — so the model actually sees the picture / hears
+the clip, not just a path. Non-media (video, archives, documents, binaries) stays
+file-only. Oversized media (`MAX_INLINE_MEDIA_BYTES`, default 16 MiB) is left
+file-only too.
+
 `channel` is one of `status · plan · thought · action · observation · final · trace`
 — what the Expo client renders as the live trajectory. The `result` carries
 `answer`, `usage.promptTokens` / `usage.completionTokens` (what the platform bills),
@@ -89,7 +101,7 @@ which the node relays while keeping the correlation open.
 | `env.mjs` | The `GROK_CREATURE_*` knobs (legacy `CLAUDE_CREATURE_*` names still read). |
 | `events.mjs` | Maps `streaming-messages-json` lines onto the platform's step channels; masks credentials. |
 | `result.mjs` | Builds the terminal reply (answer, billable usage, plan, budget). |
-| `attachments.mjs` | Materialises prompt attachments into the session workspace. |
+| `attachments.mjs` | Materialises prompt attachments into the session workspace, and turns image/audio ones into inline ACP content blocks for the model. |
 | `build/imageBuild.sh` | Builds/verifies the binary inside the image. |
 | `Dockerfile.fetch` | The creature image the deploy uses: the build downloads the published bundle. |
 | `Dockerfile` / `Dockerfile.prebuilt` | The other two image shapes: in-image compile (or published-CLI download), and a bundle already in the build context (what the GHCR image is built from). |
