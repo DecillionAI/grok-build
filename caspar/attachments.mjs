@@ -35,10 +35,14 @@ const MAX_INLINE_MEDIA_BYTES = creatureNumber("MAX_INLINE_MEDIA_BYTES", 16 * 102
 /** Ceiling on the bytes we fetch for a single URL-referenced attachment. */
 const MAX_ATTACHMENT_BYTES = creatureNumber("MAX_ATTACHMENT_BYTES", 32 * 1024 * 1024);
 
-/** True for a MIME type the model can ingest directly as an ACP content block. */
+/**
+ * True for a MIME type the model can ingest directly as an ACP content block.
+ * Images only: the model's message content is text + image (the ACP prompt path
+ * forwards only image blocks — an audio block is dropped), so audio is handled by
+ * transcription-to-text instead (see `extract.mjs`), not inlined here.
+ */
 export function isInlineMediaMime(mime) {
-  const m = String(mime || "").toLowerCase();
-  return m.startsWith("image/") || m.startsWith("audio/");
+  return String(mime || "").toLowerCase().startsWith("image/");
 }
 
 /** Keep a caller-supplied name from escaping the attachments directory. */
@@ -116,14 +120,15 @@ export async function materializeAttachments(task, workspace, { maxBytes = MAX_A
 }
 
 /**
- * Turn the image/audio attachments among the materialised descriptors into ACP
- * content blocks the headless CLI ingests inline (`{type, data, mimeType}`), so
- * the model actually sees an image or hears a clip instead of only being told a
- * path. Reads the bytes back from the file `materializeAttachments` just wrote —
+ * Turn the image attachments among the materialised descriptors into ACP image
+ * content blocks the headless CLI ingests inline (`{type:"image", data,
+ * mimeType}`), so the model actually sees the picture instead of only being told
+ * a path. Reads the bytes back from the file `materializeAttachments` just wrote —
  * so it works uniformly whether the attachment arrived as inline `data` or was
- * copied from a local `path`. Never throws: a block that cannot be built is
- * skipped (the file is still there for the agent to open), so a media hiccup
- * never fails the prompt.
+ * copied from a local `path`. Audio/PDF/documents are NOT inlined here (the model
+ * cannot ingest them as blocks); they are turned into text by `extract.mjs`.
+ * Never throws: a block that cannot be built is skipped (the file is still there
+ * for the agent to open), so a media hiccup never fails the prompt.
  *
  * `maxBytes` caps a single inline block; anything larger stays file-only.
  */
@@ -140,10 +145,7 @@ export function mediaContentBlocks(descriptors, { maxBytes = MAX_INLINE_MEDIA_BY
       }
       const data = fs.readFileSync(a.path).toString("base64");
       if (!data) continue;
-      const isAudio = String(a.mimeType).toLowerCase().startsWith("audio/");
-      const block = isAudio
-        ? { type: "audio", data, mimeType: a.mimeType }
-        : { type: "image", data, mimeType: a.mimeType, uri: `file://${a.path}` };
+      const block = { type: "image", data, mimeType: a.mimeType, uri: `file://${a.path}` };
       blocks.push(block);
     } catch (err) {
       log?.({ skipped: a.name, error: err?.message || String(err) });
