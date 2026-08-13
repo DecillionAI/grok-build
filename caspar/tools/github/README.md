@@ -3,8 +3,8 @@
 A Davinci tool creature (Caspar `docker` entity) that gives a Decillion **space a
 full GitHub client**: a human member connects a GitHub account, then everyone the
 member allows — people **and** the space's agents — can browse organizations and
-repositories and drive git and GitHub (clone, branch, commit, push, pull, merge,
-open/merge pull requests, manage issues).
+repositories and drive git and GitHub (clone, branch, stage, commit, push, pull,
+merge, open/merge pull requests, manage issues).
 
 ```
 Victor "GitHub" mini-app ─host.call▶ Nest ─signal(as the user)▶ github creature ─REST▶ GitHub
@@ -96,9 +96,10 @@ the connection is gated. Only the owner can flip sharing or disconnect.
 | `issues` / `create_issue` | issues |
 | `clone` | clone a repo into the space (idempotent) |
 | `pull` / `push` / `fetch` | sync a clone with origin |
-| `commit` | stage + commit (`message`, optional `files`) |
+| `stage` (`add`) / `unstage` | move changes into / out of the index (`git add` / `git reset`), optional `files` (default all); returns the staged/unstaged breakdown |
+| `commit` | commit (`message`); stages everything first by default, or pass `staged_only: true` to commit only what is already staged, or `files` to narrow the staging |
 | `checkout` / `branch` / `merge` | branch + merge in the clone |
-| `git_status` / `git_log` | clone state |
+| `git_status` / `git_log` | clone state (`git_status` returns per-file staged/unstaged/untracked rows) |
 | `read_file` / `write_file` / `delete_file` / `list_dir` / `list_cloned` | files in the clone (on the sandbox) |
 
 Every action requires `space_id`, pinned by Nest for front-end calls and by the
