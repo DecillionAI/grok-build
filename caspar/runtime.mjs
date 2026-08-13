@@ -38,7 +38,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { bridgeFromEnv } from "./bridge.mjs";
-import { materializeAttachments } from "./attachments.mjs";
+import { materializeAttachments, mediaContentBlocks } from "./attachments.mjs";
 import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
 import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
@@ -133,8 +133,14 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   const workspace = path.join(workspaceRoot(), sessionSlug(sessionId));
   fs.mkdirSync(workspace, { recursive: true });
 
-  const attachments = materializeAttachments(task, workspace);
+  const attachments = await materializeAttachments(task, workspace);
   if (attachments.length) log("GROK_ATTACHMENTS", { count: attachments.length, items: attachments });
+  // Image/audio attachments are additionally handed to the model inline as ACP
+  // content blocks so it can actually see/hear them — not just read a path. The
+  // bytes are the same ones just materialised above (the agent can still open the
+  // file too). Non-media stays file-only.
+  const mediaBlocks = mediaContentBlocks(attachments, { log: (info) => log("GROK_MEDIA", info) });
+  if (mediaBlocks.length) log("GROK_MEDIA", { inlined: mediaBlocks.length });
 
   const mapper = new TrajectoryMapper({ traceAll: creatureFlag("TRACE_ALL", false) });
   // Steps ride the channel the backend named; the terminal result always goes
@@ -346,6 +352,10 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
 
   const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
+  // With inline media, the turn becomes ACP content blocks: the composed text
+  // first, then each image/audio block. Without any, `promptBlocks` stays null and
+  // the run uses the plain-text prompt exactly as before.
+  const promptBlocks = mediaBlocks.length ? [{ type: "text", text: prompt }, ...mediaBlocks] : null;
   const maxWallSeconds = Number(config.max_wall_seconds) || creatureNumber("MAX_WALL_SECONDS", 900);
 
   log("GROK_BOOT", {
@@ -370,6 +380,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   try {
     run = await runGrok({
       prompt,
+      promptBlocks,
       systemPrompt,
       cwd: workspace,
       // Written into the run's config.toml — Grok has no `--mcp-config` flag.

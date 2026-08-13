@@ -726,6 +726,99 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.equal(/\[mcp_servers/.test(invocation.config), false, "no MCP server is wired when the space has no creatures");
   assert.equal(invocation.tools, undefined, "no --tools allowlist: it would strip the planning/web built-ins");
   assert.ok((invocation.disallowedTools || "").includes("run_terminal_cmd"), "the local shell/file built-ins are denied");
+  const promptPath = invocation.argv[invocation.argv.indexOf("--prompt-file") + 1] || "";
+  assert.ok(promptPath.endsWith("prompt.txt"), "a text-only turn is a .txt prompt file, not content blocks");
+});
+
+await check("an image/audio attachment reaches the model inline as ACP content blocks", async () => {
+  // A 1×1 PNG and a tiny WAV, both inline base64 — exactly what the Expo client
+  // sends for the current turn's attachments.
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const wav = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=";
+  const { result, invocation, workspaceRoot } = await serveWithFakeCli({
+    scenario: successScenario("Nice picture."),
+    delivery: proxyDelivery({
+      prompt: "what is this?",
+      extra: {
+        attachments: [
+          { name: "shot.png", mime_type: "image/png", data: png },
+          { name: "clip.wav", mime_type: "audio/wav", data: wav },
+          { name: "notes.pdf", mime_type: "application/pdf", data: "JVBERi0=" },
+        ],
+      },
+    }),
+  });
+
+  assert.equal(result.success, true, "the run still completes with attachments");
+  assert.ok(invocation, "the CLI was invoked");
+  const promptPath = invocation.argv[invocation.argv.indexOf("--prompt-file") + 1] || "";
+  assert.ok(promptPath.endsWith("prompt.json"), "a multimodal turn is a .json content-block prompt file");
+
+  const blocks = JSON.parse(invocation.prompt);
+  assert.ok(Array.isArray(blocks), "the prompt file is a content-block array");
+  assert.equal(blocks[0].type, "text", "the composed text turn comes first");
+  assert.match(blocks[0].text, /CURRENT MESSAGE TO ANSWER/);
+
+  const image = blocks.find((b) => b.type === "image");
+  assert.ok(image, "the image is inlined as an image content block");
+  assert.equal(image.mimeType, "image/png");
+  assert.equal(image.data, png, "the image bytes are carried verbatim to the model");
+
+  const audio = blocks.find((b) => b.type === "audio");
+  assert.ok(audio, "the audio clip is inlined as an audio content block");
+  assert.equal(audio.mimeType, "audio/wav");
+  assert.equal(audio.data, wav);
+
+  // Non-media stays file-only — never inlined as a block.
+  assert.equal(blocks.some((b) => b.type !== "text" && b.mimeType === "application/pdf"), false, "a PDF is not inlined as a content block");
+
+  // Every attachment (media included) is still materialised so the agent can
+  // also open/run/edit the bytes with its filesystem tools.
+  const attachDir = fs.existsSync(workspaceRoot)
+    ? fs.readdirSync(workspaceRoot, { recursive: true }).map(String)
+    : [];
+  assert.ok(attachDir.some((p) => p.endsWith("shot.png")), "the image is also materialised into the workspace");
+  assert.ok(attachDir.some((p) => p.endsWith("notes.pdf")), "the non-media file is materialised for the agent to open");
+});
+
+await check("a URL-referenced image is fetched and inlined (the Expo client's frame-safe path)", async () => {
+  // The app uploads bytes to Caspar storage and sends the agent only a small
+  // reference {name, mime_type, url} — never base64 — so the prompt signal stays
+  // under the node's frame limit. The backbone fetches the bytes from the URL.
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    "base64",
+  );
+  const http = await import("node:http");
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "image/png" });
+    res.end(png);
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  try {
+    const { result, invocation } = await serveWithFakeCli({
+      scenario: successScenario("Got it."),
+      delivery: proxyDelivery({
+        prompt: "describe the picture",
+        extra: {
+          attachments: [
+            { name: "remote.png", mime_type: "image/png", url: `http://127.0.0.1:${port}/remote.png` },
+          ],
+        },
+      }),
+    });
+    assert.equal(result.success, true);
+    const promptPath = invocation.argv[invocation.argv.indexOf("--prompt-file") + 1] || "";
+    assert.ok(promptPath.endsWith("prompt.json"), "the fetched image makes the turn multimodal");
+    const blocks = JSON.parse(invocation.prompt);
+    const image = blocks.find((b) => b.type === "image");
+    assert.ok(image, "the URL-referenced image is inlined as an image block");
+    assert.equal(image.mimeType, "image/png");
+    assert.equal(image.data, png.toString("base64"), "the fetched bytes reach the model");
+  } finally {
+    server.close();
+  }
 });
 
 await check("a space's creatures are wired into the run as an MCP server", async () => {
