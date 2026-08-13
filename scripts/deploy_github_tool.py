@@ -88,6 +88,11 @@ from caspar_signaling import CasparSignalingClient  # noqa: E402
 TOOL_ID = "github"
 TOOLS_DIR = REPO / "caspar" / "tools"
 
+# The tool's machine-creature name = the bare local part of its username. The
+# node aliases this to the creature id at gateway-route registration, so it is
+# what the fixed OAuth callback URL uses (`/{MACHINE_NAME}/{GATEWAY_PATH}/…`).
+MACHINE_NAME = f"m-tool-{TOOL_ID}"
+
 # The deterministic custom VM-gateway path the OAuth callback is served under.
 # Combined with the tool's machine-creature username it yields a FIXED node
 # ingress URL — `/{creatureUsername}/{GATEWAY_PATH}/oauth/callback` — that is
@@ -214,20 +219,22 @@ def _log_oauth_callback_url(creature_id: str) -> None:
     callback URL (and as GITHUB_OAUTH_REDIRECT_URI). The callback runs INSIDE the
     container now, not on Nest.
 
-    The URL addresses the creature by its **id** (`{creature_id}`, e.g.
-    `7@global`) — path-safe — rather than its username, because the node qualifies
-    usernames with its own source (e.g. `m-tool-github@http://host:port`), whose
-    `://` cannot go in a URL path. The gateway resolves either form, but only the
-    id form yields a valid URL here. It is deterministic and stable across
-    redeploys (the id never changes and the node re-points the route at each fresh
-    serving instance), so the OAuth app's registered redirect URI never has to be
-    updated again.
+    The URL addresses the creature by the **bare local part of its username** —
+    the tool's machine name, `m-tool-github` — which is short, readable, and
+    path-safe. The node aliases that local part to the creature id at route
+    registration, so `/m-tool-github/{GATEWAY_PATH}/oauth/callback` resolves. This
+    avoids both the full username (whose `@http://host:port` source cannot go in a
+    URL path) and the opaque numeric id. It is deterministic and stable across
+    redeploys (the name never changes and the node re-points the route at each
+    fresh serving instance), so the OAuth app's registered redirect URI never has
+    to be updated again.
 
     The base must be the node's PUBLIC VM-ingress origin — set
     GITHUB_VM_HTTP_INGRESS_BASE / CASPAR_VM_HTTP_INGRESS_BASE (e.g.
     https://api.decillionai.com) — and that origin must reverse-proxy to the
     node's VM HTTP ingress port; otherwise the printed path is only a suffix."""
-    ingress_path = f"/{creature_id}/{GATEWAY_PATH}/oauth/callback"
+    _ = creature_id  # the URL uses the machine name; the id is aliased to it on-chain
+    ingress_path = f"/{MACHINE_NAME}/{GATEWAY_PATH}/oauth/callback"
     base = env_any("GITHUB_VM_HTTP_INGRESS_BASE", "CASPAR_VM_HTTP_INGRESS_BASE", default="").rstrip("/")
     if not base:
         warn("GITHUB_VM_HTTP_INGRESS_BASE / CASPAR_VM_HTTP_INGRESS_BASE is unset — the OAuth callback URL "
@@ -257,7 +264,7 @@ def main() -> int:
     operator_id = resolve_operator(client)
     creature_id, program_id = ensure_docker_program(
         client, operator_id,
-        machine_name=f"m-tool-{TOOL_ID}",
+        machine_name=MACHINE_NAME,
         program_path=f"/tools/{TOOL_ID}",
         comment=f"tool {TOOL_ID}",
     )
