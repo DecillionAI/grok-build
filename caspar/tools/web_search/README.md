@@ -38,6 +38,15 @@ otherwise the keyless DuckDuckGo fallback so the tool always returns *something*
 If a keyed provider hiccups and returns nothing, the call transparently falls
 back to DuckDuckGo.
 
+> **Configure a provider key for reliable results.** The keyless DuckDuckGo
+> fallback tries three endpoints in turn — the `html` and `lite` HTML endpoints
+> (POSTed with a real browser User-Agent) and finally the official Instant Answer
+> JSON API — but DuckDuckGo aggressively rate-limits/blocks automated searches
+> from datacenter IPs and can still return **HTTP 403 / nothing**. It is a safety
+> net, not a production search backend. For dependable results bake one provider
+> key into the image (Tavily and Brave both have free tiers); the error message
+> a failed keyless search returns says exactly this.
+
 All credentials come from the **container environment only** — never from a
 signal payload a prompt could influence, so a prompt-injected agent cannot swap
 the provider or read the key.

@@ -97,6 +97,10 @@ step through a site by hand. `deploy_browser_tool.py` deploys it as a
 back-end + front-end, registers the tool in the on-chain platform registry (so
 `MarketService.listTools` lists it as an addable tool), and starts it as a
 long-lived serving creature so the browser stays warm between calls. `ci-deploy.sh`
-runs it on every deploy, and the Nest deployer records it in the manifest under
-`davinci.tools["browser_automation"]`. Because the image is multi-GB, its build
-timeout is larger than the other tools' (`BROWSER_REBUILD_TIMEOUT`, default 1200s).
+runs it on every deploy (disable with `BROWSER_TOOL_ENABLE=0`), and the Nest
+deployer records it in the manifest under `davinci.tools["browser_automation"]` —
+that recording is what keeps its self-registered platform-registry entry from
+being reaped by `reconcile_platform_registry.py`, so it stays on the tool-manager.
+Because the image is multi-GB, its build timeout is larger than the other tools'
+(`BROWSER_REBUILD_TIMEOUT`, default 1200s), but the build is skipped when the
+image context is unchanged, so only the first deploy is slow.
