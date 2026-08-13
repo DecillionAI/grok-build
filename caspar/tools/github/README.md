@@ -50,10 +50,15 @@ app uses, with **no code to type**:
 2. The front-end opens that URL in a browser tab (via the host's `host:openUrl`
    capability).
 3. The user picks the **account + organizations** to grant and approves.
-4. GitHub redirects the tab to Nest's fixed callback
-   (`GITHUB_OAUTH_REDIRECT_URI`, `…/api/github/oauth/callback`) with `?code&state`.
-   Nest signals the creature `oauth_exchange`, which swaps the code for a token and
-   stores it. The tab shows "connected" and closes.
+4. GitHub redirects the tab to the creature's own **fixed callback URL** with
+   `?code&state`. The callback is served *inside the container* by the tool's
+   `http_handler`, reached through the Caspar VM gateway at the deterministic
+   `/{creatureUsername}/{gatewayPath}/oauth/callback` ingress path (default
+   `gatewayPath` = `github`; bound at deploy via `deploy_github_tool.py`). The
+   handler swaps the code for a token and stores it — no Nest route involved. The
+   URL is stable across redeploys (the node re-points the route at each fresh
+   serving instance), so it is registered once as the OAuth app's callback URL
+   and as `GITHUB_OAUTH_REDIRECT_URI`. The tab shows "connected" and closes.
 5. The front-end long-polls `oauth_wait` and flips to the dashboard once the token
    lands — server-paced, so it needs no client-side timer.
 
@@ -80,7 +85,7 @@ the connection is gated. Only the owner can flip sharing or disconnect.
 |---|---|
 | `status` | connection state, account, sharing, and whether the caller may use/manage it |
 | `oauth_start` / `oauth_wait` | web-flow connect (front-end): get the authorize URL, then wait for the callback |
-| `oauth_exchange` | swap the callback's `code` for a token (called by Nest's callback route) |
+| `oauth_exchange` | swap the callback's `code` for a token (called by the in-container callback `http_handler`) |
 | `set_shared` / `disconnect` | owner-only settings |
 | `orgs` | the connected user + the orgs they granted |
 | `repos` | repositories (optionally scoped to an `org`) |
@@ -126,7 +131,7 @@ signal payload, so a prompt-injected agent cannot swap the OAuth app.
 |---|---|
 | `GITHUB_OAUTH_CLIENT_ID` | the GitHub OAuth App / GitHub App client id |
 | `GITHUB_OAUTH_CLIENT_SECRET` | **required** — the web flow signs the token exchange with it |
-| `GITHUB_OAUTH_REDIRECT_URI` | **required** — Nest's callback (`…/api/github/oauth/callback`); must **exactly** match the OAuth app's "Authorization callback URL" |
+| `GITHUB_OAUTH_REDIRECT_URI` | **required** — the creature's fixed in-container callback (`…/{creatureUsername}/{gatewayPath}/oauth/callback`, logged by `deploy_github_tool.py` as `GITHUB_OAUTH_CALLBACK_INGRESS`); must **exactly** match the OAuth app's "Authorization callback URL" |
 | `GITHUB_OAUTH_SCOPES` | default `repo,read:org,workflow,read:user` |
 | `GITHUB_OAUTH_STATE_TTL_S` | how long a pending connect stays valid (default `900`) |
 
