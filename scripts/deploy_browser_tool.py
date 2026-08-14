@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -147,18 +148,57 @@ def compose_dockerfile(files: Dict[str, str]):
     return stamp_context(dockerfile, files)
 
 
+def _connect_and_resolve(entity_id: str):
+    """Connect, authenticate, and resolve/create this tool's docker program —
+    retrying on a transient node timeout.
+
+    browser_automation is the **last** platform tool ci-deploy.sh deploys, so by
+    the time its turn comes the node has just booted the sandbox, github and
+    web_search serving VMs back to back (`run_entity(force_restart=True)` each).
+    Under that load the node can stall long enough that the first `/creatures/create`
+    for this tool's machine times out (observed: `TimeoutError: timed out` in
+    `create_machine_creature`) — which failed the whole browser deploy before it
+    ever built its image. `ensure_docker_program` is idempotent (it re-finds the
+    machine by its stable username), so we simply reconnect and retry a few times
+    with backoff, letting the node finish the preceding VM boots first.
+    """
+    timeout = int(env_any("BROWSER_DEPLOY_TIMEOUT_S", default="300"))
+    attempts = int(env_any("BROWSER_DEPLOY_CONNECT_ATTEMPTS", default="4"))
+    backoffs = [20, 40, 60, 90]
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        client = None
+        try:
+            info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT} (attempt {attempt}/{attempts})")
+            client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=timeout).connect()
+            operator_id = resolve_operator(client)
+            creature_id, program_id = ensure_docker_program(
+                client, operator_id,
+                machine_name=MACHINE_NAME,
+                program_path=f"/tools/{TOOL_ID}",
+                comment=f"tool {TOOL_ID}",
+            )
+            return client, creature_id, program_id
+        except Exception as exc:  # noqa: BLE001 — retry transient node stalls
+            last_exc = exc
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if attempt < attempts:
+                delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                warn(f"node handshake failed ({type(exc).__name__}: {exc}); the node is likely still "
+                     f"booting the other tools' VMs — retrying in {delay}s")
+                time.sleep(delay)
+    raise RuntimeError(f"could not reach the Caspar node to create the {TOOL_ID} program after "
+                       f"{attempts} attempts: {last_exc}")
+
+
 def main() -> int:
     entity_id = env_any("BROWSER_TOOL_ENTITY_ID", default=TOOL_ID)
 
-    info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT}")
-    client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=180).connect()
-    operator_id = resolve_operator(client)
-    creature_id, program_id = ensure_docker_program(
-        client, operator_id,
-        machine_name=MACHINE_NAME,
-        program_path=f"/tools/{TOOL_ID}",
-        comment=f"tool {TOOL_ID}",
-    )
+    client, creature_id, program_id = _connect_and_resolve(entity_id)
     prev_image_id = docker_image_id(program_id, entity_id)
 
     files = build_context()
