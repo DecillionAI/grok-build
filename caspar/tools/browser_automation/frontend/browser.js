@@ -93,9 +93,17 @@ var SESSION = 'desktop';
 
 function shoot() {
   hostCall('screenshot', { session: SESSION, format: 'jpeg', quality: 60 }, function (err, res) {
-    if (err == null && res != null && res.ok !== false && res.image) {
-      S.shot = 'data:image/jpeg;base64,' + res.image;
-      renderView();
+    if (err == null && res != null && res.ok !== false) {
+      // The host turns the screenshot's base64 into a short blob: URL and drops
+      // the raw bytes (so the heavy payload never crosses into this VM); use that
+      // `url` when present, and fall back to an inline data URI otherwise.
+      if (res.url) {
+        S.shot = res.url;
+        renderView();
+      } else if (res.image) {
+        S.shot = 'data:image/jpeg;base64,' + res.image;
+        renderView();
+      }
     }
   });
 }
