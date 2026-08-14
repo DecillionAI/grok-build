@@ -264,13 +264,18 @@ function renderView() {
   if (W.view == null) return;
   W.view.clear();
   if (S.shot != null) {
-    // Victor's renderer reads the image URL from `src` (or `source`) as a PLAIN
-    // STRING — it stringifies whatever it gets, so the usual React-Native
-    // `source: { uri }` object would render as "[object Object]" and show
-    // nothing. Pass the data URI string directly. On web the <img> gets
-    // width:100% with auto height, so the screenshot keeps its aspect ratio and
-    // the scroll view pans a tall capture.
-    W.view.add(RN.image({ src: S.shot, style: { width: '100%', objectFit: 'contain' } }));
+    // Two things Victor's renderer needs that plain HTML does not:
+    //  1) the image URL goes in `src` as a PLAIN STRING (it stringifies whatever
+    //     it gets — a React-Native `source:{uri}` object becomes "[object Object]");
+    //  2) this is a real React-Native <Image>, which — unlike a DOM <img> — does
+    //     NOT auto-size from the image's natural dimensions: with no explicit
+    //     height it lays out at height 0 and shows nothing. So give it an explicit
+    //     height and `resizeMode:'contain'` to fit the capture keeping its aspect.
+    W.view.add(RN.image({
+      src: S.shot,
+      resizeMode: 'contain',
+      style: { width: '100%', height: 460, backgroundColor: '#000' }
+    }));
     return;
   }
   var empty = RN.column({ style: { alignItems: 'center', paddingTop: 48 } });
