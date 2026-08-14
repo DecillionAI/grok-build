@@ -256,8 +256,13 @@ function renderView() {
   if (W.view == null) return;
   W.view.clear();
   if (S.shot != null) {
-    // A tall image; the scroll view lets the whole capture be panned.
-    W.view.add(RN.image({ source: { uri: S.shot }, style: { width: '100%', height: 1400, resizeMode: 'contain' } }));
+    // Victor's renderer reads the image URL from `src` (or `source`) as a PLAIN
+    // STRING — it stringifies whatever it gets, so the usual React-Native
+    // `source: { uri }` object would render as "[object Object]" and show
+    // nothing. Pass the data URI string directly. On web the <img> gets
+    // width:100% with auto height, so the screenshot keeps its aspect ratio and
+    // the scroll view pans a tall capture.
+    W.view.add(RN.image({ src: S.shot, style: { width: '100%', objectFit: 'contain' } }));
     return;
   }
   var empty = RN.column({ style: { alignItems: 'center', paddingTop: 48 } });
