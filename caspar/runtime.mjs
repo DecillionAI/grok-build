@@ -45,6 +45,8 @@ import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
 import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
+import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.mjs";
+import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
@@ -174,29 +176,34 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
       .catch(() => {});
   };
 
-  // The space's creatures, exposed to Grok as an MCP server. Nothing is wired
-  // when the space has none: an agent handed tools that do not exist will promise
-  // capabilities it cannot deliver.
-  //
-  // The initial catalog is what we bake into the system prompt (the model has
-  // to see something on turn one). But every subsequent `search_tool` MCP call
-  // re-runs discovery live against the node's on-chain program index, so a
-  // tool a teammate attaches mid-conversation shows up on the next call.
-  // A short in-memory cache keeps a burst of search_tool calls from
-  // hammering the node — a slow node's discovery already backs off inside
-  // discoverSpaceCatalog.
-  const { tools: toolDefs, byName } = buildToolDefinitions(catalog);
-  // Live re-discovery is **stale-while-revalidate**: `tools/list` (grok's
-  // `search_tool`) is answered INSTANTLY from the last-known catalog, and a
-  // refresh runs in the background to pick up tools a teammate attached
-  // mid-conversation. This matters because `search_tool` is on the model's
-  // hot path — an earlier version awaited discovery on every call, and a
-  // single slow node round-trip there stalled the whole run at `search_tool`.
-  // The refresh is also cheap: program-index only (no per-member getCreature
-  // fan-out), short-bounded, and never throws into the list handler.
+  // The space's creatures plus two platform-owned media tools, exposed through
+  // one MCP server. `generate_media` is provider-neutral (OpenAI, Gemini,
+  // OpenRouter, xAI/custom-compatible routes); `share_media` attaches an
+  // existing internet URL or a file from the shared sandbox.
+  const initialCatalog = buildToolDefinitions(catalog);
+  const byName = initialCatalog.byName;
+  const platformToolDefs = [GENERATE_MEDIA_TOOL, SHARE_MEDIA_TOOL];
+  const reservedToolNames = new Set(platformToolDefs.map((tool) => tool.name));
+  const installCatalog = (rebuilt) => {
+    // `initialCatalog.byName` is the same Map object as `byName`; snapshot it
+    // before clearing so the first install does not erase external creatures.
+    const entries = [...rebuilt.byName];
+    byName.clear();
+    for (const [name, entry] of entries) {
+      if (!reservedToolNames.has(name)) byName.set(name, entry);
+    }
+    for (const tool of platformToolDefs) {
+      byName.set(tool.name, { name: tool.name, kind: "tool", category: "media" });
+    }
+    return [...rebuilt.tools.filter((tool) => !reservedToolNames.has(tool.name)), ...platformToolDefs];
+  };
+
+  // Live re-discovery is stale-while-revalidate: `tools/list` responds from the
+  // last catalog immediately and refreshes the space's external creatures in
+  // the background. Platform media tools are re-added after every refresh.
   const DISCOVERY_CACHE_MS = creatureNumber("DISCOVERY_CACHE_MS", 15000);
   const DISCOVERY_REFRESH_TIMEOUT_MS = creatureNumber("DISCOVERY_REFRESH_TIMEOUT_MS", 4000);
-  let lastToolDefs = toolDefs;
+  let lastToolDefs = installCatalog(initialCatalog);
   let lastDiscoveryAt = Date.now();
   let refreshInFlight = null;
   const startBackgroundRefresh = () => {
@@ -205,84 +212,89 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     refreshInFlight = (async () => {
       try {
         const discovered = await discoverSpaceCatalog(bridge, task, {
-          log: () => {}, // don't spam the boot log on every search_tool
+          log: () => {},
           programIndexOnly: true,
           timeoutMs: DISCOVERY_REFRESH_TIMEOUT_MS,
         });
         const liveCatalog = discovered.length ? mergeCatalogs(tools, discovered) : tools;
-        const rebuilt = buildToolDefinitions(liveCatalog);
-        // Swap the invoker's byName in place so freshly-discovered tools are
-        // callable without replacing the reference the ToolInvoker holds.
-        byName.clear();
-        for (const [k, v] of rebuilt.byName) byName.set(k, v);
-        lastToolDefs = rebuilt.tools;
+        lastToolDefs = installCatalog(buildToolDefinitions(liveCatalog));
         lastDiscoveryAt = Date.now();
       } catch {
-        // Best-effort: a slow/failed node refresh keeps the previous catalog.
-        lastDiscoveryAt = Date.now(); // back off so we don't hammer a sick node
+        lastDiscoveryAt = Date.now();
       } finally {
         refreshInFlight = null;
       }
     })();
   };
-  // Return immediately with what we have; kick the refresh off for NEXT time.
   const refreshCatalog = () => {
     startBackgroundRefresh();
     return lastToolDefs;
   };
-  let invoker = null;
+
+  let invoker = bridge ? new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "") : null;
   let socketServer = null;
   let sandboxBridge = null;
   let mcpServers;
   const tempDir = runTempDir();
   const extraEnv = {};
-  if (bridge && toolDefs.length) {
-    invoker = new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "");
-    const socketPath = path.join(tempDir, "tools.sock");
-    socketServer = new ToolSocketServer(socketPath, {
-      list: () => refreshCatalog(),
-      call: (name, args) => invoker.invoke(name, args),
-    });
-    try {
-      await socketServer.start();
-      mcpServers = {
-        [MCP_SERVER_NAME]: {
-          command: process.execPath,
-          args: [path.join(HERE, "mcpStdioServer.mjs")],
-          env: { CASPAR_TOOL_SOCKET: socketPath },
-          // A tool creature can be cold — the node may have to spawn its container
-          // before it answers — so the CLI must not give up on the server early.
-          startupTimeoutSec: creatureNumber("MCP_STARTUP_TIMEOUT", 60),
-          toolTimeoutSec: creatureNumber("TOOL_TIMEOUT", 240) + 60,
-        },
-      };
-    } catch (err) {
-      log("GROK_BOOT", { tool_bridge_error: String(err?.message || err) });
-      socketServer = null;
-    }
+  const sandboxToolName = bridge && creatureFlag("USE_SANDBOX_BACKEND", true)
+    ? detectSandboxTool(initialCatalog.tools, byName)
+    : null;
+  const mediaCollector = new OutboundMediaCollector({
+    localRoots: [workspace],
+    sandboxReader: async (sandboxPath) => {
+      if (!invoker || !sandboxToolName) throw new Error("this space has no shared sandbox to export that path from");
+      const reply = await invoker.invoke(sandboxToolName, { function: "read", path: sandboxPath });
+      if (!reply || reply.ok === false) throw new Error(reply?.error || "sandbox file export failed");
+      return reply.response;
+    },
+    log: (info) => log("GROK_MEDIA", info),
+  });
+  const mediaGenerator = new ProviderMediaGenerator({ llm: config.llm, collector: mediaCollector });
 
-    // If the space has a sandbox creature attached, stand up the sandbox
-    // bridge socket too. The grok binary's `SandboxTerminalBackend` /
-    // `SandboxFileSystem` connect to this socket for every built-in shell +
-    // file call, so the agent works on the shared VM instead of the CLI's
-    // private container. This is what makes `bash`, `read_file`, `edit`,
-    // `list_dir`, `task` / `get_task_output` / `kill_task` execute against
-    // the space's sandbox without the model having to reach for a separate
-    // MCP tool. Detection uses the same heuristic as the system-prompt
-    // "shared environment" hint below — no hardcoded program id.
-    const sandboxToolName = creatureFlag("USE_SANDBOX_BACKEND", true)
-      ? detectSandboxTool(toolDefs, byName)
-      : null;
-    if (sandboxToolName) {
-      const sandboxSocketPath = path.join(tempDir, "sandbox.sock");
-      sandboxBridge = new SandboxBridgeServer(sandboxSocketPath, invoker, sandboxToolName);
-      try {
-        await sandboxBridge.start();
-        extraEnv.GROK_SANDBOX_SOCKET = sandboxSocketPath;
-      } catch (err) {
-        log("GROK_BOOT", { sandbox_bridge_error: String(err?.message || err) });
-        sandboxBridge = null;
-      }
+  // The platform media tools exist even in a space with no attached creature,
+  // so the local MCP socket is always useful. External calls still require the
+  // Caspar bridge and return a clear error when it is unavailable.
+  const socketPath = path.join(tempDir, "tools.sock");
+  socketServer = new ToolSocketServer(socketPath, {
+    list: () => refreshCatalog(),
+    call: (name, args) => {
+      if (name === GENERATE_MEDIA_TOOL.name) return mediaGenerator.generate(args);
+      if (name === SHARE_MEDIA_TOOL.name) return mediaCollector.share(args);
+      if (!invoker) return { ok: false, error: `tool ${name} needs a live Caspar bridge` };
+      return invoker.invoke(name, args);
+    },
+  });
+  try {
+    await socketServer.start();
+    mcpServers = {
+      [MCP_SERVER_NAME]: {
+        command: process.execPath,
+        args: [path.join(HERE, "mcpStdioServer.mjs")],
+        env: { CASPAR_TOOL_SOCKET: socketPath },
+        startupTimeoutSec: creatureNumber("MCP_STARTUP_TIMEOUT", 60),
+        toolTimeoutSec: Math.max(
+          creatureNumber("TOOL_TIMEOUT", 240) + 60,
+          creatureNumber("MEDIA_VIDEO_WAIT_SECONDS", 240) + 60,
+        ),
+      },
+    };
+  } catch (err) {
+    log("GROK_BOOT", { tool_bridge_error: String(err?.message || err) });
+    socketServer = null;
+  }
+
+  // If the space has a sandbox creature attached, also swap Grok's built-in
+  // filesystem and shell over to that shared machine.
+  if (invoker && sandboxToolName) {
+    const sandboxSocketPath = path.join(tempDir, "sandbox.sock");
+    sandboxBridge = new SandboxBridgeServer(sandboxSocketPath, invoker, sandboxToolName);
+    try {
+      await sandboxBridge.start();
+      extraEnv.GROK_SANDBOX_SOCKET = sandboxSocketPath;
+    } catch (err) {
+      log("GROK_BOOT", { sandbox_bridge_error: String(err?.message || err) });
+      sandboxBridge = null;
     }
   }
 
@@ -299,7 +311,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // stops it from inventing compound tool names like
   // `caspar__vercel_sandbox_exec` and then telling the user it "doesn't have
   // access to that action". See prompt.capabilitiesPreamble.
-  const capabilities = toolDefs.map((t) => {
+  const capabilities = lastToolDefs.map((t) => {
     const entry = byName.get(t.name) || {};
     return {
       name: qualify(t.name),
@@ -314,7 +326,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // filesystem/shell as the collaborative workspace, not its private local dir.
   // Recognised by the descriptor the platform publishes (category "execution")
   // or a sandbox-shaped name — no hardcoded program id.
-  const sharedEnvDef = toolDefs.find((t) => {
+  const sharedEnvDef = lastToolDefs.find((t) => {
     const entry = byName.get(t.name) || {};
     const category = String(entry.category || "").toLowerCase();
     const name = String(entry.name || t.name).toLowerCase();
@@ -371,7 +383,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     workspace,
     objective_chars: objective.length,
     history_turns: Array.isArray(task.history) ? task.history.length : 0,
-    tools: toolDefs.map((t) => t.name),
+    tools: lastToolDefs.map((t) => t.name),
     shared_env: sharedEnv?.name,
     sandbox_backend: sandboxActive || undefined,
     disallowed_builtins: disallowedTools.length ? disallowedTools : undefined,
@@ -442,6 +454,18 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   if (!run.result && !run.timedOut) {
     log("GROK_NORESULT", { exitCode: run.exitCode, messageTypes, stdoutTail: (run.stdoutTail || "").slice(-800), backbone: run.backbone });
   }
+  mediaCollector.allowLocalRoot(run.grokHome);
+  try {
+    await mediaCollector.collectGenerated(run.messages);
+  } catch (err) {
+    log("GROK_MEDIA", { collect_error: String(err?.message || err) });
+  }
+  const outboundAttachments = mediaCollector.attachments();
+  if (outboundAttachments.length) {
+    log("GROK_MEDIA", {
+      outbound: outboundAttachments.map(({ name, mimeType, kind, size, source }) => ({ name, mimeType, kind, size, source })),
+    });
+  }
   const result = buildResult(objective, run.result, mapper, {
     durationMs: Date.now() - started,
     timedOut: run.timedOut,
@@ -452,6 +476,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     sessionId: initMessage?.session_id,
     initMessage,
     warnings: run.warnings,
+    attachments: outboundAttachments,
   });
   if (run.stderr?.trim()) log("GROK_STDERR", { tail: run.stderr.trim().split("\n").slice(-6) });
   process.stdout.write(`DAVINCI_RESULT ${JSON.stringify(result)}\n`);

@@ -233,7 +233,7 @@ export function platformKeyFor(providerId, env = process.env) {
 }
 
 /** Providers whose admin-configured platform key we hydrate from the secret store. */
-export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter"];
+export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "mistral", "together"];
 
 /**
  * Hydrate the admin-configured platform LLM keys from the on-chain **secret
@@ -783,9 +783,9 @@ export async function runGrok(opts) {
 
   const argv = [command, ...args];
   if (outcome instanceof Error) {
-    return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv, warnings, stdoutTail, backbone, sessionId };
+    return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
   }
-  return { result, messages, exitCode: outcome, timedOut, stderr, argv, warnings, stdoutTail, backbone, sessionId };
+  return { result, messages, exitCode: outcome, timedOut, stderr, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
 }
 
 /**

@@ -141,6 +141,9 @@ export function buildResult(objective, grokResult, mapper, extra = {}) {
     sessionId: sessionId || grokResult?.session_id || undefined,
   };
   if (!succeeded) result.error = failure;
+  if (Array.isArray(extra.attachments) && extra.attachments.length) {
+    result.attachments = extra.attachments;
+  }
   if (warnings.length) result.warnings = warnings;
   if (Array.isArray(grokResult?.permission_denials) && grokResult.permission_denials.length) {
     result.permission_denials = grokResult.permission_denials.map((d) => d?.tool_name).filter(Boolean);

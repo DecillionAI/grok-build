@@ -38,8 +38,10 @@ import { renderConfigToml } from "../grokConfig.mjs";
 import { applyLlmOverride, buildChildEnv, defaultLlm } from "../grokRunner.mjs";
 import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
+import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
+import { OutboundMediaCollector } from "../outboundMedia.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
-import { normalizeUsage } from "../result.mjs";
+import { buildResult, normalizeUsage } from "../result.mjs";
 import { buildHistoryTurns, fetchSpaceHistoryRecords } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
 import { ToolInvoker } from "../toolInvoker.mjs";
@@ -265,6 +267,104 @@ await check("history reaches the prompt with [From → To] annotations", () => {
   assert.match(prompt, /CURRENT MESSAGE TO ANSWER ===\nwhat's the status\?/);
 });
 
+await check("OpenAI GPT-family image generation uses the Responses image tool and attaches its bytes", async () => {
+  const calls = [];
+  const collector = new OutboundMediaCollector();
+  const generator = new ProviderMediaGenerator({
+    llm: { provider: "openai", models: ["gpt-5.4"], api_key: "sk-agent" },
+    collector,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({
+        output: [{ type: "image_generation_call", result: Buffer.from("openai-image").toString("base64") }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  const result = await generator.generate({ modality: "image", prompt: "A green orbital habitat", format: "png" });
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, "openai");
+  assert.equal(result.model, "gpt-5.4", "the selected GPT model performs the generation");
+  assert.match(calls[0].url, /\/responses$/);
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.tools[0].type, "image_generation");
+  assert.equal(body.tool_choice.type, "image_generation");
+  assert.equal(calls[0].init.headers.authorization, "Bearer sk-agent");
+  assert.equal(collector.attachments()[0].dataBase64, Buffer.from("openai-image").toString("base64"));
+});
+
+await check("media generation falls back from a non-output LLM to configured Gemini audio and wraps PCM as WAV", async () => {
+  const calls = [];
+  const collector = new OutboundMediaCollector();
+  const generator = new ProviderMediaGenerator({
+    llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "sk-anthropic" },
+    env: { GROK_CREATURE_LLM_KEY_GEMINI: "gemini-platform" },
+    collector,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: Buffer.from([1, 2, 3, 4]).toString("base64") } }] } }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  const result = await generator.generate({ modality: "audio", prompt: "Welcome to Decillion", voice: "Kore" });
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, "gemini", "Anthropic has no media-output route, so a configured provider is selected");
+  assert.match(calls[0].url, /\/v1beta\/models\/gemini-3\.1-flash-tts-preview:generateContent$/);
+  assert.equal(calls[0].init.headers["x-goog-api-key"], "gemini-platform");
+  const bytes = Buffer.from(collector.attachments()[0].dataBase64, "base64");
+  assert.equal(bytes.subarray(0, 4).toString(), "RIFF");
+  assert.equal(bytes.subarray(8, 12).toString(), "WAVE");
+});
+
+await check("OpenRouter asynchronous video generation is polled and attached as video", async () => {
+  const calls = [];
+  const collector = new OutboundMediaCollector();
+  const generator = new ProviderMediaGenerator({
+    llm: { provider: "openrouter", models: ["openai/gpt-5.4"], api_key: "or-agent" },
+    collector,
+    sleep: async () => {},
+    fetchImpl: async (url, init) => {
+      const href = String(url);
+      calls.push({ url: href, method: init.method });
+      if (init.method === "POST") {
+        return new Response(JSON.stringify({ id: "video-1", status: "queued" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (href.includes("/content?")) {
+        return new Response(Buffer.from("mp4-bytes"), { status: 200, headers: { "content-type": "video/mp4" } });
+      }
+      return new Response(JSON.stringify({ id: "video-1", status: "completed" }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+
+  const result = await generator.generate({ modality: "video", prompt: "A robot crossing a salt flat", aspect_ratio: "16:9", duration: 5 });
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, "openrouter");
+  assert.equal(result.model, "google/veo-3.1-lite");
+  assert.equal(calls.length, 3, "submit, poll, then download");
+  assert.equal(collector.attachments()[0].kind, "video");
+  assert.equal(Buffer.from(collector.attachments()[0].dataBase64, "base64").toString(), "mp4-bytes");
+});
+
+await check("a failed provider request is not retried against another billable provider", async () => {
+  let requests = 0;
+  const generator = new ProviderMediaGenerator({
+    llm: { provider: "openai", models: ["gpt-5.4"], api_key: "sk-agent" },
+    env: { GROK_CREATURE_LLM_KEY_GEMINI: "gemini-platform" },
+    collector: new OutboundMediaCollector(),
+    fetchImpl: async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ error: { message: "policy rejected" } }), { status: 400, headers: { "content-type": "application/json" } });
+    },
+  });
+  const result = await generator.generate({ modality: "image", prompt: "test" });
+  assert.equal(result.ok, false);
+  assert.equal(result.provider, "openai");
+  assert.equal(requests, 1, "a possibly billed failure must not spill into Gemini");
+  assert.match(result.hint, /not retried/);
+});
+
 await check("the tool catalog becomes MCP tools with pinned platform defaults", () => {
   const catalog = [
     {
@@ -298,6 +398,24 @@ await check("token usage maps to what the platform bills", () => {
   assert.equal(usage.promptTokens, 1010);
   assert.equal(usage.completionTokens, 40);
   assert.equal(usage.totalTokens, 1050);
+});
+
+await check("terminal results preserve generated attachments for the Decillion uploader", () => {
+  const attachment = {
+    name: "generated.png",
+    mimeType: "image/png",
+    kind: "image",
+    size: 3,
+    dataBase64: Buffer.from("png").toString("base64"),
+    source: "generated",
+  };
+  const result = buildResult(
+    "draw it",
+    { subtype: "success", is_error: false, result: "Here it is.", usage: {} },
+    { seq: 0, toolCallCount: 0, todos: [] },
+    { attachments: [attachment] },
+  );
+  assert.deepEqual(result.attachments, [attachment]);
 });
 
 await check("an agent's own API key takes over the run from the image's credentials", () => {
@@ -723,7 +841,9 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.match(invocation.rules, /Tina, the release manager/);
   assert.match(invocation.prompt, /CURRENT MESSAGE TO ANSWER/);
   assert.ok(invocation.grokHome, "the run gets its own GROK_HOME");
-  assert.equal(/\[mcp_servers/.test(invocation.config), false, "no MCP server is wired when the space has no creatures");
+  assert.equal(/\[mcp_servers/.test(invocation.config), true, "platform media tools keep the MCP server available without space creatures");
+  assert.match(invocation.rules, /caspar__generate_media/, "the provider-neutral generation tool is explained to the agent");
+  assert.match(invocation.rules, /caspar__share_media/, "the outbound sharing tool is explained to the agent");
   assert.equal(invocation.tools, undefined, "no --tools allowlist: it would strip the planning/web built-ins");
   assert.ok((invocation.disallowedTools || "").includes("run_terminal_cmd"), "the local shell/file built-ins are denied");
   const promptPath = invocation.argv[invocation.argv.indexOf("--prompt-file") + 1] || "";
@@ -903,6 +1023,7 @@ await check("a space's creatures are wired into the run as an MCP server", async
   assert.match(invocation.config, /\[mcp_servers\.caspar\]/);
   assert.match(invocation.config, /mcpStdioServer\.mjs/);
   assert.match(invocation.config, /CASPAR_TOOL_SOCKET = "/);
+  assert.match(invocation.rules, /caspar__project_sandbox/, "platform tools must not erase the space's external creature catalog");
 });
 
 await check("a native/default-backbone run still gets a bounded idle timeout + retries", async () => {
