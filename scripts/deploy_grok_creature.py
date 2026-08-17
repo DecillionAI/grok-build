@@ -117,6 +117,7 @@ from caspar_deploy_common import (  # noqa: E402
     bad,
     bake_snippet,
     docker_cli,
+    ensure_docker_program,
     image_built_for_context,
     docker_image_id,
     env_any,
@@ -446,19 +447,57 @@ def report_not_ready(logs) -> None:
         print(f"    | {line[:400]}", flush=True)
 
 
-def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) -> Dict[str, str]:
+def resolve_program(client: CasparSignalingClient, operator_id: str, reuse_id: str) -> Dict[str, str]:
+    """Resolve the backbone program without ever treating an error as absence.
+
+    A manifest id is reused only when authoritative program and creature lists
+    prove that it exists and belongs to this deploy owner. If that id is
+    genuinely absent, the stable m-grok-build machine is upserted. A
+    foreign-owned id is an ownership error, never a cue to mint a duplicate.
+    """
+    programs = client.list_programs()
+    creatures = {str(c.get("id") or ""): c for c in client.list_creatures()}
+    if reuse_id:
+        row = next((p for p in programs if str(p.get("id") or "") == reuse_id), None)
+        if row is not None:
+            creature_id = str(row.get("machineId") or row.get("machine_id") or "")
+            machine = creatures.get(creature_id)
+            if machine is None:
+                raise RuntimeError(
+                    f"backbone program {reuse_id} points to missing machine {creature_id}; "
+                    "refusing to guess that the program is absent"
+                )
+            owner = str(machine.get("ownerId") or machine.get("owner_id") or "")
+            if owner != operator_id:
+                raise RuntimeError(
+                    f"backbone program {reuse_id} exists but its machine {creature_id} is owned by "
+                    f"{owner!r}, not deploy owner {operator_id!r}; refusing to re-mint"
+                )
+            info(f"reusing manifest backbone program {reuse_id} (machine {creature_id}, owner verified)")
+            return {"creature_id": creature_id, "program_id": reuse_id}
+        warn(f"recorded backbone program {reuse_id} is genuinely absent; using the stable-name create path")
+
+    creature_id, program_id = ensure_docker_program(
+        client,
+        operator_id,
+        machine_name="m-grok-build",
+        program_path="/grok-build",
+        comment="grok build agent",
+    )
+    return {"creature_id": creature_id, "program_id": program_id}
+
+
+def deploy(
+    client: CasparSignalingClient,
+    *,
+    creature_id: str,
+    program_id: str,
+    entity_id: str,
+) -> Dict[str, str]:
     """Deploy (or redeploy) the creature entity; returns the ids it landed on."""
-    creature_id = ""
-    prev_image_id = ""
-    if program_id:
-        info(f"redeploying the grok-build entity onto existing program {program_id} (entity {entity_id}) — no new creature")
-        # Capture the image id BEFORE the rebuild so the wait can detect a change.
-        prev_image_id = docker_image_id(program_id, entity_id)
-    else:
-        suffix = os.urandom(4).hex()
-        creature_id = client.create_machine_creature(f"m-grok-build-{suffix}")
-        program_id = client.create_program(creature_id, "/grok-build", "docker", "grok build agent")
-        info(f"created machine creature {creature_id} and program {program_id}")
+    info(f"redeploying the grok-build entity onto program {program_id} (entity {entity_id})")
+    # Capture the image id BEFORE the rebuild so the wait can detect a change.
+    prev_image_id = docker_image_id(program_id, entity_id)
 
     context = bundle_tar_gz()
     encoded_mb = len(context) * 4 / 3 / 1048576
@@ -521,7 +560,13 @@ def main() -> int:
 
     reuse_pid = env_any("GROK_REUSE_PROGRAM_ID", "DAVINCI_REUSE_PROGRAM_ID", "CLAUDE_REUSE_PROGRAM_ID")
     try:
-        deployed = deploy(client, program_id=reuse_pid, entity_id=ENTITY_ID)
+        resolved = resolve_program(client, operator_id, reuse_pid)
+        deployed = deploy(
+            client,
+            creature_id=resolved["creature_id"],
+            program_id=resolved["program_id"],
+            entity_id=ENTITY_ID,
+        )
     except Exception as exc:  # noqa: BLE001
         bad(f"deploy failed: {exc}")
         client.close()

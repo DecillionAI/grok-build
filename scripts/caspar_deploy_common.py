@@ -187,9 +187,9 @@ def resolve_operator(client) -> str:
       3. A fresh ``login(DEPLOY_USER)``, whose resulting identity is then persisted
          so runs 2+ take path (2).
     """
-    op_id = env_any("CASPAR_OPERATOR_ID", "CASPAR_OPERATOR_USER_ID")
+    op_id = env_any("CASPAR_OPERATOR_ID", "CASPAR_OPERATOR_USER_ID", "OWNER_ID")
     op_key = _resolve_operator_key(
-        os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY", ""),
+        env_any("CASPAR_OPERATOR_PRIVATE_KEY", "OWNER_PRIVATE_KEY"),
         os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY_B64", ""),
     )
     if op_id and op_key:
@@ -197,13 +197,18 @@ def resolve_operator(client) -> str:
         ok(f"deploy operator from env: {op_id} (pinned; redeploys reuse this account and never re-mint)")
         return op_id
     if op_id and not op_key:
-        # A half-configured pin is the classic cause of "still re-minting despite
-        # pinning": the id is set, the key never arrived (or was unreadable), so we
-        # fall back to the file/login path and drift. Make it LOUD instead of silent.
-        warn(f"CASPAR_OPERATOR_ID={op_id} is set but no usable private key was provided. "
-             "The pinned operator is NOT in effect — falling back to the persisted file / login, "
-             "which is what causes tool programs to re-mint. Set CASPAR_OPERATOR_PRIVATE_KEY_B64 to the "
-             "base64 of the PEM (base64 -w0 < operator.pem); a raw or \\n-escaped PEM is also accepted.")
+        raise RuntimeError(
+            f"deploy owner {op_id} was supplied without a usable private key; refusing to fall back "
+            "to another identity. Set OWNER_PRIVATE_KEY/CASPAR_OPERATOR_PRIVATE_KEY (or the _B64 form)."
+        )
+    if op_key and not op_id:
+        raise RuntimeError("a deploy private key was supplied without OWNER_ID/CASPAR_OPERATOR_ID")
+
+    if truthy(env_any("CASPAR_REQUIRE_PINNED_OPERATOR", default="0")):
+        raise RuntimeError(
+            "this deploy requires the pinned node-owner identity, but OWNER_ID/OWNER_PRIVATE_KEY "
+            "(or their CASPAR_OPERATOR_* aliases) were not both available"
+        )
 
     path = _operator_identity_path()
     saved = _read_identity(path)
@@ -253,42 +258,38 @@ def ensure_docker_program(
       a freshly-reproduced node).
     * Never re-mint: a stable-named machine owned by a different account is fatal.
     """
-    source = operator_id.split("@", 1)[1] if "@" in operator_id else "global"
-    username = f"{machine_name}@{source}"
     # Re-find the machine by enumerating creatures and matching the unqualified
     # local part — getByUsername can't (the node stores + uniquely indexes the
     # username qualified with its own source, which getByUsername doesn't match),
     # so a redeploy would miss the machine it already owns and then collide on
     # create with "creature username already exists". Prefer an operator-owned
     # match; remember a foreign-owned one so the ownership guard below can report
-    # it clearly. Fall back to the raw getByUsername probe only if listing fails.
+    # it clearly. The list call is authoritative: if it fails, propagate the
+    # failure instead of turning "unknown" into "absent" and creating a duplicate.
     want = machine_name[:32]
     existing = None
     foreign = None
-    try:
-        for c in client.list_creatures():
-            uname = str(c.get("username") or "")
-            if uname.split("@", 1)[0] != want and uname != want:
-                continue
-            cid = str(c.get("id") or "")
-            if not cid:
-                continue
-            owner = str(c.get("ownerId") or c.get("owner_id") or "")
-            entry = {"id": cid, "ownerId": owner}
-            if owner == operator_id:
-                existing = entry
-                break
-            foreign = foreign or entry
-    except Exception:  # noqa: BLE001 — fall through to the raw probe
-        existing = None
+    for c in client.list_creatures():
+        uname = str(c.get("username") or "")
+        if uname.split("@", 1)[0] != want and uname != want:
+            continue
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        owner = str(c.get("ownerId") or c.get("owner_id") or "")
+        entry = {"id": cid, "ownerId": owner}
+        if owner == operator_id:
+            existing = entry
+            break
+        foreign = foreign or entry
     if existing is None:
-        existing = foreign or client.get_by_username(username) or client.get_by_username(want)
+        existing = foreign
     if existing:
         creature_id = str(existing.get("id") or "")
         owner = str(existing.get("ownerId") or existing.get("owner_id") or "")
         if owner != operator_id:
             raise RuntimeError(
-                f"machine {username} exists but is owned by {owner!r}, not the deploy operator "
+                f"machine {machine_name} exists but is owned by {owner!r}, not the deploy operator "
                 f"{operator_id!r}. Refusing to re-mint. Deploy as the owning operator (one operator for "
                 f"the backbone and every tool), or wipe the node so its state is reproduced under it."
             )
@@ -303,6 +304,9 @@ def ensure_docker_program(
         program_id = client.create_program(creature_id, program_path, "docker", comment)
         info(f"reusing machine {creature_id}, created its program {program_id}")
         return creature_id, program_id
+    # We reached creation only after a successful, exhaustive list proved the
+    # stable machine name absent. A race is still possible; never mask the
+    # create rejection as a reason to invent another username.
     creature_id = client.create_machine_creature(machine_name)
     program_id = client.create_program(creature_id, program_path, "docker", comment)
     info(f"created machine creature {creature_id} and program {program_id} (first deploy of {machine_name})")

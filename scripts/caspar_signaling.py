@@ -199,9 +199,17 @@ class CasparSignalingClient:
         owner (``ownerId``)."""
         r = self.send("/creatures/getByUsername", {"username": username})
         if r.get("_res_code", -1) != 0:
-            return None  # "user not found" (or any error) — treat as absent
+            # Only the action's explicit not-found result means absence. An
+            # auth failure, timeout, malformed response, or unavailable node is
+            # not evidence that creating another creature is safe.
+            error = str(r.get("error") or r.get("message") or r.get("raw") or "").strip().lower()
+            if error == "user not found":
+                return None
+            raise RuntimeError(f"getByUsername({username}) failed: {r}")
         user = r.get("user")
-        return user if isinstance(user, dict) else None
+        if not isinstance(user, dict) or not user.get("id"):
+            raise RuntimeError(f"getByUsername({username}) returned a malformed success response: {r}")
+        return user
 
     def list_programs(self, offset: int = 0, count: int = 100000) -> List[Dict[str, Any]]:
         """Every program on the node as ``{id, machineId, …}`` rows.
@@ -209,10 +217,12 @@ class CasparSignalingClient:
         Used to resolve a machine creature's docker program by its ``machineId``,
         so a redeploy lands on the same program the machine already owns."""
         r = self.send("/programs/list", {"offset": offset, "count": count})
-        if not isinstance(r, dict):
-            return []
+        if not isinstance(r, dict) or r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"list programs failed: {r}")
         rows = r.get("machines")
-        return rows if isinstance(rows, list) else []
+        if not isinstance(rows, list):
+            raise RuntimeError(f"list programs returned a malformed success response: {r}")
+        return rows
 
     def list_creatures(self, offset: int = 0, count: int = 100000) -> List[Dict[str, Any]]:
         """Every creature on the node as ``{id, username, ownerId}`` rows.
@@ -225,10 +235,12 @@ class CasparSignalingClient:
         the unqualified local part sidesteps that — the same fix the Nest wasm
         deployer uses (see ``deployer.ts`` ``creatureNames``)."""
         r = self.send("/creatures/list", {"offset": offset, "count": count})
-        if not isinstance(r, dict):
-            return []
+        if not isinstance(r, dict) or r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"list creatures failed: {r}")
         rows = r.get("creatures")
-        return rows if isinstance(rows, list) else []
+        if not isinstance(rows, list):
+            raise RuntimeError(f"list creatures returned a malformed success response: {r}")
+        return rows
 
     def deploy(self, program_id: str, entity_id: str, entity_type: str,
                primary_b64: str, files_b64: Optional[Dict[str, str]] = None,
