@@ -161,9 +161,15 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   const stepTarget = streamTo || replyTo;
   const streamSteps = Boolean(bridge && stepTarget && creatureFlag("STREAM_STEPS", true));
 
+  // When the stream last carried anything to the client. A real step resets it;
+  // the heartbeat below uses it to tell "actively working but quiet" (a long tool
+  // call or model turn) from "the run went away", so the client's own idle
+  // watchdog never kills a healthy-but-silent run.
+  let lastStreamAt = Date.now();
   const emit = (event) => {
     process.stdout.write(`DAVINCI_TRACE ${JSON.stringify(event)}\n`);
     if (!streamSteps) return;
+    lastStreamAt = Date.now();
     // Best-effort: a step that cannot be delivered must never break the run —
     // the authoritative result is still signalled at the end.
     bridge
@@ -175,6 +181,30 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
         seq: event.seq,
         channel: event.channel,
         event,
+      })
+      .catch(() => {});
+  };
+
+  // A lightweight keep-alive pushed on the same stream while a run is in flight.
+  // Grok goes silent for the whole duration of a long tool call (a sandbox
+  // `exec`/build can run minutes) or a long model turn, and a client that only
+  // watched wall-clock time would give up mid-progress. The heartbeat carries no
+  // trajectory content (empty `heartbeat` channel — the app renders nothing new
+  // for it) but proves the run is alive, so the client resets its inactivity
+  // timer instead of timing the run out. It never writes a DAVINCI_TRACE line, so
+  // it does not spam the VM logs.
+  const heartbeatMs = Math.max(0, creatureNumber("STREAM_HEARTBEAT_MS", 25000));
+  const sendHeartbeat = () => {
+    if (!streamSteps || Date.now() - lastStreamAt < heartbeatMs) return;
+    lastStreamAt = Date.now();
+    bridge
+      .signalUser("creatures/signal", String(stepTarget), {
+        kind: "davinci/step",
+        stream: true,
+        final: false,
+        correlationId,
+        channel: "heartbeat",
+        event: { kind: "heartbeat", ts: lastStreamAt },
       })
       .catch(() => {});
   };
@@ -399,6 +429,12 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     max_wall_seconds: maxWallSeconds,
   });
 
+  // Keep the stream alive for the duration of the run so a long, quiet stretch
+  // (a minutes-long tool call, a long model turn) does not look like a stall to
+  // the client. Only meaningful when we are actually streaming to someone.
+  const heartbeatTimer = streamSteps && heartbeatMs > 0 ? setInterval(sendHeartbeat, heartbeatMs) : null;
+  if (heartbeatTimer && typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+
   let run;
   try {
     run = await runGrok({
@@ -435,6 +471,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   } catch (err) {
     run = { result: null, messages: [], exitCode: null, timedOut: false, stderr: String(err?.message || err), warnings: [] };
   } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (sandboxBridge) await sandboxBridge.stop();
     if (socketServer) await socketServer.stop();
     if (invoker) invoker.dispose();
