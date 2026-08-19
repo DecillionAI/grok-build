@@ -7,7 +7,7 @@
  * `AsyncFileSystem` — and normally hit the container the CLI itself runs in.
  * For Decillion agents that container is private and ephemeral, so we swap the
  * backend for one that forwards every call to the space's shared cloud sandbox
- * (the `vercel_sandbox` creature). Then `bash /app/build.sh` in one subagent
+ * (the `sandbox` creature). Then `bash /app/build.sh` in one subagent
  * and `pytest -q` in another are just two POSTs to the same VM — no per-agent
  * workspace magic, no shell replacement.
  *
@@ -16,10 +16,10 @@
  *   grok binary (Rust `CasparSandboxTerminalBackend` / `CasparSandboxFileSystem`)
  *      │  NDJSON over unix socket
  *      ▼
- *   sandboxBridge.mjs  ── ToolInvoker (Caspar signal) ──▶ vercel_sandbox creature
+ *   sandboxBridge.mjs  ── ToolInvoker (Caspar signal) ──▶ sandbox creature
  *                                                            │
  *                                                            ▼
- *                                                     Vercel Sandbox microVM
+ *                                                     Modal / Vercel microVM
  *
  * The socket path (see `SandboxBridgeServer.socketPath`) is set on the grok
  * child as `GROK_SANDBOX_SOCKET`; the Rust backend connects on first use.
@@ -40,10 +40,10 @@
  *   ← { "id": 1, "ok": true,  "result": { … creature response … } }
  *   ← { "id": 2, "ok": false, "error": "no sandbox creature bound to this space" }
  *
- * Every op maps 1:1 onto a `vercel_sandbox` action (see its tool.py). The
+ * Every op maps 1:1 onto a `sandbox` action (see its tool.py). The
  * platform pins `space_id` into every call through the catalog's `defaults`,
  * so an agent can never reach another space's sandbox by naming a different
- * id — same guarantee as `caspar__vercel_sandbox` reached via MCP.
+ * id — same guarantee as `caspar__sandbox` reached via MCP.
  *
  * Cancellation: closing the client socket kills all pending requests for that
  * connection. The grok CLI cancels a turn by dropping the socket, which is why

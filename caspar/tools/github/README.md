@@ -11,7 +11,7 @@ Victor "GitHub" mini-app ─host.call▶ Nest ─signal(as the user)▶ github c
      (the space desktop)             (space_id + sandbox pinned)      │
 space agents ─Davinci bridge▶ signal ──────────────────────────────────┤
                                                                         │ signal(exec/read/write)
-                                                          vercel_sandbox creature ─▶ the space's machine
+                                                          sandbox creature ─▶ the space's machine
 ```
 
 One creature serves **every** space; the binding is per-space state (the OAuth
@@ -22,7 +22,7 @@ space and any space that adds the tool from its tool-management page gets it.
 
 This creature keeps **no repository files of its own**. Every clone, fetch, pull,
 push, commit, branch, merge and every file read/write/delete happens on the
-space's **vercel_sandbox** creature — the same machine the space's agents and the
+space's **sandbox** creature — the same machine the space's agents and the
 Files desktop use — reached by signalling that creature over Caspar
 (`bridge.invoke_tool` → the sandbox's `exec`/`read`/`write`/`list_dir`). So a repo
 cloned here is on the one shared filesystem everyone in the space sees, under

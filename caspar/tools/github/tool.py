@@ -851,17 +851,17 @@ def _number(payload: Dict[str, Any]) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Git + filesystem — run on the space's vercel_sandbox creature over signalling
+# Git + filesystem — run on the space's sandbox creature over signalling
 # --------------------------------------------------------------------------- #
 #
 # The github tool NEVER touches its own container filesystem for repository work.
 # Every clone / fetch / pull / push / commit / branch / merge and every file
-# read/write/list happens on the space's **vercel_sandbox** creature — the same
+# read/write/list happens on the space's **sandbox** creature — the same
 # machine the space's agents and the Files desktop use — reached by signalling
 # that creature over Caspar (bridge.invoke_tool). So a repo an agent clones here
 # is the repo everyone in the space sees, on one shared filesystem.
 
-SANDBOX_ENTITY = os.environ.get("GITHUB_SANDBOX_ENTITY", "vercel_sandbox")
+SANDBOX_ENTITY = os.environ.get("GITHUB_SANDBOX_ENTITY", "sandbox")
 # Where clones live on the sandbox, relative to its home directory.
 REPO_ROOT = os.environ.get("GITHUB_SANDBOX_REPO_ROOT", "github")
 SANDBOX_TIMEOUT_S = int(os.environ.get("GITHUB_SANDBOX_TIMEOUT_S", "300"))
@@ -949,7 +949,7 @@ def _is_sandbox_descriptor(d: Dict[str, Any]) -> bool:
     tool_id = str(d.get("tool_id") or "").lower()
     if "github" in name or "github" in tool_id:
         return False  # never mistake ourselves for the sandbox
-    if "sandbox" in name or "vercel_sandbox" in tool_id:
+    if "sandbox" in name or "sandbox" in tool_id:
         return True
     cats = [str(c).lower() for c in (d.get("categories") or [])]
     return str(d.get("category") or "").lower() == "execution" or "execution" in cats
@@ -1003,7 +1003,7 @@ def _program_is_sandbox(rec: Dict[str, Any]) -> bool:
     name = str(meta.get("name") or rec.get("name") or "").lower()
     if "github" in name:
         return False
-    return "sandbox" in name or "vercel_sandbox" in name
+    return "sandbox" in name
 
 
 def _read_platform_registry() -> List[Dict[str, Any]]:
@@ -1045,7 +1045,7 @@ def _registry_entry_is_sandbox(entry: Dict[str, Any]) -> bool:
     d = entry.get("descriptor") if isinstance(entry.get("descriptor"), dict) else None
     if d and _is_sandbox_descriptor(d):
         return True
-    return "sandbox" in key or "sandbox" in name or "vercel_sandbox" in key
+    return "sandbox" in key or "sandbox" in name
 
 
 def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:

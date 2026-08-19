@@ -7,14 +7,15 @@ space is created and to destroy it when the space is deleted, and publishes it i
 the space so every agent there discovers it as a tool. The binding is the sandbox's
 *name*, derived from the space id, so no party has to store a mapping.
 
-The creature (`caspar/tools/vercel_sandbox`) and the shared tool runtime
+The creature (`caspar/tools/sandbox`) and the shared tool runtime
 (`caspar/tools/_runtime`) live in this repository because this repository is the
 platform's agent backbone: deploying agents and deploying the machine they work on
 should not need two checkouts.
 
-The Vercel credentials are read from this process's environment and **baked into
-the creature image**, so they never travel in a signal payload an agent's prompt
-could influence, and are never written to the repo.
+The Modal/Vercel credentials are read from this process's environment and **baked
+into the creature image**, so they never travel in a signal payload an agent's
+prompt could influence, and are never written to the repo. Whichever provider's
+key is baked in selects the backbone at runtime (Modal wins over Vercel).
 
 Environment
 -----------
@@ -31,18 +32,21 @@ Environment
     (the program is resolved deterministically by the tool's stable machine
      username — see caspar_deploy_common.ensure_docker_program — so there is no
      reuse-id env and no re-mint: a redeploy always re-finds its own program.)
-    SANDBOX_TOOL_ENTITY_ID    entity id (default vercel_sandbox)
+    SANDBOX_TOOL_ENTITY_ID    entity id (default sandbox)
     SANDBOX_RUN_ENTITY        1 (default) to start it serving after the deploy
     SANDBOX_VM_RAM_MB / _DISK_GB / _CPUS / _MAX_SECONDS   VM resources
     SANDBOX_REBUILD_TIMEOUT   image build wait, seconds (default 480)
 
-    VERCEL_TOKEN (or VERCEL_API_TOKEN / VERCEL_ACCESS_TOKEN), VERCEL_TEAM_ID,
-    VERCEL_PROJECT_ID, VERCEL_API_BASE, VERCEL_SANDBOX_*  → baked into the image
+    Backbone credentials (whichever provider's key is set selects the backend;
+    Modal wins over Vercel), baked into the image:
+      MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (or MODAL_API_KEY), MODAL_SANDBOX_*
+      VERCEL_TOKEN (or VERCEL_API_TOKEN / VERCEL_ACCESS_TOKEN), VERCEL_TEAM_ID,
+      VERCEL_PROJECT_ID, VERCEL_API_BASE, VERCEL_SANDBOX_*, SANDBOX_*
 
 Output (stdout, machine-readable — the CI greps these):
     SANDBOX_TOOL_PROGRAM_ID=<id>
     SANDBOX_TOOL_CREATURE_ID=<id>
-    SANDBOX_TOOL_ENTITY_ID=vercel_sandbox
+    SANDBOX_TOOL_ENTITY_ID=sandbox
     SANDBOX_TOOL_VM_ID=<vmId>         (when the standalone runEntity start succeeds)
 """
 
@@ -82,7 +86,7 @@ from caspar_deploy_common import (  # noqa: E402
 )
 from caspar_signaling import CasparSignalingClient  # noqa: E402
 
-TOOL_ID = "vercel_sandbox"
+TOOL_ID = "sandbox"
 TOOLS_DIR = REPO / "caspar" / "tools"
 
 # The tool's Victor mini-app front-end: an Elpian-based JS file explorer that
@@ -93,21 +97,36 @@ TOOLS_DIR = REPO / "caspar" / "tools"
 FRONTEND_ENTITY_ID = "frontend"
 FRONTEND_SOURCE = TOOLS_DIR / TOOL_ID / "frontend" / "explorer.js"
 
-# Every name the tool reads. All three token spellings are here on purpose: the
-# tool accepts any of them, so baking only VERCEL_TOKEN would let an operator who
-# set VERCEL_API_TOKEN deploy a creature that looks fine and refuses every call.
+# Every name the tool reads. All the token spellings are here on purpose: the
+# tool accepts any of them, so baking only one would let an operator who set a
+# different spelling deploy a creature that looks fine and refuses every call.
 SANDBOX_ENV_NAMES = (
+    # Modal backend (selected first when present).
+    "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_API_KEY", "MODAL_KEY",
+    "MODAL_SANDBOX_APP", "MODAL_SANDBOX_WORKDIR", "MODAL_SANDBOX_IMAGE",
+    "MODAL_SANDBOX_SESSION_TTL", "MODAL_ENVIRONMENT",
+    # Vercel backend (fallback when no Modal key is present).
     "VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN",
     "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_API_BASE",
     "VERCEL_SANDBOX_RUNTIME", "VERCEL_SANDBOX_TIMEOUT_MS", "VERCEL_SANDBOX_VCPUS",
     "VERCEL_SANDBOX_PREFIX", "VERCEL_SANDBOX_MAX_OUTPUT", "VERCEL_SANDBOX_MAX_READ_BYTES",
     "VERCEL_SANDBOX_EXEC_TIMEOUT_MS", "VERCEL_SANDBOX_HTTP_TIMEOUT",
     "VERCEL_SANDBOX_SESSION_TTL",
+    # Provider-agnostic tuning (preferred spellings).
+    "SANDBOX_PREFIX", "SANDBOX_TIMEOUT_MS", "SANDBOX_VCPUS", "SANDBOX_MAX_OUTPUT",
+    "SANDBOX_MAX_READ_BYTES", "SANDBOX_EXEC_TIMEOUT_MS", "SANDBOX_HTTP_TIMEOUT",
+    "SANDBOX_BG_CHUNK_BYTES",
+)
+
+# The token names that, if any is present, mean a usable backbone is configured.
+SANDBOX_BACKEND_KEYS = (
+    "MODAL_TOKEN_ID", "MODAL_API_KEY", "MODAL_KEY",
+    "VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN",
 )
 
 
 def bake_env() -> Dict[str, str]:
-    """The Vercel credentials + tuning to bake into the creature image."""
+    """The Modal/Vercel credentials + tuning to bake into the creature image."""
     import os
 
     return {name: os.environ[name].strip() for name in SANDBOX_ENV_NAMES if os.environ.get(name, "").strip()}
@@ -119,8 +138,9 @@ def build_context() -> Dict[str, str]:
     tool_dir = TOOLS_DIR / TOOL_ID
     files = {
         "tool_runtime.py": b64_file(runtime / "tool_runtime.py"),
-        # The docker-host bridge client, the tool's only route to the node's host
-        # functions (HTTP for the Vercel API) and to signalling its result back.
+        # The docker-host bridge client, the tool's route to the node's host
+        # functions and to signalling its result back. (The backend reaches
+        # Modal/Vercel over the container's own network, not this bridge.)
         "caspar_bridge.py": b64_file(runtime / "caspar_bridge.py"),
         "tool.py": b64_file(tool_dir / "tool.py"),
         "requirements.txt": b64_file(tool_dir / "requirements.txt"),
@@ -169,11 +189,15 @@ def compose_dockerfile(files: Dict[str, str]):
     dockerfile = (TOOLS_DIR / TOOL_ID / "Dockerfile").read_bytes()
     dockerfile = apply_ca(dockerfile, files)
     baked = bake_env()
-    if any(baked.get(k) for k in ("VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN")):
-        info(f"baking Vercel credentials into the image (scope={baked.get('VERCEL_TEAM_ID') or 'personal account'})")
+    if baked.get("MODAL_TOKEN_ID") or baked.get("MODAL_API_KEY") or baked.get("MODAL_KEY"):
+        info(f"baking Modal credentials into the image (app={baked.get('MODAL_SANDBOX_APP') or 'decillion-sandbox'}) "
+             "— Modal is the selected backbone")
+    elif any(baked.get(k) for k in ("VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN")):
+        info(f"baking Vercel credentials into the image (scope={baked.get('VERCEL_TEAM_ID') or 'personal account'}) "
+             "— Vercel is the selected backbone")
     else:
-        warn("no VERCEL_TOKEN in the environment — the creature will deploy but every call will fail "
-             "until the token is baked in")
+        warn("no Modal or Vercel key in the environment — the creature will deploy but every call will fail "
+             "until a MODAL_TOKEN_ID/MODAL_TOKEN_SECRET (or MODAL_API_KEY) or VERCEL_TOKEN is baked in")
     dockerfile = dockerfile + b"\n" + bake_snippet(baked).encode()
     return stamp_context(dockerfile, files)
 

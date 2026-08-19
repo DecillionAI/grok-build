@@ -1,0 +1,4 @@
+requests>=2.31
+# Modal backend (used when a Modal API key is baked into the image). Modal has
+# no public REST API for sandboxes, so this SDK is the only way to drive them.
+modal>=0.64

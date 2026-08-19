@@ -342,7 +342,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // through to the prompt (instead of just name + description) lets the model
   // see how to *call* each tool — not merely that it exists — which is what
   // stops it from inventing compound tool names like
-  // `caspar__vercel_sandbox_exec` and then telling the user it "doesn't have
+  // `caspar__sandbox_exec` and then telling the user it "doesn't have
   // access to that action". See prompt.capabilitiesPreamble.
   const capabilities = lastToolDefs.map((t) => {
     const entry = byName.get(t.name) || {};

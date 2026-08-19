@@ -33,7 +33,7 @@ import { creatureNumber } from "./env.mjs";
  * This is the waiter on the backbone→tool hop. It MUST be longer than the
  * tool's own internal work budget, or the invoker gives up while the tool is
  * still running and the model sees a dead call. The per-space sandbox is the
- * binding case: its `exec` runs up to VERCEL_SANDBOX_EXEC_TIMEOUT_MS (300s)
+ * binding case: its `exec` runs up to SANDBOX_EXEC_TIMEOUT_MS (300s)
  * with an HTTP read timeout of exec+HTTP_TIMEOUT (~360s), so a 240s waiter was
  * shorter than the work — `npm install` / a build / a large push would stall.
  * A catalog entry may still shorten (or lengthen) this per tool via

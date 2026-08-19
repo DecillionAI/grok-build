@@ -1,13 +1,13 @@
 {
   "isMcp": true,
   "kind": "tool",
-  "tool_id": "vercel_sandbox",
+  "tool_id": "sandbox",
   "name": "sandbox",
-  "vm_name": "vercel-sandbox-vm",
-  "machine_id": "vercel-sandbox-machine",
-  "image_name": "vercel-sandbox:latest",
-  "container_name": "tool-vercel-sandbox",
-  "description": "Per-space cloud sandbox (Vercel Sandbox microVM) bound to a Decillion space: run shell commands, install packages, write and read files, expose ports",
+  "vm_name": "sandbox-vm",
+  "machine_id": "sandbox-machine",
+  "image_name": "sandbox:latest",
+  "container_name": "tool-sandbox",
+  "description": "Per-space cloud sandbox (a Modal or Vercel microVM) bound to a Decillion space: run shell commands, install packages, write and read files, expose ports",
   "usecases": [
     "you need to actually run something instead of describing it — shell commands, installs, builds, tests, scripts",
     "you need a file to exist on a real machine, or to read one back",
@@ -16,8 +16,8 @@
   ],
   "howToTalk": "Signal it with `function` naming the operation: `exec` (default) runs a shell line — pass `command`, optionally `cwd`, `env`, `timeout_ms` — and returns `stdout`, `stderr` and `exit_code`; `write` takes `path` + `content`; `read` takes `path`; `mkdir` takes `path`; `list_dir` takes `path`; `info` reports status and the public URLs of exposed ports; `start` boots the machine and `stop` puts it to sleep keeping its files. The space is already bound — never pass a space id.",
   "prompt": "Use this to actually DO work on a machine instead of only describing it: run shell commands, install dependencies, clone repos, execute build/test suites, write and read files, and expose a port so the humans in the space can open what you built. Every space has exactly one sandbox and it is shared by the whole team, so files you write persist between turns and other agents in the space see them. The sandbox is addressed by the space it belongs to — you never create or choose one. Name the operation with `function`: exec (default), write, read, mkdir, info, start, stop.",
-  "request_point": "tool::vercel_sandbox::request",
-  "response_point": "tool::vercel_sandbox::response",
+  "request_point": "tool::sandbox::request",
+  "response_point": "tool::sandbox::response",
   "risk_level": "high",
   "risk": "high",
   "requires_network": true,
@@ -111,7 +111,7 @@
       "desc": "provision the sandbox bound to a space (called by the platform when a space is created; agents should use start instead)",
       "args": {
         "space_id": {"type": "STRING", "desc": "the Decillion space id the sandbox is bound to"},
-        "runtime": {"type": "STRING", "desc": "node22 | node24 | node26 | python3.13 (default node24)"},
+        "runtime": {"type": "STRING", "desc": "Vercel runtime (node22 | node24 | node26 | python3.13, default node24) or a container image for Modal"},
         "ports": {"type": "ARRAY", "desc": "ports to expose publicly"},
         "timeout_ms": {"type": "NUMBER", "desc": "maximum session lifetime in milliseconds"}
       }

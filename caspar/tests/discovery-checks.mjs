@@ -228,8 +228,8 @@ async function main() {
     // Platform tools + sub-agents are attached as PROGRAMS, not store members.
     const programIndex = {
       "px-sandbox": {
-        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "vercel_sandbox",
-        metadata: { name: "vercel_sandbox", descriptor: SANDBOX_META.public.decillion, defaults: { space_id: "space-1" } },
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "sandbox",
+        metadata: { name: "sandbox", descriptor: SANDBOX_META.public.decillion, defaults: { space_id: "space-1" } },
       },
       "px-researcher": {
         programId: "px-researcher", creatureId: "cx-researcher", entityId: "agent",
@@ -244,7 +244,7 @@ async function main() {
       // The descriptor's own name ("sandbox") wins over the record's name.
       assert.deepEqual(names, ["Researcher", "legacy-tool", "sandbox"]);
       const sb = entries.find((e) => e.program_id === "px-sandbox");
-      assert.equal(sb.entity_id, "vercel_sandbox");
+      assert.equal(sb.entity_id, "sandbox");
       assert.deepEqual(sb.defaults, { space_id: "space-1" }, "the platform-pinned space binding is carried");
       // The index carries descriptors inline — no per-member getCreature needed.
       assert.equal(gw.calls.filter((c) => c.op === "getCreature").length, 0, "no getCreature round-trips");
@@ -262,8 +262,8 @@ async function main() {
         metadata: { descriptor: { kind: "agent", name: "Gpt_5_4_Mini", usecases: ["chat"] } },
       },
       "px-sandbox": {
-        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "vercel_sandbox",
-        metadata: { name: "vercel_sandbox", descriptor: SANDBOX_META.public.decillion },
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "sandbox",
+        metadata: { name: "sandbox", descriptor: SANDBOX_META.public.decillion },
       },
     };
     await withBridge(nodeBehaviour({ members: [], metaById: {}, programIndex }), async (bridge) => {

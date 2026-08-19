@@ -53,7 +53,7 @@ function properties(entry) {
  * Enumerate the operations a multi-function creature (per-space sandbox:
  * exec/write/read/…, github: clone/commit/push/…) accepts. Historical entries
  * only carried the *default* function so the model had to guess the rest and
- * routinely tried `use_tool("caspar__vercel_sandbox_exec", …)` — a compound
+ * routinely tried `use_tool("caspar__sandbox_exec", …)` — a compound
  * tool name that does not exist — which came back as "no such tool" and the
  * model paraphrased as "doesn't have access to that action". Sources, in
  * priority order (most explicit first):
@@ -62,7 +62,7 @@ function properties(entry) {
  *   2. `entry.arg_schema.function.enum` — the standard JSON-Schema way to
  *      declare it.
  *   3. `entry.tools[].name` — every checked-in creature descriptor lists its
- *      operations in a `tools[]` array (see e.g. the vercel_sandbox / github
+ *      operations in a `tools[]` array (see e.g. the sandbox / github
  *      `point.metadata.json`); this is the source of truth today.
  *   4. Parse `entry.arg_schema.function.description` for the pattern
  *      "`exec` (default) | `write` | `read`" — the human-readable form the
