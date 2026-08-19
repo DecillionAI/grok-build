@@ -850,6 +850,53 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.ok(promptPath.endsWith("prompt.txt"), "a text-only turn is a .txt prompt file, not content blocks");
 });
 
+await check("a quiet run still streams heartbeats so the client does not time it out", async () => {
+  // The CLI stays silent (no stream-json) for a stretch that dwarfs the heartbeat
+  // interval, standing in for a long tool call or model turn. The run must keep
+  // pushing keep-alive steps on the stream so a client watching for inactivity
+  // sees the run is alive.
+  const quietScenario = {
+    messages: [
+      { type: "system", subtype: "init", session_id: "sess-1", model: "grok-build", tools: [], mcp_servers: [] },
+      { __sleepMs: 450 },
+      ...successScenario("done").messages.slice(1),
+    ],
+  };
+  const { signals, result } = await serveWithFakeCli({
+    scenario: quietScenario,
+    envOverrides: { GROK_CREATURE_STREAM_HEARTBEAT_MS: "80" },
+  });
+  const heartbeats = signals.filter((s) => s.packet.kind === "davinci/step" && s.packet.channel === "heartbeat");
+  assert.ok(heartbeats.length >= 1, `expected at least one heartbeat during the quiet stretch, saw ${heartbeats.length}`);
+  assert.ok(
+    heartbeats.every((s) => s.userId === "9@global" && s.packet.stream === true && s.packet.final === false),
+    "heartbeats ride the same live stream (streamTo) as ordinary steps, non-terminal",
+  );
+  assert.ok(
+    heartbeats.every((s) => s.packet.correlationId === "corr-1"),
+    "each heartbeat carries the run's correlation so the client can match it",
+  );
+  // The heartbeat is purely a keep-alive: the run still finishes and replies.
+  assert.equal(result.success, true);
+  assert.equal(result.answer, "done");
+});
+
+await check("heartbeats can be disabled with STREAM_HEARTBEAT_MS=0", async () => {
+  const quietScenario = {
+    messages: [
+      { type: "system", subtype: "init", session_id: "sess-1", model: "grok-build", tools: [], mcp_servers: [] },
+      { __sleepMs: 300 },
+      ...successScenario("done").messages.slice(1),
+    ],
+  };
+  const { signals } = await serveWithFakeCli({
+    scenario: quietScenario,
+    envOverrides: { GROK_CREATURE_STREAM_HEARTBEAT_MS: "0" },
+  });
+  const heartbeats = signals.filter((s) => s.packet.kind === "davinci/step" && s.packet.channel === "heartbeat");
+  assert.equal(heartbeats.length, 0, "no heartbeats when the interval is zero");
+});
+
 await check("an image/audio attachment reaches the model inline as ACP content blocks", async () => {
   // A 1×1 PNG and a tiny WAV, both inline base64 — exactly what the Expo client
   // sends for the current turn's attachments.
