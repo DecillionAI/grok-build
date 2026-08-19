@@ -1,4 +1,4 @@
-// vercel_sandbox — the tool's front-end (a Victor "mini app").
+// sandbox — the tool's front-end (a Victor "mini app").
 //
 // This runs on the Elpian VM inside the Decillion client (the space "desktop"),
 // NOT on the Caspar node. It is deployed as the downloadable `frontend` entity

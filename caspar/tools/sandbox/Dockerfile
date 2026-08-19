@@ -1,8 +1,9 @@
-# vercel_sandbox tool creature.
+# sandbox tool creature.
 # Build context is assembled by scripts/deploy_and_test.py (ships the shared
 # tools/_runtime/tool_runtime.py alongside this tool's tool.py + requirements).
-# The Vercel credentials are baked in as ENV by the deploy harness — they are
-# never read from the signal payload.
+# The Modal/Vercel credentials are baked in as ENV by the deploy harness — they
+# are never read from the signal payload. Whichever provider's key is present
+# selects the backbone (Modal takes precedence over Vercel).
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
@@ -15,6 +16,6 @@ RUN pip install --no-cache-dir \
 COPY . /app
 
 RUN mkdir -p /app/input
-ENV DAVINCI_INPUT_DIR=/app/input PYTHONUNBUFFERED=1 TOOL_ID=vercel_sandbox
+ENV DAVINCI_INPUT_DIR=/app/input PYTHONUNBUFFERED=1 TOOL_ID=sandbox
 
 CMD ["python", "tool_runtime.py"]

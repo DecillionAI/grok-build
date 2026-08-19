@@ -135,7 +135,7 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
    * carried name + description; multi-function creatures (the sandbox, the
    * github tool) declare their operations in a `function` field of the
    * schema, and without seeing its enum the model routinely invented
-   * compound tool names like `caspar__vercel_sandbox_exec` — which do not
+   * compound tool names like `caspar__sandbox_exec` — which do not
    * exist — and then reported "I don't have access to that action" to the
    * user. Rendering the enum + the other args inline fixes that at source.
    */
@@ -225,9 +225,9 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "The names below are already fully qualified — use them verbatim, and NEVER " +
     "invent a compound tool name for an operation. A multi-function creature (its " +
     "listing shows a `function` field with an enum) selects the operation through " +
-    "that argument: e.g. `use_tool(tool_name: \"caspar__vercel_sandbox\", " +
+    "that argument: e.g. `use_tool(tool_name: \"caspar__sandbox\", " +
     'tool_input: { function: "exec", command: "npm test" })` — NOT ' +
-    "`use_tool(tool_name: \"caspar__vercel_sandbox_exec\", …)`, which does not exist " +
+    "`use_tool(tool_name: \"caspar__sandbox_exec\", …)`, which does not exist " +
     "and will come back as `Tool not found`. If a listing below shows no `function` " +
     'field, the tool has a single operation — just pass its named args. `search_tool` ' +
     "can refetch the live catalog when a teammate adds a tool mid-conversation.\n" +

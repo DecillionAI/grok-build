@@ -371,7 +371,7 @@ await check("the tool catalog becomes MCP tools with pinned platform defaults", 
       name: "project sandbox",
       tool_id: "31@global",
       program_id: "31@global",
-      entity_id: "vercel_sandbox",
+      entity_id: "sandbox",
       creature_id: "30@global",
       category: "sandbox",
       description: "the project's cloud machine",
@@ -621,7 +621,7 @@ await check("the space's creatures are employable over MCP, and pinned args win"
       name: "project sandbox",
       tool_id: "31@global",
       program_id: "31@global",
-      entity_id: "vercel_sandbox",
+      entity_id: "sandbox",
       arg_schema: { command: { type: "string" }, space_id: { type: "string" } },
       required: ["command"],
       function: "exec",
@@ -675,7 +675,7 @@ await check("the space's creatures are employable over MCP, and pinned args win"
 
     assert.equal(invoked.length, 1);
     assert.equal(invoked[0].target, "31@global");
-    assert.equal(invoked[0].packet.entityId, "vercel_sandbox", "entityId is required for the node to cold-spawn the tool");
+    assert.equal(invoked[0].packet.entityId, "sandbox", "entityId is required for the node to cold-spawn the tool");
     assert.equal(invoked[0].packet.function, "exec");
     assert.equal(invoked[0].packet.reply_to, bridge.machineId);
     assert.equal(invoked[0].packet.payload.space_id, "space-1", "the platform's space binding must win over the model's argument");
@@ -1064,7 +1064,7 @@ await check("a URL-referenced image is fetched and inlined (the Expo client's fr
 await check("a space's creatures are wired into the run as an MCP server", async () => {
   const { invocation } = await serveWithFakeCli({
     scenario: successScenario(),
-    catalogTools: [{ name: "project sandbox", tool_id: "31@global", program_id: "31@global", entity_id: "vercel_sandbox", arg_schema: { command: { type: "string" } }, required: ["command"], function: "exec", defaults: { space_id: "space-1" } }],
+    catalogTools: [{ name: "project sandbox", tool_id: "31@global", program_id: "31@global", entity_id: "sandbox", arg_schema: { command: { type: "string" } }, required: ["command"], function: "exec", defaults: { space_id: "space-1" } }],
   });
   // Grok has no --mcp-config flag: the server is an entry in the run's config.toml.
   assert.match(invocation.config, /\[mcp_servers\.caspar\]/);
@@ -1151,7 +1151,7 @@ await check("tools added to a space appear on the next prompt (dynamic catalog)"
   };
 
   const webSearch = { name: "web search", tool_id: "40@global", program_id: "40@global", entity_id: "web_search", arg_schema: { query: { type: "string" } }, required: ["query"] };
-  const sandbox = { name: "project sandbox", tool_id: "31@global", program_id: "31@global", entity_id: "vercel_sandbox", arg_schema: { command: { type: "string" } }, required: ["command"], function: "exec", defaults: { space_id: "space-1" } };
+  const sandbox = { name: "project sandbox", tool_id: "31@global", program_id: "31@global", entity_id: "sandbox", arg_schema: { command: { type: "string" } }, required: ["command"], function: "exec", defaults: { space_id: "space-1" } };
 
   const before = await listToolsFor([webSearch]);
   const after = await listToolsFor([webSearch, sandbox]);
