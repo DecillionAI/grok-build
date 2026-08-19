@@ -1276,5 +1276,88 @@ await check("the backbone fetches space history by signalling the spaces/history
   }
 });
 
+await check("the serve loop processes prompts in parallel — a slow prompt does not block others", async () => {
+  // Each run's fake CLI sleeps before answering, so its work has a measurable
+  // duration. If the loop served serially the second reply would land ~a full
+  // sleep after the first; served in parallel both finish within a moment of
+  // each other. We assert on the GAP between the two terminal results, which is
+  // robust to how long process startup takes on the host.
+  const SLEEP_MS = 1500;
+  const sleepScenario = {
+    messages: [
+      { type: "system", subtype: "init", session_id: "sess", model: "grok-build", tools: [], mcp_servers: [] },
+      { __sleepMs: SLEEP_MS },
+      ...successScenario("done").messages,
+    ],
+  };
+  const { file } = scenarioFile(sleepScenario);
+  const workspaceRoot = tempDir("caspar-ws-");
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CASPAR_GATEWAY_HOST: "127.0.0.1",
+    GROK_BIN: FAKE_CLI,
+    GROK_FAKE_SCENARIO: file,
+    GROK_FAKE_RECORD: "", // a single record path would be clobbered by two runs
+    GROK_CREATURE_WORKSPACE_ROOT: workspaceRoot,
+    GROK_CREATURE_CONFIG_DIR: path.join(workspaceRoot, "config"),
+    GROK_CREATURE_MAX_WALL_SECONDS: "30",
+    GROK_CREATURE_USER: "",
+    GROK_CREATURE_MAX_CONCURRENT_PROMPTS: "4",
+    GROK_CREATURE_DISCOVER_TOOLS: "false",
+    GROK_CREATURE_TASK_WAIT: "30",
+    GROK_CREATURE_RECONNECT_ATTEMPTS: "1",
+  });
+  const gateway = await new FakeGateway().listen();
+  process.env.CASPAR_GATEWAY_PORT = String(gateway.port);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Two prompts as two different users/threads produce: distinct sessions (so
+  // they don't share a workspace) and distinct correlations.
+  const a = proxyDelivery({ prompt: "slow-a", correlationId: "cc-a", extra: { sessionId: "space:space-1:agent-a" } });
+  const b = proxyDelivery({ prompt: "slow-b", correlationId: "cc-b", extra: { sessionId: "space:space-1:agent-b" } });
+
+  const { main } = await import("../runtime.mjs");
+  const mainPromise = main();
+  try {
+    // The gateway can only push to a connected creature, so wait for the serve
+    // loop's bridge to hand-shake before delivering the prompts.
+    for (let i = 0; i < 300 && gateway.sockets.size === 0; i++) await sleep(10);
+    assert.ok(gateway.sockets.size > 0, "the creature connected to the gateway");
+    await sleep(50); // let the serve loop subscribe (early-signal buffer covers the race regardless)
+
+    gateway.pushSignal(a.key, a.data);
+    gateway.pushSignal(b.key, b.data);
+
+    let firstAt = 0;
+    let secondAt = 0;
+    for (let i = 0; i < 600; i++) {
+      const finals = gateway.signals().filter((s) => s.packet.kind === "davinci/result");
+      if (finals.length >= 1 && !firstAt) firstAt = Date.now();
+      if (finals.length >= 2) {
+        secondAt = Date.now();
+        break;
+      }
+      await sleep(20);
+    }
+
+    const finals = gateway.signals().filter((s) => s.packet.kind === "davinci/result");
+    const correlations = new Set(finals.map((s) => s.packet.correlationId));
+    assert.equal(finals.length, 2, "both prompts produced a terminal result");
+    assert.deepEqual([...correlations].sort(), ["cc-a", "cc-b"], "each prompt replied on its own correlation (its own stream)");
+    // Served serially, the gap would be ~SLEEP_MS; served in parallel it is tiny.
+    assert.ok(
+      secondAt - firstAt < SLEEP_MS - 500,
+      `the two results landed ${secondAt - firstAt}ms apart — serial would be ~${SLEEP_MS}ms, so the second prompt was not blocked behind the first`,
+    );
+  } finally {
+    // Drop the link and stop listening so the serve loop's reconnect fails and
+    // main() returns instead of idling forever.
+    for (const socket of [...gateway.sockets]) socket.destroy();
+    await gateway.close();
+    await Promise.race([mainPromise, sleep(8000)]);
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+  }
+});
+
 console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
 process.exit(failures.length ? 1 : 0);
