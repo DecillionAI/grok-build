@@ -5,7 +5,10 @@
  * Deployed as a Caspar `docker` creature and started with `/programs/runEntity`,
  * this process is a **persistent agent server**: it connects to the node's
  * docker-host bridge gateway, announces itself, and then answers every prompt
- * signal that arrives, one at a time, for as long as the VM lives.
+ * signal that arrives for as long as the VM lives. One program backs every agent
+ * in the platform, so prompts are served **concurrently** (up to
+ * `MAX_CONCURRENT_PROMPTS`) — each on its own grok child and its own streaming
+ * correlation — so a long-running prompt never blocks the others behind it.
  *
  *   Decillion (Nest)  ──signal──▶  agent proxy entity  ──relay──▶  THIS creature
  *          ▲                                                          │
@@ -529,7 +532,8 @@ export async function serveOnce(bridge, delivery) {
  * arrive close together (two agents in one space, or two users). A listener that is
  * only registered while idle would drop the second one — and a dropped prompt is a
  * client that spins until the backend's timeout. So prompts are captured the moment
- * they arrive and served in order.
+ * they arrive and buffered here; the serve loop then drains them concurrently (see
+ * `MAX_CONCURRENT_PROMPTS` in `main`), so a slow prompt never holds up the queue.
  */
 export function createDeliveryQueue(bridge, idleWaitMs, onQueued) {
   const queue = [];
@@ -663,6 +667,14 @@ export async function main() {
 
   const serveForever = creatureFlag("SERVE_FOREVER", true);
   const idleWaitMs = creatureNumber("TASK_WAIT", 600) * 1000;
+  // How many prompts this one program serves at the same time. It backs EVERY
+  // agent in the platform, so prompts from different users/threads must not queue
+  // behind each other: each runs on its own grok child, streams on its own
+  // `correlationId`/`streamTo`, and replies on its own `replyTo`, so a long run
+  // never blocks the others. Capped so a burst cannot exhaust the VM (each run
+  // spawns a grok CLI child + its tool sockets). Set `MAX_CONCURRENT_PROMPTS=1`
+  // to restore the old strictly-serial behavior.
+  const maxConcurrent = Math.max(1, creatureNumber("MAX_CONCURRENT_PROMPTS", 8));
   let served = 0;
 
   const onQueued = (depth, delivery) => {
@@ -671,43 +683,93 @@ export async function main() {
   const callTimeoutMs = creatureNumber("CALL_TIMEOUT_MS", 60000);
   let deliveries = createDeliveryQueue(bridge, idleWaitMs, onQueued);
 
-  try {
-    for (;;) {
-      log("GROK_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, ts: Date.now() / 1000 });
-      const delivery = await deliveries.next();
+  // Runs currently in flight. Each `serveOnce` removes its own promise when it
+  // settles, so `inFlight.size` is the live concurrency and `Promise.race` frees
+  // the loop the instant any slot opens. `serveOnce` never throws (it always
+  // replies), but the guard keeps one broken run from taking down the server.
+  const inFlight = new Set();
+  const startDelivery = (activeBridge, delivery) => {
+    const task = (async () => {
+      try {
+        await serveOnce(activeBridge, delivery);
+      } catch (err) {
+        log("GROK_BOOT", { serve_error: String(err?.message || err).slice(0, 200) });
+      } finally {
+        served += 1;
+        inFlight.delete(task);
+      }
+    })();
+    inFlight.add(task);
+    return task;
+  };
+
+  // Single-shot mode (SERVE_FOREVER=false, e.g. a one-task self-test): serve
+  // exactly one prompt and exit with its status. There is only ever one prompt,
+  // so no concurrency is involved.
+  if (!serveForever) {
+    log("GROK_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, ts: Date.now() / 1000 });
+    const delivery = await deliveries.next();
+    try {
       if (!delivery) {
-        // A dropped gateway link looks like idle here, but the creature would be
-        // alive-and-unreachable (the node cannot fix a container it still sees
-        // as "running"), so reconnect instead of waiting on forever.
-        if (serveForever && !bridge.isConnected()) {
-          log("GROK_RECONNECT", { served, reason: "gateway link lost" });
-          deliveries.dispose();
-          try {
-            bridge.close();
-          } catch {
-            /* already gone */
-          }
-          const next = await reconnectBridge(callTimeoutMs);
-          if (!next) {
-            log("GROK_SERVE_UNAVAILABLE", { served, reason: "gateway link lost and could not be re-established — exiting so the node cold-spawns a fresh container" });
-            return 2;
-          }
-          bridge = next;
-          deliveries = createDeliveryQueue(bridge, idleWaitMs, onQueued);
-          continue;
-        }
-        if (serveForever) {
-          log("GROK_IDLE", { served, waited_s: idleWaitMs / 1000 });
-          continue; // immortal: keep waiting for the next prompt
-        }
         process.stdout.write(`DAVINCI_RESULT ${JSON.stringify({ success: false, error: "no task signal received within the wait window" })}\n`);
         return 2;
       }
-
-      // One bad prompt must never kill the server: `serveOnce` always replies.
       const result = await serveOnce(bridge, delivery);
-      served += 1;
-      if (!serveForever) return result.success ? 0 : 2;
+      return result.success ? 0 : 2;
+    } finally {
+      deliveries.dispose();
+      try {
+        bridge.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  try {
+    for (;;) {
+      // Backpressure: while every slot is busy, wait for one to free before
+      // pulling the next prompt. In-flight runs keep progressing on the event
+      // loop meanwhile — this only paces how fast new prompts are admitted.
+      if (inFlight.size >= maxConcurrent) {
+        await Promise.race(inFlight);
+        continue;
+      }
+
+      log("GROK_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, inflight: inFlight.size, ts: Date.now() / 1000 });
+      const delivery = await deliveries.next();
+      if (delivery) {
+        // Start the run and immediately loop back for the next prompt instead of
+        // awaiting it. The run streams and replies on its own correlation, so
+        // parallel prompts each get their own stream and none blocks another.
+        startDelivery(bridge, delivery);
+        continue;
+      }
+
+      // No delivery within the idle window. A dropped gateway link looks like
+      // idle here, but the creature would be alive-and-unreachable (the node
+      // cannot fix a container it still sees as "running"), so reconnect instead
+      // of waiting on forever. In-flight runs stay on the old bridge and drain
+      // (their replies fail and are logged); fresh prompts serve on the new one.
+      if (!bridge.isConnected()) {
+        log("GROK_RECONNECT", { served, inflight: inFlight.size, reason: "gateway link lost" });
+        deliveries.dispose();
+        try {
+          bridge.close();
+        } catch {
+          /* already gone */
+        }
+        const next = await reconnectBridge(callTimeoutMs);
+        if (!next) {
+          log("GROK_SERVE_UNAVAILABLE", { served, reason: "gateway link lost and could not be re-established — exiting so the node cold-spawns a fresh container" });
+          return 2;
+        }
+        bridge = next;
+        deliveries = createDeliveryQueue(bridge, idleWaitMs, onQueued);
+        continue;
+      }
+      log("GROK_IDLE", { served, inflight: inFlight.size, waited_s: idleWaitMs / 1000 });
+      // immortal: keep waiting for the next prompt
     }
   } finally {
     deliveries.dispose();
