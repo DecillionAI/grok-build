@@ -73,7 +73,9 @@ from caspar_deploy_common import (  # noqa: E402
     docker_image_id,
     env_any,
     info,
+    list_platform_registry,
     load_manifest,
+    manifest_endpoint,
     ok,
     register_platform_tool,
     resolve_operator,
@@ -88,6 +90,15 @@ from caspar_signaling import CasparSignalingClient  # noqa: E402
 
 TOOL_ID = "sandbox"
 TOOLS_DIR = REPO / "caspar" / "tools"
+
+# The tool used to be named `vercel_sandbox`; the rename to `sandbox` mints a new
+# machine + program (the machine name — `m-tool-<id>` — is what anchors the
+# deploy's identity), so the OLD creature, its program and its still-running VM
+# would linger. Every new deploy tears the legacy creature down (see
+# remove_legacy_sandbox) so exactly one sandbox tool exists on the node.
+LEGACY_TOOL_ID = "vercel_sandbox"
+LEGACY_MACHINE_NAME = f"m-tool-{LEGACY_TOOL_ID}"
+LEGACY_ENTITY_ID = LEGACY_TOOL_ID
 
 # The tool's Victor mini-app front-end: an Elpian-based JS file explorer that
 # runs in the Decillion client (not on the node) and reaches this back-end over
@@ -183,6 +194,94 @@ def deploy_frontend(client: "CasparSignalingClient", program_id: str) -> bool:
     ok(f"{TOOL_ID} front-end deployed: program={program_id} entity={FRONTEND_ENTITY_ID} (downloadable)")
     print("SANDBOX_TOOL_FRONTEND_ENTITY_ID=" + FRONTEND_ENTITY_ID, flush=True)
     return True
+
+
+def _unregister_platform_program(client: "CasparSignalingClient", manifest: Dict[str, object],
+                                 program_id: str) -> None:
+    """Drop a program's entry from the market creature's platform registry."""
+    unreg = manifest_endpoint(manifest, "market/unregisterPlatform")
+    if not unreg or not program_id:
+        return
+    try:
+        client.signal_wasm_endpoint(
+            creature_id=unreg["creatureId"], program_id=unreg["programId"],
+            action="unregisterPlatform", payload={"programId": program_id})
+        ok(f"unregistered legacy sandbox program {program_id} from the platform registry")
+    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+        warn(f"could not unregister legacy sandbox program {program_id}: {exc}")
+
+
+def remove_legacy_sandbox(client: "CasparSignalingClient", operator_id: str,
+                          manifest: Dict[str, object], new_program_id: str) -> None:
+    """Tear down the pre-rename ``vercel_sandbox`` creature, if it still exists.
+
+    Idempotent and best-effort: nothing here is fatal to the deploy — the new
+    ``sandbox`` tool is already live before we run, and existing spaces re-point
+    to it by the tool's stable ``name`` on their next signal, so removing the old
+    program never leaves a space without a sandbox. For every operator-owned
+    machine named ``m-tool-vercel_sandbox`` we: stop its VM, unregister its
+    program from the platform registry, delete the program, then delete the
+    machine creature. A legacy machine owned by a different account is left alone.
+    """
+    want = LEGACY_MACHINE_NAME[:32]
+    try:
+        creatures = client.list_creatures()
+    except Exception as exc:  # noqa: BLE001 — never fail the deploy over cleanup
+        warn(f"legacy sandbox cleanup skipped — could not list creatures: {exc}")
+        return
+
+    legacy_ids = []
+    for c in creatures:
+        uname = str(c.get("username") or "")
+        if uname.split("@", 1)[0] != want and uname != want:
+            continue
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        owner = str(c.get("ownerId") or c.get("owner_id") or "")
+        if owner and owner != operator_id:
+            warn(f"legacy sandbox machine {cid} is owned by {owner!r}, not the deploy "
+                 "operator — leaving it in place")
+            continue
+        legacy_ids.append(cid)
+
+    if not legacy_ids:
+        info("no legacy vercel_sandbox creature to remove")
+        return
+
+    try:
+        programs = client.list_programs()
+    except Exception as exc:  # noqa: BLE001
+        warn(f"legacy sandbox cleanup skipped — could not list programs: {exc}")
+        return
+
+    for creature_id in legacy_ids:
+        for prog in programs:
+            if str(prog.get("machineId") or prog.get("machine_id") or "") != creature_id:
+                continue
+            program_id = str(prog.get("id") or "")
+            if not program_id or program_id == new_program_id:
+                continue
+            # 1) stop the still-running VM (best-effort; it may already be down).
+            try:
+                client.stop_entity(program_id, LEGACY_ENTITY_ID)
+                info(f"stopped legacy sandbox VM (program {program_id})")
+            except Exception as exc:  # noqa: BLE001
+                info(f"legacy sandbox VM already stopped or absent (program {program_id}): {exc}")
+            # 2) drop it from the on-chain platform registry so spaces stop seeing it.
+            _unregister_platform_program(client, manifest, program_id)
+            # 3) delete the program record.
+            try:
+                client.send("/programs/delete", {"programId": program_id})
+                ok(f"deleted legacy sandbox program {program_id}")
+            except Exception as exc:  # noqa: BLE001
+                warn(f"could not delete legacy sandbox program {program_id}: {exc}")
+        # 4) delete the machine creature itself.
+        try:
+            client.send("/creatures/delete", {"userId": creature_id})
+            ok(f"deleted legacy sandbox machine creature {creature_id}")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"could not delete legacy sandbox machine creature {creature_id}: {exc}")
 
 
 def compose_dockerfile(files: Dict[str, str]):
@@ -281,6 +380,11 @@ def main() -> int:
             warn(f"runEntity failed ({exc}); the node will cold-spawn the tool per signal")
     else:
         info("SANDBOX_RUN_ENTITY=0 — skipping the standalone runEntity start")
+
+    # Now that the new `sandbox` tool is deployed, registered and serving, tear
+    # down the pre-rename `vercel_sandbox` creature so the node ends with exactly
+    # one sandbox tool. Best-effort and non-fatal — the new tool is already live.
+    remove_legacy_sandbox(client, operator_id, load_manifest(), program_id)
 
     client.close()
     return 0
