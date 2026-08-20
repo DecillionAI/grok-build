@@ -60,7 +60,13 @@
     {
       "name": "answer",
       "desc": "return a short synthesised answer to a question plus the sources it is drawn from",
-      "args": { "query": { "type": "STRING", "desc": "the question to answer" } }
+      "args": { "query": { "type": "STRING", "desc": "the question to answer" } },
+      "widget": {
+        "kind": "answer",
+        "title": "Answer",
+        "fields": ["answer", "sources"],
+        "desc": "When asked in chat, answers with a filled answer card (summary + sources) instead of a plain message."
+      }
     },
     {
       "name": "fetch",

@@ -279,6 +279,40 @@ def _extract_invoke(data: dict) -> dict:
     return packet
 
 
+# Keys a tool implementation commonly reads its primary free-text argument from.
+# A chat command (``@tool command the rest is free text``) carries that free text
+# as a single blob; the client sends it under `args`/`chat_text`, and we mirror it
+# onto every alias below so any tool — whichever key it happens to read — picks it
+# up. This is what lets an existing tool answer a chat command with no per-tool
+# change: web_search reads `query`/`text`/`task`, github/sandbox read `text`/`input`.
+_CHAT_TEXT_ALIASES = ("text", "query", "prompt", "task", "input", "message", "q")
+
+
+def _normalize_chat_args(function: str, payload: dict) -> None:
+    """Spread a chat command's free-text argument across the alias keys tools read.
+
+    Mutates ``payload`` in place. Only fills an alias that is missing/empty, so an
+    explicit structured argument from an agent or a front-end is never clobbered.
+    The originating command name (``function``) is also recorded under ``command``
+    so a tool that wants to branch on it can."""
+    if not isinstance(payload, dict):
+        return
+    if function and not payload.get("command"):
+        payload["command"] = function
+    text = ""
+    for src in ("args", "chat_text", "command_text", "text", "query", "prompt"):
+        v = payload.get(src)
+        if isinstance(v, str) and v.strip():
+            text = v.strip()
+            break
+    if not text:
+        return
+    for alias in _CHAT_TEXT_ALIASES:
+        cur = payload.get(alias)
+        if not (isinstance(cur, str) and cur.strip()):
+            payload[alias] = text
+
+
 def _handle_invoke(bridge, packet: dict) -> None:
     """Run one tool invocation and signal the result back to the caller.
 
@@ -302,6 +336,9 @@ def _handle_invoke(bridge, packet: dict) -> None:
         _caller = packet.get("reply_to") or packet.get("userId")
         if isinstance(_caller, str) and _caller.strip():
             payload["__caller_id"] = _caller.strip()
+        # A chat command delivers its argument as one free-text blob; spread it
+        # across the alias keys tools read so any tool can answer a chat command.
+        _normalize_chat_args(function, payload)
     print(f"TOOL_BOOT {json.dumps({'tool_id': tool_id, 'function': function, 'ts': time.time()})}", flush=True)
     try:
         result = _dispatch(tool_id, function, payload)
@@ -387,6 +424,7 @@ def _run_once_offline() -> int:
     tool_id = signal.get("tool_id") or TOOL_ID or "unknown"
     function = signal.get("function", "invoke")
     payload = signal.get("payload") or {}
+    _normalize_chat_args(function, payload)
     print(f"TOOL_BOOT {json.dumps({'tool_id': tool_id, 'function': function, 'ts': time.time()})}", flush=True)
     try:
         result = _dispatch(tool_id, function, payload)
