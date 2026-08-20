@@ -320,6 +320,83 @@
     }
 
     #[test]
+    fn wake_turn_stop_affordance_offered_then_cleared_at_terminal() {
+        // The pane stays Idle around a wake turn, so the stop affordance is
+        // keyed on `running_wake_turn`: set by the first live wake delta,
+        // cleared by the wake terminal.
+        let mut app = make_app_with_agent("sess-wake");
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 5_000),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            matches!(agent.wake_display_state(), Some(AgentState::TurnRunning)),
+            "a streaming wake turn must offer the running chrome (and [stop])"
+        );
+
+        // A delta arriving mid-cancel must not reset the cancelling phase.
+        if let Some(wake) = app
+            .agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .running_wake_turn
+            .as_mut()
+        {
+            wake.cancel_sent = true;
+        }
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 6_000),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            matches!(agent.wake_display_state(), Some(AgentState::TurnCancelling)),
+            "a later delta must not clobber the cancelling phase"
+        );
+
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg1", None),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            agent.running_wake_turn.is_none() && agent.wake_display_state().is_none(),
+            "the wake terminal must retire the stop affordance"
+        );
+
+        // Deltas and the terminal ride separate channels: a late delta for
+        // the finished wake must not revive the affordance.
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 7_000),
+            &mut app,
+        );
+        assert!(
+            app.agents[&AgentId(0)].running_wake_turn.is_none(),
+            "a late delta after the terminal must not revive the stop affordance"
+        );
+
+        // A second wake finishing must not forget the first: bg1's late
+        // delta stays dead after bg2's terminal lands too.
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg2", 8_000),
+            &mut app,
+        );
+        let _ = handle_ext_notification(
+            &xai_wake_turn_completed_notif("sess-wake", "task-completed-bg2", None),
+            &mut app,
+        );
+        let _ = handle(
+            make_viewer_chunk_with_turn_start("sess-wake", "task-completed-bg1", 9_000),
+            &mut app,
+        );
+        assert!(
+            app.agents[&AgentId(0)].running_wake_turn.is_none(),
+            "an earlier finished wake stays finished after later terminals"
+        );
+    }
+
+    #[test]
     fn wake_terminal_finishes_in_flight_streamed_entry() {
         // The terminal is a wake's ONLY flush site (wakes skip PromptResponse).
         let mut app = make_app_with_agent("sess-wake");
@@ -1172,6 +1249,49 @@
     }
 
     #[test]
+    fn stop_cancelled_hooks_fold_into_the_cancelled_marker() {
+        // The report is dispatched off the command loop, so it races the terminal in both
+        // directions: the terminal first folds onto an existing marker, the batch first stashes.
+        for terminal_first in [true, false] {
+            let mut app = make_app_with_agent("sess-cancelled-hooks");
+            app.agents.get_mut(&AgentId(0)).unwrap().attached_as_viewer = true;
+            let _ = handle(
+                make_agent_chunk_message_with_prompt(
+                    "sess-cancelled-hooks",
+                    "chunk",
+                    "pid-c",
+                    false,
+                ),
+                &mut app,
+            );
+            let terminal =
+                xai_turn_completed_notif("sess-cancelled-hooks", "pid-c", "cancelled", false);
+            let batch = xai_hook_execution_notif_for_prompt(
+                "sess-cancelled-hooks",
+                "stop_cancelled",
+                Some("pid-c"),
+                false,
+            );
+            for notif in if terminal_first {
+                [&terminal, &batch]
+            } else {
+                [&batch, &terminal]
+            } {
+                let _ = handle_ext_notification(notif, &mut app);
+            }
+
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            assert_eq!(
+                last_marker_stop_hook_groups(&agent.scrollback),
+                Some(1),
+                "the cancelled turn's hook batch must render inside its marker \
+                 (terminal_first={terminal_first})"
+            );
+            assert_eq!(count_lifecycle_blocks(&agent.scrollback), 0);
+        }
+    }
+
+    #[test]
     fn stamped_stop_hooks_merge_past_interleaved_tail_block() {
         // Viewer/race order with a block (compaction, recap, …) landing
         // between the marker and the batch: an exact pid match still merges
@@ -1562,7 +1682,17 @@
                 .contains("p-first")
         );
 
-        // A second load (reconnect) enters a fresh replay window.
+        // A second load (reconnect) enters a fresh replay window. An armed
+        // cancel resend belongs to the pre-reload turn and must drop with it.
+        app.agents.get_mut(&id).unwrap().pending_cancel_resend =
+            Some(crate::app::agent_view::PendingCancelResend {
+                prompt_id: Some("p-first".into()),
+                sent_at: std::time::Instant::now(),
+                attempts: 1,
+                confirmed: false,
+                cancel_subagents: true,
+                trigger: crate::app::actions::CancelTrigger::Esc,
+            });
         app.agents.get_mut(&id).unwrap().begin_session_reload(1);
         let agent = &app.agents[&id];
         assert!(
@@ -1572,6 +1702,10 @@
         assert_eq!(
             agent.unexpected_replay_drops, 0,
             "begin_replay_window must reset every replay-coupled field together"
+        );
+        assert!(
+            agent.pending_cancel_resend.is_none(),
+            "an armed cancel resend must not survive into the reload window"
         );
         assert!(agent.session.loading_replay);
     }

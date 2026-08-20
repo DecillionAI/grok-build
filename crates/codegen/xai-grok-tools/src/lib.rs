@@ -22,6 +22,7 @@ pub mod bridge;
 pub mod computer;
 pub mod gitignore;
 pub mod implementations;
+pub mod media_gen_limits;
 pub mod normalization;
 pub mod notification;
 pub mod persistence;
@@ -36,3 +37,5 @@ pub mod versions;
 pub use attribution::{
     Auth401AttributionCallback, BEARER_SUFFIX_LEN, SharedAttributionCallback, ToolConsumer,
 };
+pub use implementations::grok_build::is_task_tool_id;
+pub use implementations::{SEARCH_TOOL_NAME, USE_TOOL_NAME};

@@ -14,6 +14,7 @@
 //! - `SubagentForegroundWait` — host wait-window guard factory (optional)
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
 
+pub mod admission;
 pub mod backend;
 pub mod coordinator;
 mod coordinator_state;
@@ -31,6 +32,8 @@ use crate::types::resources::{SessionFolder, SharedResources};
 use crate::types::tool::{ToolKind, ToolNamespace};
 use regex::Regex;
 use xai_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput};
+
+pub const TASK_TOOL_NAME: &str = "task";
 
 /// Default max nesting depth when [`MaxSubagentDepth`] is not injected.
 pub const MAX_SUBAGENT_DEPTH: u32 = 1;
@@ -138,12 +141,51 @@ async fn detect_continue_parent_work(
     xai_tool_types::should_continue_parent_work(&asks, description, prompt)
 }
 
+/// Resolve the model-facing get-output tool and param names for the
+/// background notices. Kind-wide resolution is correct here: these name the
+/// retrieval tool's schema (which the host may rename), not task's own.
+async fn resolve_background_notice_names(resources: &SharedResources) -> (String, String, String) {
+    let canonical = xai_tool_types::BackgroundNoticeNaming::CANONICAL;
+    let res = resources.lock().await;
+    let Some(renderer) = res.get::<crate::types::template_renderer::TemplateRenderer>() else {
+        return (
+            canonical.task_output_tool.to_string(),
+            canonical.task_ids_param.to_string(),
+            canonical.timeout_ms_param.to_string(),
+        );
+    };
+    (
+        renderer
+            .tool_for_kind(ToolKind::BackgroundTaskAction)
+            .unwrap_or(canonical.task_output_tool)
+            .to_string(),
+        renderer
+            .param_for_kind(ToolKind::BackgroundTaskAction, "task_ids")
+            .unwrap_or(canonical.task_ids_param)
+            .to_string(),
+        renderer
+            .param_for_kind(ToolKind::BackgroundTaskAction, "timeout_ms")
+            .unwrap_or(canonical.timeout_ms_param)
+            .to_string(),
+    )
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Tool implementation
 // ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
 pub struct TaskTool;
+
+/// True when `name` is a wire name of the subagent-spawn ("task") tool.
+///
+/// Accepts every spelling regardless of enabled features: names arrive over
+/// the wire from arbitrary toolsets. Spellings other than [`TASK_TOOL_NAME`]
+/// are defined downstream and pinned to this predicate by tests at their
+/// definition sites.
+pub fn is_task_tool_id(name: &str) -> bool {
+    matches!(name, TASK_TOOL_NAME | "Task" | "spawn_subagent")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tests
@@ -234,7 +276,7 @@ impl xai_tool_runtime::Tool for TaskTool {
     type Output = ToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("task").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(TASK_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
@@ -484,6 +526,8 @@ impl xai_tool_runtime::Tool for TaskTool {
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
                 persona: None,
+                // JSON cannot set this field. Compat-harness adapters still
+                // populate it in-process; model-facing spawns stay `None`.
                 capability_mode: input.capability_mode,
                 isolation: input.isolation,
                 // Model-issued `task` spawns never override the harness; the
@@ -534,15 +578,13 @@ impl xai_tool_runtime::Tool for TaskTool {
                 }
             });
 
-            // `resolve_tool_name` (not a template render): a missing kind
-            // renders as empty-`Ok`, so a `Result` fallback never fires.
-            let task_output_name =
-                crate::types::template_renderer::TemplateRenderer::resolve_tool_name(
-                    &resources,
-                    crate::types::tool::ToolKind::BackgroundTaskAction,
-                )
-                .await
-                .unwrap_or_else(|| "get_task_output".to_string());
+            let (task_output_tool, task_ids_param, timeout_ms_param) =
+                resolve_background_notice_names(&resources).await;
+            let naming = xai_tool_types::BackgroundNoticeNaming {
+                task_output_tool: &task_output_tool,
+                task_ids_param: &task_ids_param,
+                timeout_ms_param: &timeout_ms_param,
+            };
 
             let continue_parent =
                 detect_continue_parent_work(&resources, &input.description, &input.prompt).await;
@@ -551,7 +593,7 @@ impl xai_tool_runtime::Tool for TaskTool {
                     &id,
                     &input.subagent_type,
                     &input.description,
-                    &task_output_name,
+                    &naming,
                     continue_parent,
                 )
                 .into(),
@@ -570,41 +612,31 @@ impl xai_tool_runtime::Tool for TaskTool {
         // still-running child — return a task_id to poll, like the background
         // branch above (the result arrives via auto-wake or a later poll).
         if result.backgrounded {
-            // `resolve_tool_name` (not a template render): a missing kind
-            // renders as empty-`Ok`, so a `Result` fallback never fires.
-            let task_output_name =
-                crate::types::template_renderer::TemplateRenderer::resolve_tool_name(
-                    &resources,
-                    crate::types::tool::ToolKind::BackgroundTaskAction,
-                )
-                .await
-                .unwrap_or_else(|| "get_task_output".to_string());
+            let (task_output_tool, task_ids_param, timeout_ms_param) =
+                resolve_background_notice_names(&resources).await;
+            let naming = xai_tool_types::BackgroundNoticeNaming {
+                task_output_tool: &task_output_tool,
+                task_ids_param: &task_ids_param,
+                timeout_ms_param: &timeout_ms_param,
+            };
             // Only promise a completion notification when the client
             // actually delivers system reminders.
-            let notify_clause = if resources
+            let notified_on_completion = resources
                 .lock()
                 .await
                 .get::<crate::types::resources::SystemRemindersEnabled>()
-                .is_none_or(|e| e.0)
-            {
-                " — you will be notified when it completes"
-            } else {
-                ""
-            };
+                .is_none_or(|e| e.0);
+            let continue_parent =
+                detect_continue_parent_work(&resources, &input.description, &input.prompt).await;
 
-            let mut text = format!(
-                "Subagent took longer than the foreground budget and was moved to the \
-                 background to keep the conversation responsive. It is still running{notify_clause}.\n\
-                 subagent_id: {id}\n\
-                 type: {}\n\
-                 description: {}\n\n\
-                 Use {task_output_name} with task_ids=[\"{id}\"] and timeout_ms to wait for results.",
-                input.subagent_type, input.description,
+            let text = xai_tool_types::format_subagent_auto_backgrounded(
+                &id,
+                &input.subagent_type,
+                &input.description,
+                &naming,
+                notified_on_completion,
+                continue_parent,
             );
-            if detect_continue_parent_work(&resources, &input.description, &input.prompt).await {
-                text.push_str("\n\n");
-                text.push_str(xai_tool_types::BACKGROUND_SUBAGENT_CONTINUE_PARENT_WORK);
-            }
             return Ok(ToolOutput::Text(text.into()));
         }
 
@@ -1545,10 +1577,37 @@ mod tests {
         assert!(capture_rx.try_recv().is_err(), "must fire exactly once");
     }
 
+    #[test]
+    fn task_tool_id_predicate_accepts_all_wire_spellings() {
+        assert!(is_task_tool_id(
+            xai_tool_runtime::Tool::id(&TaskTool).as_str()
+        ));
+        for name in ["task", "Task", "spawn_subagent"] {
+            assert!(is_task_tool_id(name), "must accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn task_tool_id_predicate_rejects_lookalikes() {
+        for name in [
+            "",
+            "TASK",
+            "tasks",
+            "spawn_subagents",
+            "Spawn_Subagent",
+            "task_output",
+            "kill_task",
+            "subagent",
+            " task",
+        ] {
+            assert!(!is_task_tool_id(name), "must reject {name:?}");
+        }
+    }
+
     // ── Runtime overrides serde tests ─────────────────
 
     #[test]
-    fn runtime_overrides_parse() {
+    fn capability_mode_in_json_is_ignored() {
         let input: TaskToolInput = serde_json::from_str(
             r#"{
                 "description": "d",
@@ -1557,20 +1616,20 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(
-            input.capability_mode,
-            Some(SubagentCapabilityMode::ReadOnly)
+        assert!(
+            input.capability_mode.is_none(),
+            "model-facing JSON must not set capability_mode"
         );
     }
 
     #[test]
     fn partial_overrides_leave_rest_none() {
-        let input: TaskToolInput = serde_json::from_str(
-            r#"{"description": "d", "prompt": "p", "capability_mode": "execute"}"#,
-        )
-        .unwrap();
-        assert_eq!(input.capability_mode, Some(SubagentCapabilityMode::Execute));
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description": "d", "prompt": "p", "isolation": "worktree"}"#)
+                .unwrap();
+        assert_eq!(input.isolation, Some(SubagentIsolationMode::Worktree));
         assert!(input.model.is_none());
+        assert!(input.capability_mode.is_none());
     }
 
     #[test]
@@ -1582,6 +1641,15 @@ mod tests {
              available model slugs. If omitted, the subagent uses the same model as the parent \
              agent. Do not pass if resume_from is set (prior model will be used). Only choose \
              an explicit model when the user directly requests it."
+        );
+    }
+
+    #[test]
+    fn task_tool_input_schema_omits_capability_mode() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        assert!(
+            schema["properties"].get("capability_mode").is_none(),
+            "capability_mode must not be advertised on the model-facing schema"
         );
     }
 
@@ -1611,9 +1679,9 @@ mod tests {
         let json = serde_json::to_string(&input).unwrap();
         let parsed: TaskToolInput = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.description, "find bugs");
-        assert_eq!(
-            parsed.capability_mode,
-            Some(SubagentCapabilityMode::ReadOnly)
+        assert!(
+            parsed.capability_mode.is_none(),
+            "capability_mode is harness-only and must not round-trip through JSON"
         );
         assert_eq!(parsed.model.as_deref(), Some("test-model"));
     }
@@ -1626,17 +1694,16 @@ mod tests {
             ("execute", SubagentCapabilityMode::Execute),
             ("all", SubagentCapabilityMode::All),
         ] {
-            let json =
-                format!(r#"{{"description":"d","prompt":"p","capability_mode":"{json_val}"}}"#);
-            let input: TaskToolInput = serde_json::from_str(&json).unwrap();
-            assert_eq!(input.capability_mode, Some(expected), "for {json_val}");
+            let parsed: SubagentCapabilityMode =
+                serde_json::from_value(serde_json::json!(json_val)).unwrap();
+            assert_eq!(parsed, expected, "for {json_val}");
         }
     }
 
     #[test]
     fn capability_mode_rejects_invalid_value() {
-        let json = r#"{"description":"d","prompt":"p","capability_mode":"invalid_mode"}"#;
-        let result = serde_json::from_str::<TaskToolInput>(json);
+        let result =
+            serde_json::from_value::<SubagentCapabilityMode>(serde_json::json!("invalid_mode"));
         assert!(result.is_err(), "unknown value should be rejected");
     }
 
@@ -1660,10 +1727,9 @@ mod tests {
             ("All", SubagentCapabilityMode::All, "all"),
             ("ALL", SubagentCapabilityMode::All, "all"),
         ] {
-            let json = format!(r#"{{"description":"d","prompt":"p","capability_mode":"{alias}"}}"#);
-            let input: TaskToolInput = serde_json::from_str(&json)
+            let parsed: SubagentCapabilityMode = serde_json::from_value(serde_json::json!(alias))
                 .unwrap_or_else(|e| panic!("alias {alias:?} should parse: {e}"));
-            assert_eq!(input.capability_mode, Some(expected), "parse {alias:?}");
+            assert_eq!(parsed, expected, "parse {alias:?}");
             assert_eq!(
                 serde_json::to_value(expected).unwrap(),
                 canonical,

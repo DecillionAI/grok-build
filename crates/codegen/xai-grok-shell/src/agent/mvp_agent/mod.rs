@@ -58,7 +58,8 @@ use crate::agent::folder_trust;
 use crate::agent::models::{resolve_catalog_key, selectable_catalog_key_for_persisted};
 use crate::agent::session_config;
 use xai_grok_sampling_types::{
-    REASONING_EFFORT_META_KEY, ReasoningEffortOption, reasoning_effort_meta_value,
+    REASONING_EFFORT_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    parse_reasoning_effort_meta, reasoning_effort_meta_value,
     supports_reasoning_effort_meta,
 };
 use crate::agent::update_chunk_merge;
@@ -84,10 +85,11 @@ use crate::terminal::{AcpTerminalRunner, TerminalRunner};
 use crate::tools::ToolContext;
 use crate::upload::manifest::write_error_manifest;
 use crate::upload::trace::{
-    GCS_SCHEMA_VERSION, PromptMetadata, TurnResultMetadata,
-    build_chat_history_session_state, local_sandbox_telemetry, upload_full_prompt_txt,
-    upload_harness_session_archive, upload_images, upload_metadata, upload_plugin_state,
-    upload_session_state, upload_turn_messages, upload_turn_result, upload_unified_log,
+    GCS_SCHEMA_VERSION, PromptMetadata, PromptMetadataParams, TurnResultMetadata,
+    build_chat_history_then_move_capture, local_sandbox_telemetry,
+    upload_full_prompt_txt, upload_harness_session_archive, upload_images,
+    upload_metadata, upload_plugin_state, upload_session_state, upload_turn_messages,
+    upload_turn_result, upload_unified_log,
 };
 use crate::upload::turn::{
     PromptTraceContext, UploadWait, complete_prompt_trace, spawn_upload_task,
@@ -252,7 +254,8 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub client_terminal: bool,
     pub client_fs_read: bool,
     pub client_fs_write: bool,
-    pub preloaded_envrc: Option<std::collections::HashMap<String, String>>,
+    /// In-flight `.envrc` load; `None` → `spawn_and_register_session` spawns its own.
+    pub envrc: Option<xai_grok_workspace::envrc::EnvrcLoad>,
     pub persisted_signals: Option<crate::session::signals::SessionSignals>,
     pub persisted_plan_mode: Option<crate::session::plan_mode::PlanModeSnapshot>,
     pub persisted_goal_mode: Option<crate::session::goal_tracker::GoalOrchestration>,
@@ -263,9 +266,10 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub session_meta: Option<&'a acp::Meta>,
-    pub managed_mcp_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
+    /// A `session/new` reasoning-effort hint applied to the spawn sampling; `None` for loads.
+    pub initial_reasoning_effort: Option<ReasoningEffort>,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
@@ -432,16 +436,16 @@ pub(crate) fn chat_session_spawn_options<'a>(
         client_terminal: false,
         client_fs_read: false,
         client_fs_write: false,
-        preloaded_envrc: None,
+        envrc: None,
         persisted_signals: None,
         persisted_plan_mode: None,
         persisted_goal_mode: None,
         persisted_workflow_runs: Vec::new(),
         persisted_announcement_state: None,
         session_meta,
-        managed_mcp_expires_at: None,
         model_agent_type,
         session_model_id,
+        initial_reasoning_effort: None,
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
@@ -504,8 +508,10 @@ pub(crate) struct PromptResponseMeta {
     /// Whole-prompt billing (sibling token fields are last call only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::extensions::notification::PromptUsage>,
-    /// Cancellation category when the turn was terminated by the system
-    /// (e.g. doom loop). `None` for normal completions and user cancels.
+    /// Why the turn ended early (`cancellation_category_meta`): a cancel's
+    /// category (`"HookDenied"`, `"MidTurnAbort"`, …) or a synthetic end
+    /// (`"max_turns_reached"`, `"action_stationarity"`); `None` for normal
+    /// completions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_category: Option<String>,
     /// What triggered a cancelled turn's cancel (`"send_now"`, `"ctrl_c"`,
@@ -606,6 +612,7 @@ struct SettingsUpdateNotification {
     gate_url: Option<String>,
     gate_label: Option<String>,
     allow_access: Option<bool>,
+    consent_gate: Option<crate::util::config::ConsentGate>,
     subscription_tier_display: Option<String>,
     auto_permission_mode_enabled: Option<bool>,
     /// Soft-default permission mode for the pager (post-auth / `/new` refresh).
@@ -717,6 +724,10 @@ struct ResidentResources {
 struct RetainedResources {
     turn_number: Option<u64>,
     dispatch_lock: Option<std::rc::Rc<tokio::sync::Mutex<()>>>,
+    /// Serializes tray `list_running` and the actor's live-orphan tick.
+    /// Same `Arc` is cloned onto `ToolContext` at spawn. Released by
+    /// `remove_session`.
+    live_orphan_heal_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     permission_event_receiver: Option<
         tokio::sync::mpsc::UnboundedReceiver<PermissionEvent>,
     >,
@@ -817,7 +828,7 @@ pub struct MvpAgent {
     /// [`Self::sync_collection_config_gate`] on every mid-session
     /// `remote_settings` rewrite.
     pub(crate) trace_upload_live: Arc<std::sync::atomic::AtomicBool>,
-    /// Memory system configuration (None when --experimental-memory not set).
+    /// Memory system configuration (None when memory is disabled).
     memory_config: Option<crate::config::MemoryConfig>,
     /// Optional channel to the leader's `ConfigFileWatcher` for dynamic
     /// per-cwd registration as new sessions open. Each
@@ -848,6 +859,9 @@ pub struct MvpAgent {
     /// LEADER-SAFE(shared): agent-level code-nav index manager, keyed by cwd,
     /// no per-client state.
     codebase_indexes: Arc<parking_lot::Mutex<CodebaseIndexManager>>,
+    /// LEADER-SAFE(init-once): one index for the process. Empty until
+    /// [`MvpAgent::start_search_index_once`] decides, so reading cannot decide.
+    search_index: crate::session::storage::search::SharedSearchIndex,
     /// Worktree creation type (resolved: local config > remote > default Linked).
     pub(crate) worktree_type: crate::util::config::WorktreeType,
     /// Restore codebase state on worktree resume (resolved: local config > remote > default false).
@@ -928,6 +942,13 @@ pub struct MvpAgent {
     /// Cleared by [`PostUnblockJwtRetryInFlightGuard`] on task exit (including
     /// panic/abort), not only on the normal post-backoff path.
     post_unblock_jwt_retry_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight claim for [`MvpAgent::retry_subscription_check`] — the
+    /// tier re-check work itself, so the detached initialize re-check, the
+    /// awaited authenticate-path checks, and the pager's 5s poll can never
+    /// run it concurrently (a second concurrent check would double IdP/HTTP
+    /// traffic for the same verdict and race the gate writes). Cleared by
+    /// [`TierRecheckInFlightGuard`] on exit (including panic/abort).
+    tier_recheck_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Local workspace ops, built lazily via [`Self::ensure_local_workspace_ops`].
     /// The agent never opens Computer Hub as a harness/client; remote cloud
     /// sandboxes are gateway-owned (`gateway_bridge` / `computer_sessions`).
@@ -1004,10 +1025,17 @@ pub struct MvpAgent {
     /// in-flight guard.
     #[cfg(test)]
     settings_reapply_spawn_count: std::cell::Cell<usize>,
+    /// Test-only: counts auto-GC runs spawned past the settled guard.
+    #[cfg(test)]
+    auto_gc_spawn_count: std::cell::Cell<usize>,
     /// Test-only: counts `spawn_post_auth_settings` tasks spawned past its
     /// own guard.
     #[cfg(test)]
     post_auth_settings_spawn_count: std::cell::Cell<usize>,
+    /// Test-only: counts tier re-checks that claimed the single-flight flag
+    /// (i.e. `retry_subscription_check` bodies that actually ran).
+    #[cfg(test)]
+    tier_recheck_run_count: std::cell::Cell<usize>,
 }
 /// Spawn a thread to warm the shared async HTTP client (`OnceLock`-cached).
 /// Loading TLS root certs is ~95ms; doing it here avoids a cold-start hit
@@ -1107,6 +1135,41 @@ fn read_session_or_init_meta_str<'a>(
         m.and_then(|m| m.get(key)).and_then(|v| v.as_str())
     };
     read(session_meta).or_else(|| read(init_meta))
+}
+/// Resolve `startupHints` for a session spawn: the session request `_meta`
+/// wins over the connection-level `initialize` `_meta`.
+///
+/// Same OnceLock-bypass rationale as [`read_session_or_init_meta_str`], and
+/// it matters most for headless clients: the shared `initialize_request`
+/// holds whichever client initialized this process first, and a leader can
+/// multiplex many logical clients — so on a leader-routed `session/load`
+/// the init-level hints can belong to a *different* client than the one
+/// loading the session. Losing `nonInteractive` silently downgrades
+/// `McpInitStrategy::Blocking` to `Progressive`, letting the first prompt
+/// of a loaded headless session run while the MCP server carrying its only
+/// user-visible output channel is still handshaking.
+///
+/// The first parseable `startupHints` object wins whole (no per-field
+/// merge), mirroring how a client would send it on `initialize`; an
+/// unparseable value falls through, matching the sibling helper's
+/// treatment of wrong-typed values.
+fn startup_hints_from_meta(
+    session_meta: Option<&acp::Meta>,
+    init_meta: Option<&acp::Meta>,
+) -> crate::session::StartupHints {
+    explicit_startup_hints(session_meta)
+        .or_else(|| explicit_startup_hints(init_meta))
+        .unwrap_or_default()
+}
+/// Parse `startupHints` carried explicitly on one `_meta` object. `None`
+/// when absent or unparseable — callers that must distinguish "client made
+/// no claim" from "client sent defaults" (the resident re-attach rail) key
+/// on this, so an attach without hints never resets a session's policy.
+fn explicit_startup_hints(
+    meta: Option<&acp::Meta>,
+) -> Option<crate::session::StartupHints> {
+    meta.and_then(|m| m.get("startupHints"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 /// Non-empty `systemPromptOverride` from session meta (preferred) or init meta.
@@ -1359,6 +1422,7 @@ mod session_lifecycle;
 mod subagent_coordinator;
 mod agent_ops;
 mod acp_agent;
+pub(crate) mod reasoning_effort;
 mod session_setup;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
@@ -1397,160 +1461,6 @@ pub(crate) struct OrphanedTask {
     cwd: String,
 }
 impl MvpAgent {
-    /// Replay updates from disk and drain completions.
-    /// Returns `(initial_total_tokens, end_offset)`.
-    pub(super) async fn replay_session_updates(
-        &self,
-        session_id: &acp::SessionId,
-        cwd: &AbsPathBuf,
-        updates_file_path: &Option<PathBuf>,
-        persist_data: Option<&serde_json::Value>,
-        target_client_id: Option<&serde_json::Value>,
-        cursor: Option<&str>,
-    ) -> Result<(u64, u64, Vec<(String, String)>), acp::Error> {
-        let mut replay_timer = crate::instrumentation_timer!("session.load_session_replay");
-        replay_timer.with_field("session_id", session_id.0.as_ref());
-        replay_timer.with_field("cwd", cwd.as_str());
-        let Some(updates_path) = updates_file_path.clone() else {
-            tracing::warn!(session_id = %session_id.0, "replay: no updates file path");
-            return Ok((0, 0, Vec::new()));
-        };
-        let file_size = std::fs::metadata(&updates_path).map(|m| m.len()).unwrap_or(0);
-        let raw_contents = match std::fs::read_to_string(&updates_path) {
-            Ok(s) if !s.is_empty() => s,
-            _ => return Ok((0, 0, Vec::new())),
-        };
-        let end_offset = raw_contents.len() as u64;
-        let mut prepared = {
-            let _timer = crate::instrumentation_timer!("session.replay.read_and_filter");
-            crate::session::storage::prepare_replay_lines(&raw_contents, cursor)
-        };
-        let unfinished_subagents = std::mem::take(&mut prepared.unfinished_subagents);
-        if cursor.is_some() {
-            let sending = prepared.lines.len();
-            if prepared.mark_replay {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    "replay: cursor not found, falling back to full replay"
-                );
-            } else {
-                tracing::info!(
-                    session_id = %session_id.0,
-                    skipped = prepared.total_live - sending,
-                    remaining = sending,
-                    "replay: cursor found, skipping events"
-                );
-            }
-        }
-        let last_tokens = prepared.last_tokens;
-        let mark_replay = prepared.mark_replay;
-        if let Some(max_seq) = prepared.max_event_seq {
-            crate::util::event_id::ensure_event_counter_at_least(max_seq + 1);
-        }
-        let lines_to_send = prepared.lines;
-        let updates_count = lines_to_send.len() as u64;
-        let mut completions = Vec::with_capacity(lines_to_send.len());
-        {
-            let _timer = crate::instrumentation_timer!("session.replay.forward_updates");
-            let mut pending_tool_calls = std::collections::HashMap::new();
-            for line in &lines_to_send {
-                self.forward_raw_replay_line(
-                    line,
-                    persist_data,
-                    target_client_id,
-                    &mut completions,
-                    mark_replay,
-                    &mut pending_tool_calls,
-                );
-            }
-        }
-        if updates_count > 0 && completions.is_empty() {
-            tracing::warn!(
-                updates_count,
-                "Replay sent updates but collected 0 completions — \
-                 forward_raw_replay_line must use gateway.forward_with_completion(). \
-                 See: session/load notification ordering bug."
-            );
-        }
-        {
-            let _timer = crate::instrumentation_timer!("session.replay.drain_completions");
-            for rx in completions {
-                let _ = rx.await;
-            }
-        }
-        tracing::info!(
-            session_id = %session_id.0,
-            updates_count,
-            end_offset,
-            file_size,
-            "replay: completed"
-        );
-        replay_timer.with_field("updates_count", updates_count);
-        Ok((last_tokens, end_offset, unfinished_subagents))
-    }
-    /// Enqueue replay notifications for updates appended after `from_offset`.
-    /// Returns completion receivers; callers open the gate then drain.
-    /// Intentionally sync (not async) so no prompt-task progress before gate flip.
-    ///
-    /// When `mark_replay` is false (cursor-based reconnect), delta events are
-    /// forwarded without `_meta.isReplay` since they are truly new events the
-    /// client has not seen.
-    pub(super) fn replay_session_updates_from_offset_enqueue(
-        &self,
-        session_id: &acp::SessionId,
-        updates_file_path: &Option<PathBuf>,
-        from_offset: u64,
-        persist_data: Option<&serde_json::Value>,
-        target_client_id: Option<&serde_json::Value>,
-        mark_replay: bool,
-    ) -> Vec<tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<()>>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let Some(updates_path) = updates_file_path.clone() else {
-            return Vec::new();
-        };
-        let mut file = match std::fs::File::open(&updates_path) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
-        if file.seek(SeekFrom::Start(from_offset)).is_err() {
-            return Vec::new();
-        }
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_err() || contents.is_empty() {
-            return Vec::new();
-        }
-        let live_lines = crate::session::storage::filter_delta_replay_lines(&contents);
-        let delta_count = live_lines.len();
-        let mut completions = Vec::with_capacity(live_lines.len());
-        let mut pending_tool_calls = std::collections::HashMap::new();
-        for line in &live_lines {
-            self.forward_raw_replay_line(
-                line,
-                persist_data,
-                target_client_id,
-                &mut completions,
-                mark_replay,
-                &mut pending_tool_calls,
-            );
-        }
-        if delta_count > 0 && completions.is_empty() {
-            tracing::warn!(
-                delta_count,
-                "Delta replay sent updates but collected 0 completions — \
-                 forward_raw_replay_line must use gateway.forward_with_completion(). \
-                 See: session/load notification ordering bug."
-            );
-        }
-        if delta_count > 0 {
-            tracing::info!(
-                session_id = %session_id.0,
-                delta_count,
-                from_offset,
-                "Delta replay enqueued updates (drain pending)"
-            );
-        }
-        completions
-    }
     /// Scan persisted updates for `task_backgrounded` entries that have no
     /// matching `task_completed`. Applies rewind dead-branch filtering so
     /// tasks from rewound branches are not included.
@@ -1640,6 +1550,7 @@ impl MvpAgent {
                 kind: xai_grok_tools::computer::types::TaskKind::Bash,
                 block_waited: false,
                 explicitly_killed: false,
+                kill_result_delivered: false,
                 owner_session_id: None,
                 description: None,
                 is_backgrounded: true,
@@ -1768,13 +1679,27 @@ impl MvpAgent {
     /// blocked on `/v1/models`. Without a matching claim, defers to
     /// `spawn_post_unblock_jwt_and_catalog_retry`.
     pub(crate) async fn retry_subscription_check(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .tier_recheck_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            tracing::debug!("tier re-check already in flight, skipping duplicate check");
+            return;
+        }
+        let _in_flight_guard = TierRecheckInFlightGuard {
+            flag: self.tier_recheck_in_flight.clone(),
+        };
+        #[cfg(test)]
+        self.tier_recheck_run_count.set(self.tier_recheck_run_count.get() + 1);
         let (proxy_base_url, alpha_test_key) = {
             let cfg = self.cfg.borrow();
             (cfg.endpoints.proxy_url(), cfg.endpoints.alpha_test_key.clone())
         };
         let user_id = self
             .auth_manager
-            .current()
+            .current_or_expired()
             .map(|a| a.user_id.clone())
             .unwrap_or_default();
         let result = super::subscription_check::single_check(
@@ -1784,6 +1709,13 @@ impl MvpAgent {
                 &user_id,
             )
             .await;
+        let canonical_user_id = result
+            .as_ref()
+            .map(|u| u.canonical_user_id.clone())
+            .filter(|c| !c.is_empty());
+        if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref()) {
+            return;
+        }
         if let Some(unblocked) = result {
             tracing::info!(
                 new_tier = %unblocked.new_tier,
@@ -1804,10 +1736,22 @@ impl MvpAgent {
                 && let Some(auth) = self.auth_manager.current()
                 && let Some(settings) = self.fetch_settings_resolving_gate(&auth).await
             {
+                if self
+                    .tier_recheck_identity_changed(
+                        &user_id,
+                        canonical_user_id.as_deref(),
+                    )
+                {
+                    return;
+                }
                 self.install_remote_settings(settings);
                 if remote_was_absent {
-                    self.spawn_auto_worktree_gc();
+                    self.run_deferred_remote_work();
                 }
+            }
+            if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref())
+            {
+                return;
             }
             if crate::util::config::resolve_remote_fetch_enabled()
                 && !settings_allow_access(self.cfg.borrow().remote_settings.as_ref())
@@ -1828,40 +1772,67 @@ impl MvpAgent {
                 );
                 return;
             }
-            self.tier_allowed.set(true);
-            let refresh_ok = match self
+            let claim_already_current = self
                 .auth_manager
-                .refresh_chain(
-                    crate::auth::token_type::TokenType::OidcSession,
-                    crate::auth::manager::RefreshReason::ServerRejected,
-                )
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!("post-unblock: JWT refresh_chain succeeded");
-                    xai_grok_telemetry::unified_log::info(
-                        "paywall_check_jwt_refreshed",
-                        None,
-                        Some(serde_json::json!({ "user_id": user_id })),
-                    );
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "post-unblock: JWT refresh failed, user may need to re-login on next restart");
-                    xai_grok_telemetry::unified_log::warn(
-                        "paywall_check_error",
-                        None,
-                        Some(
-                            serde_json::json!({
-                            "user_id": user_id,
-                            "kind": "post_unblock_refresh_failed",
-                            "detail": e.to_string(),
-                        }),
-                        ),
-                    );
-                    false
-                }
+                .current_or_expired()
+                .and_then(|auth| jwt_tier_claim(&auth.key))
+                .is_some_and(|claim| jwt_claim_matches_user_subscription_tier(
+                    &claim,
+                    &unblocked.new_tier,
+                ));
+            let refresh_ok = if claim_already_current {
+                true
+            } else if unblocked.refresh_deadline_hit {
+                tracing::info!(
+                    "post-unblock: skipping forced mint, single_check's bounded refresh still in flight"
+                );
+                xai_grok_telemetry::unified_log::info(
+                    "paywall_check_skip_redundant_mint",
+                    None,
+                    Some(serde_json::json!({ "user_id": user_id })),
+                );
+                false
+            } else {
+                match self
+                        .auth_manager
+                        .refresh_chain_bounded(
+                            crate::auth::token_type::TokenType::OidcSession,
+                            crate::auth::manager::RefreshReason::ServerRejected,
+                            crate::auth::manager::BEST_EFFORT_REFRESH_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!("post-unblock: JWT refresh_chain succeeded");
+                            xai_grok_telemetry::unified_log::info(
+                                "paywall_check_jwt_refreshed",
+                                None,
+                                Some(serde_json::json!({ "user_id": user_id })),
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "post-unblock: JWT refresh failed, user may need to re-login on next restart");
+                            xai_grok_telemetry::unified_log::warn(
+                                "paywall_check_error",
+                                None,
+                                Some(
+                                    serde_json::json!({
+                                "user_id": user_id,
+                                "kind": "post_unblock_refresh_failed",
+                                "detail": e.to_string(),
+                            }),
+                                ),
+                            );
+                            false
+                        }
+                    }
             };
+            if self.tier_recheck_identity_changed(&user_id, canonical_user_id.as_deref())
+            {
+                return;
+            }
+            self.tier_allowed.set(true);
             let jwt_claim = self
                 .auth_manager
                 .current_or_expired()
@@ -1983,26 +1954,92 @@ impl MvpAgent {
             return;
         }
         let Some(auth) = self.auth_manager.current() else {
+            self.run_deferred_remote_work();
             return;
         };
         let Some(settings) = self.fetch_settings_resolving_gate(&auth).await else {
+            self.run_deferred_remote_work();
             return;
         };
         tracing::info!("post-auth remote_settings fetch succeeded");
         self.install_remote_settings(settings);
+        self.run_deferred_remote_work();
+    }
+    /// Remote settings are on the config, or they are never coming.
+    pub(super) fn remote_settings_settled(&self) -> bool {
+        let arrived = self.cfg.borrow().remote_settings.is_some();
+        arrived || !crate::util::config::resolve_remote_fetch_enabled()
+    }
+    /// The two switches `initialize` defers, which share no precondition:
+    /// auto-GC guards itself, the index decides on whatever has arrived.
+    pub(super) fn run_deferred_remote_work(&self) {
         self.spawn_auto_worktree_gc();
+        self.start_search_index_once();
+    }
+    /// Settles whether this process keeps an index. Touches no disk until
+    /// something bootstraps it.
+    fn decide_search_index(&self) {
+        self.search_index
+            .decide(|| {
+                crate::session::storage::search::start_if_enabled(&self.cfg.borrow())
+                    .started()
+                    .map(Arc::new)
+            });
+    }
+    /// Decides, then bootstraps. The first decision is kept: a later switch would
+    /// serve an index missing everything written meanwhile.
+    pub(super) fn start_search_index_once(&self) {
+        self.decide_search_index();
+        if let crate::session::storage::search::IndexDecision::On(index) = self
+            .search_index()
+        {
+            index.bootstrap_once(crate::util::grok_home::grok_home());
+        }
+    }
+    pub(crate) fn search_index(
+        &self,
+    ) -> crate::session::storage::search::IndexDecision<'_> {
+        self.search_index.decision()
+    }
+    /// For code that cannot borrow the agent, notably the persistence actor.
+    pub(crate) fn search_index_cell(
+        &self,
+    ) -> crate::session::storage::search::SharedSearchIndex {
+        self.search_index.clone()
     }
     /// Resolve current auto-GC policy and run it on the blocking pool.
     pub(super) fn spawn_auto_worktree_gc(&self) {
+        if !self.remote_settings_settled() {
+            static DEFERRED_ONCE: std::sync::Once = std::sync::Once::new();
+            DEFERRED_ONCE
+                .call_once(|| {
+                    tracing::info!(
+                    "worktree auto cleanup is waiting for the server to answer, and will not run \
+                     until it does or until remote_fetch is set to false"
+                );
+                });
+            return;
+        }
+        #[cfg(test)] self.auto_gc_spawn_count.set(self.auto_gc_spawn_count.get() + 1);
         let auto_gc_policy = self.cfg.borrow().resolve_worktree_auto_gc();
-        tokio::task::spawn_blocking(move || {
-            let opts = xai_fast_worktree::AutoGcOptions::from_resolved(auto_gc_policy);
-            if let Err(e) = xai_fast_worktree::WorktreeDb::open_default()
-                .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &opts))
-            {
-                tracing::warn!(error = %e, "auto worktree gc failed");
-            }
-        });
+        let grok_home = xai_fast_worktree::resolve_grok_home();
+        tokio::task::spawn_blocking(move || Self::reclaim_worktrees(
+            grok_home,
+            auto_gc_policy,
+        ));
+    }
+    /// The caller resolves the home: read here, $GROK_HOME would be read when the
+    /// blocking thread starts, and this deletes worktrees under what it finds.
+    pub(super) fn reclaim_worktrees(
+        grok_home: anyhow::Result<std::path::PathBuf>,
+        policy: xai_fast_worktree::ResolvedWorktreeAutoGc,
+    ) {
+        if let Err(e) = grok_home
+            .and_then(|home| xai_fast_worktree::WorktreeDb::open(&home))
+            .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &policy))
+        {
+            tracing::warn!(error = %e, "auto worktree gc failed");
+        }
     }
     /// Fire-and-forget `x.ai/settings/update` from the current remote snapshot.
     pub(super) fn emit_settings_update_notification(&self) {
@@ -2024,6 +2061,7 @@ impl MvpAgent {
                 gate_url: rs.and_then(|s| s.gate_url.clone()),
                 gate_label: rs.and_then(|s| s.gate_label.clone()),
                 allow_access: rs.and_then(|s| s.allow_access),
+                consent_gate: rs.and_then(|s| s.consent_gate.clone()),
                 subscription_tier_display: rs
                     .and_then(|s| s.subscription_tier_display.clone()),
                 auto_permission_mode_enabled: crate::util::config::remote_auto_mode_enabled(
@@ -2103,6 +2141,71 @@ impl MvpAgent {
                     registry,
                 });
         }
+    }
+    /// True when the live credential no longer belongs to the identity a
+    /// tier re-check started with. Every post-await write in
+    /// [`Self::retry_subscription_check`] runs behind this, so a detached
+    /// check that outlives an account switch discards its result instead of
+    /// gating/ungating the successor identity.
+    ///
+    /// `canonical_user_id` is the `/user` `userId` the check itself resolved
+    /// with the live bearer (see `UnblockResult`): the check's own mint
+    /// spawns a `/user` enrichment that can rewrite a seeded/stale user_id
+    /// to that canonical value mid-check, and that normalization is the same
+    /// account, not a switch. A real switch matches neither id.
+    fn tier_recheck_identity_changed(
+        &self,
+        started_user_id: &str,
+        canonical_user_id: Option<&str>,
+    ) -> bool {
+        let live = self.auth_manager.current_or_expired().map(|a| a.user_id);
+        if live.as_deref() == Some(started_user_id) {
+            return false;
+        }
+        if let Some(canonical) = canonical_user_id.filter(|c| !c.is_empty())
+            && live.as_deref() == Some(canonical)
+        {
+            return false;
+        }
+        xai_grok_telemetry::unified_log::info(
+            "tier re-check identity changed, discarding result",
+            None,
+            Some(
+                serde_json::json!({
+                "started_user_id": started_user_id,
+                "canonical_user_id": canonical_user_id,
+                "live_user_id": live,
+            }),
+            ),
+        );
+        true
+    }
+    /// Background the reconnect tier re-check so a gated initialize answers
+    /// immediately: the re-check can block for tens of seconds on the
+    /// subscription endpoint plus a refresh, and the pager already polls
+    /// "Check subscription" every 5s while the paywall shows, so a background
+    /// lift lands within one poll. No outer timeout: every await inside is
+    /// bounded (HTTP, bounded refresh), and a drop-at-deadline would abandon
+    /// an in-flight IdP exchange. Deduplication lives on the work itself —
+    /// `retry_subscription_check` claims `tier_recheck_in_flight` — so this
+    /// spawn, the awaited authenticate-path checks, and the pager's poll can
+    /// never run the re-check concurrently.
+    ///
+    /// Two deliberate user-visible consequences (also documented in
+    /// AUTH.md § "Reconnect tier re-check"): a subscribed user with a stale
+    /// cached verdict can see a paywall flash on reconnect that the detached
+    /// check clears within one poll, and the gate lift can land up to the
+    /// bounded refresh budget (`BEST_EFFORT_REFRESH_TIMEOUT`, 20s) later
+    /// than the pre-detached behavior because `tier_allowed` is set only
+    /// after that refresh returns and is identity-revalidated.
+    pub(super) fn spawn_tier_recheck(&self) {
+        let agent_ref = LocalRef::new(self);
+        tokio::task::spawn_local(async move {
+            let Some(auth) = agent_ref.get().auth_manager.current() else {
+                return;
+            };
+            agent_ref.get().enforce_grok_code_access(&auth).await;
+        });
     }
     /// Spawn a best-effort bundle sync. Re-fires on every call site (init,
     /// cached_token, grok.com/oidc); the cheap pre-checks below absorb repeats
@@ -2233,17 +2336,14 @@ async fn handle_synthetic_turn_trace(
         return;
     };
     let before_ctx = ctx.clone();
-    let metadata = PromptMetadata {
+    let metadata = PromptMetadata::new(PromptMetadataParams {
         schema_version: GCS_SCHEMA_VERSION.to_string(),
         session_id: ctx.session_info.id.0.to_string(),
         turn_number: ctx.turn_number,
         request_id: request.prompt_id.clone(),
         turn_started_at,
-        repo_root: None,
-        remote_url: None,
         user_id,
         user_email,
-        team_id: None,
         client_source,
         client_version,
         model: model.clone(),
@@ -2251,18 +2351,16 @@ async fn handle_synthetic_turn_trace(
             .session_handle
             .reasoning_effort
             .map(|e| e.as_str().to_string()),
-        experiment_id: None,
         host_os: std::env::consts::OS.to_string(),
         host_arch: std::env::consts::ARCH.to_string(),
         prompt_has_image: Some(false),
         prompt_was_truncated: Some(false),
         prompt_verbatim: Some(true),
         cwd: Some(info.cwd.clone()),
-        agent_type: None,
         shell_version: Some(xai_grok_version::VERSION.to_string()),
-        workspace_type: None,
         sandbox: local_sandbox_telemetry(),
-    };
+        ..Default::default()
+    });
     spawn_upload_task(
         "synthetic_before_uploads",
         async move {
@@ -2430,11 +2528,24 @@ impl Drop for PostUnblockJwtRetryInFlightGuard {
         self.flag.store(false, std::sync::atomic::Ordering::Release);
     }
 }
+/// Clears [`MvpAgent::tier_recheck_in_flight`] on scope exit — completion,
+/// early identity-changed bail, cancel/abort, or panic — so the single-flight
+/// flag cannot wedge `true` for the rest of the process.
+struct TierRecheckInFlightGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for TierRecheckInFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Background retry when post-unblock JWT lacks a tier claim that matches
-/// the live `/user` tier. Re-attempts `refresh_chain` and only treats an
-/// attempt as success when [`jwt_claim_matches_user_subscription_tier`]
-/// holds (bare refresh Ok, free token, or a *stale older* paid claim are
-/// all misses). Then refreshes the model catalog.
+/// the live `/user` tier. Each attempt first re-checks the current JWT (the
+/// bounded refresh's detached mint may have landed a matching claim already)
+/// and only then re-attempts `refresh_chain`; an attempt succeeds only when
+/// [`jwt_claim_matches_user_subscription_tier`] holds (bare refresh Ok, free
+/// token, or a *stale older* paid claim are all misses). Then refreshes the
+/// model catalog.
 ///
 /// Gate lift already happened; this only recovers the tier-targeted catalog.
 ///
@@ -2479,6 +2590,18 @@ fn spawn_post_unblock_jwt_and_catalog_retry(
                     let auth_manager = auth_manager.clone();
                     let new_tier = new_tier.clone();
                     async move {
+                        let pre_refresh_claim = auth_manager
+                            .current_or_expired()
+                            .and_then(|auth| jwt_tier_claim(&auth.key));
+                        let already_current = pre_refresh_claim
+                            .as_ref()
+                            .is_some_and(|claim| jwt_claim_matches_user_subscription_tier(
+                                claim,
+                                &new_tier,
+                            ));
+                        if already_current {
+                            return Ok(());
+                        }
                         let refresh_result = auth_manager
                             .refresh_chain(
                                 crate::auth::token_type::TokenType::OidcSession,

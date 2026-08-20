@@ -21,7 +21,6 @@
 //! Cost magnitudes: see `benches/edit_highlight` (hunk-only first paint is
 //! cheap; full-file is once-per-upgrade; naïve prefix-per-hunk is not shipped).
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
@@ -35,7 +34,6 @@ use syntect::highlighting::Style as SyntectStyle;
 
 use super::TOOL_HEADER_RANGE;
 use crate::appearance::AppearanceConfig;
-use crate::diff::{DiffHunk, diff_hunks_to_patch};
 use crate::scrollback::block::BlockContent;
 use crate::scrollback::types::{
     AccentStyle, BlockBackground, BlockContext, BlockLine, BlockOutput, DisplayMode,
@@ -44,6 +42,7 @@ use crate::scrollback::types::{
 };
 use crate::syntax::{Syntect, get_syntect};
 use crate::theme::{Theme, ThemeKind};
+use xai_grok_pager_diff::{DiffHunk, diff_hunks_to_patch};
 
 /// Skip full-file HL when the post-edit file exceeds this size (2 MiB).
 ///
@@ -112,15 +111,6 @@ impl Default for DiffRenderConfig {
 const INDENT: &str = "  ";
 const GUTTER_GAP: &str = " ";
 const CONTENT_GAP: &str = "  ";
-
-/// Expand tabs using the global tab_width (`Cow::Borrowed` when none).
-fn expand_tabs(text: &str) -> Cow<'_, str> {
-    let tw = crate::appearance::tab_width();
-    if tw == 0 || !text.contains('\t') {
-        return Cow::Borrowed(text);
-    }
-    Cow::Owned(text.replace('\t', &" ".repeat(tw as usize)))
-}
 
 /// A rendered diff line with optional background color.
 pub struct DiffLineOutput {
@@ -214,7 +204,7 @@ fn render_diff_hunks_core(
         let mut new_highlighter = syntect.highlight_lines_by_file_path(path);
         for line in hunk {
             let trimmed = line.text.trim_end_matches(['\r', '\n']);
-            let text = expand_tabs(trimmed);
+            let text = xai_grok_pager_render::appearance::expand_tabs(trimmed);
             // Cold spans render unconditionally so Delete lines and any map
             // miss (text drift) paint exactly like the hunk-only phase.
             let mut content_spans = match line.tag {
@@ -274,7 +264,10 @@ fn hunk_new_line_texts(hunks: &[DiffHunk]) -> HashMap<usize, String> {
         for line in hunk {
             if matches!(line.tag, ChangeTag::Equal | ChangeTag::Insert) && line.ln > 0 {
                 let trimmed = line.text.trim_end_matches(['\r', '\n']);
-                out.insert(line.ln, expand_tabs(trimmed).into_owned());
+                out.insert(
+                    line.ln,
+                    xai_grok_pager_render::appearance::expand_tabs(trimmed).into_owned(),
+                );
             }
         }
     }
@@ -325,7 +318,7 @@ pub fn compute_file_scoped_styles(
         if ln > max_needed {
             break;
         }
-        let expanded = expand_tabs(line);
+        let expanded = xai_grok_pager_render::appearance::expand_tabs(line);
         let owned = format!("{expanded}\n");
         let ranges = highlighter
             .highlight_line(&owned, &syntect.syntax_set)
@@ -379,7 +372,7 @@ pub fn render_diff_hunks_with_styles(
 /// user already saw). `None` — missing line, text drift, or nothing visible —
 /// keeps the cold spans.
 fn map_spans_for_line(
-    line: &crate::diff::DiffLine,
+    line: &xai_grok_pager_diff::DiffLine,
     expanded: &str,
     by_new_line: &HashMap<usize, EditLineStyles>,
     theme: &Theme,
@@ -410,7 +403,7 @@ fn map_spans_for_line(
 
 /// Assemble gutter + content spans into one or more wrapped [`DiffLineOutput`]s.
 fn assemble_diff_line_outputs(
-    line: &crate::diff::DiffLine,
+    line: &xai_grok_pager_diff::DiffLine,
     content_spans: Vec<Span<'static>>,
     layout: &GutterLayout,
     indent_width: usize,
@@ -643,7 +636,7 @@ fn gutter_layout(hunk: &DiffHunk, config: &DiffRenderConfig) -> GutterLayout {
 /// Render the line number gutter.
 fn render_gutter(
     spans: &mut Vec<Span<'static>>,
-    line: &crate::diff::DiffLine,
+    line: &xai_grok_pager_diff::DiffLine,
     layout: &GutterLayout,
     theme: &Theme,
     config: &DiffRenderConfig,
@@ -1502,8 +1495,8 @@ mod tests {
 
     use super::*;
     use crate::appearance::AppearanceConfig;
-    use crate::diff::DiffLine;
     use crate::scrollback::types::DisplayMode;
+    use xai_grok_pager_diff::DiffLine;
 
     fn test_ctx() -> BlockContext {
         BlockContext {
