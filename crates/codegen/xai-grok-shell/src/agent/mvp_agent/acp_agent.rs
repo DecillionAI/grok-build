@@ -4,7 +4,6 @@
 //! Co-located child of `mvp_agent` (`use super::*`).
 use super::*;
 use crate::auth::SilentRefresh;
-use crate::upload::trace::PromptMetadataParams;
 use crate::leader::protocol::InternalMethod;
 /// Which `x_search` sub-tools enforce the date cutoff, sent in `initialize`. `x_user_search` and
 /// `x_thread_fetch` are `false`: they don't honor it yet.
@@ -46,31 +45,39 @@ impl acp::Agent for MvpAgent {
     ) -> Result<acp::InitializeResponse, acp::Error> {
         tracing::debug!(target: "sampling_log", "Received initialize request");
         xai_grok_telemetry::unified_log::info("agent initialized", None, None);
-        xai_grok_telemetry::startup::mark_agent_serving();
         self.start_subagent_coordinator();
         if self.cfg.borrow().remote_settings.is_none() {
             self.spawn_settings_reapply();
         }
-        let remote_settled = self.remote_settings_settled();
-        let auto_gc_policy = self.cfg.borrow().resolve_worktree_auto_gc();
-        if !remote_settled {
+        let (auto_gc_policy, run_auto_gc) = {
+            let cfg = self.cfg.borrow();
+            let has_remote = cfg.remote_settings.is_some();
+            let run = has_remote || !crate::util::config::resolve_remote_fetch_enabled();
+            (cfg.resolve_worktree_auto_gc(), run)
+        };
+        if !run_auto_gc {
             tracing::debug!(
-                "auto worktree gc and session search deferred until remote_settings arrive"
+                "auto worktree gc deferred until remote_settings are available"
             );
         }
-        let grok_home = xai_fast_worktree::resolve_grok_home();
         tokio::task::spawn_blocking(move || {
             crate::session::worktree_pool::cleanup_stale_pool_worktrees(None);
-            if !remote_settled {
+            if !run_auto_gc {
                 return;
             }
-            Self::reclaim_worktrees(grok_home, auto_gc_policy);
+            let opts = xai_fast_worktree::AutoGcOptions::from_resolved(auto_gc_policy);
+            if let Err(e) = xai_fast_worktree::WorktreeDb::open_default()
+                .and_then(|db| xai_fast_worktree::maybe_auto_gc(&db, &opts))
+            {
+                tracing::warn!(error = %e, "auto worktree gc failed");
+            }
         });
         tokio::task::spawn_blocking(|| {
             crate::session::persistence::cleanup_stale_sessions(None);
         });
-        if remote_settled {
-            self.start_search_index_once();
+        {
+            let root = crate::util::grok_home::grok_home();
+            crate::session::storage::search::SEARCH_INDEX_MANAGER.bootstrap_once(root);
         }
         const PERMISSION_CLEANUP_TTL_DAYS: u64 = 30;
         static CLEANUP_PERMISSIONS_ONCE: std::sync::Once = std::sync::Once::new();
@@ -108,8 +115,8 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        if !self.tier_allowed.get() {
-            self.spawn_tier_recheck();
+        if !self.tier_allowed.get() && let Some(auth) = self.auth_manager.current() {
+            self.enforce_grok_code_access(&auth).await;
         }
         self.maybe_sync_bundle_in_background(false);
         let mut client_type = arguments
@@ -420,7 +427,12 @@ impl acp::Agent for MvpAgent {
         let current_working_directory = self.launch_cwd.clone();
         let hostname = gethostname::gethostname();
         let mcp_servers: Vec<crate::extensions::mcp::McpServerEntry> = Vec::new();
-        self.spawn_initialize_launch_mcp_setup();
+        let fetch_managed_mcps = self.cfg.borrow().managed_mcps_enabled
+            && self.can_fetch_managed_mcps();
+        if self.cfg.borrow().managed_mcps_enabled && !fetch_managed_mcps {
+            tracing::info!("Managed MCP fetch: DISABLED");
+        }
+        self.spawn_initialize_launch_mcp_setup(fetch_managed_mcps);
         self.spawn_managed_gateway_tool_catalog_fetch();
         {
             let agent_ref = LocalRef::new(self);
@@ -499,10 +511,7 @@ impl acp::Agent for MvpAgent {
                     "mcpApps": client_supports_mcp_apps,
                     "metadata": metadata,
                     "availableCommands": crate::session::slash_commands::builtin_commands(self.command_availability()),
-                    "cancelRewind": self
-                        .cfg
-                        .borrow()
-                        .is_feature_enabled(crate::agent::config::Feature::CancelRewind),
+                    "cancelRewind": self.cfg.borrow().resolve_cancel_rewind().value,
                     // Resolved session-recap state (remote settings / config / env;
                     // default ON). The client gates BOTH its automatic
                     // away-recap poll and the manual `/recap` on this so a
@@ -1020,7 +1029,6 @@ impl acp::Agent for MvpAgent {
                             arguments.session_id.clone(),
                             restore_model_id.clone(),
                         ),
-                        None,
                     )
                     .await
                 {
@@ -1153,12 +1161,14 @@ impl acp::Agent for MvpAgent {
                     }
                 })
                 .collect();
-            let mut prompt_metadata = PromptMetadata::new(PromptMetadataParams {
+            let mut prompt_metadata = PromptMetadata {
                 schema_version: GCS_SCHEMA_VERSION.to_string(),
                 session_id: ctx.session_info.id.0.to_string(),
                 turn_number: ctx.turn_number,
                 request_id: prompt_id.clone(),
                 turn_started_at: turn_started_at.clone(),
+                repo_root: None,
+                remote_url: None,
                 user_id,
                 user_email,
                 team_id,
@@ -1178,9 +1188,9 @@ impl acp::Agent for MvpAgent {
                 cwd: Some(ctx.session_info.cwd.clone()),
                 agent_type: Some(ctx.session_handle.agent_name.clone()),
                 shell_version: Some(xai_grok_version::VERSION.to_string()),
+                workspace_type: None,
                 sandbox: local_sandbox_telemetry(),
-                ..Default::default()
-            });
+            };
             let (session_copy_tx, session_copy_rx) = oneshot::channel();
             let copy_sent = ctx
                 .session_handle
@@ -1359,10 +1369,6 @@ impl acp::Agent for MvpAgent {
                 } => ctx.trigger.clone(),
                 _ => None,
             });
-        let cancellation_category: Option<String> = stop_result
-            .as_ref()
-            .ok()
-            .and_then(|ok| ok.completion_kind.cancellation_category_meta());
         {
             let mapped = stop_result
                 .as_ref()
@@ -1387,9 +1393,6 @@ impl acp::Agent for MvpAgent {
             }
             if let Some(ref t) = cancel_trigger {
                 payload["cancelTrigger"] = serde_json::json!(t);
-            }
-            if let Some(ref c) = cancellation_category {
-                payload["cancellationCategory"] = serde_json::json!(c);
             }
             let params = serde_json::value::to_raw_value(&payload)
                 .expect("prompt_complete params serialization");
@@ -1874,6 +1877,19 @@ impl acp::Agent for MvpAgent {
                     }
                 }
                 let last_turn_usage = last_turn_usage_for_meta;
+                let cancellation_category = match &completion_kind {
+                    crate::session::commands::PromptCompletionKind::Cancelled {
+                        category: Some(cat),
+                        ..
+                    } => Some(format!("{cat:?}")),
+                    crate::session::commands::PromptCompletionKind::MaxTurnsReached {
+                        ..
+                    } => Some("max_turns_reached".to_string()),
+                    crate::session::commands::PromptCompletionKind::StationarityEnded => {
+                        Some("action_stationarity".to_string())
+                    }
+                    _ => None,
+                };
                 Ok(
                     acp::PromptResponse::new(stop_reason)
                         .meta(
@@ -2083,24 +2099,9 @@ impl acp::Agent for MvpAgent {
             let rewind_if_no_output = args
                 .meta
                 .as_ref()
-                .and_then(|m| {
-                    m.get("rewindIfNoOutput").or_else(|| m.get("rewindIfPristine"))
-                })
+                .and_then(|m| m.get("rewindIfPristine"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let rewind_prompt_id = args
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("promptId"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            let history = if rewind_if_no_output {
-                crate::session::CancelHistoryDisposition::RewindIfNoOutput {
-                    prompt_id: rewind_prompt_id,
-                }
-            } else {
-                crate::session::CancelHistoryDisposition::Keep
-            };
             let dispatch_lock = self.dispatch_lock(&args.session_id);
             let _dispatch_guard = dispatch_lock.lock().await;
             let _ = handle
@@ -2108,7 +2109,7 @@ impl acp::Agent for MvpAgent {
                 .send(
                     SessionCommand::Cancel(crate::session::CancelOptions {
                         cancel_subagents,
-                        history,
+                        rewind_if_no_output,
                         trigger: cancel_trigger,
                         user_initiated: true,
                         ..Default::default()
@@ -2143,13 +2144,7 @@ impl acp::Agent for MvpAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
-        let model = match self.resolve_model_id(&args.model_id) {
-            Ok(model) => model,
-            Err(_) => {
-                self.models_manager.wait_for_first_catalog().await;
-                self.resolve_model_id(&args.model_id)?
-            }
-        };
+        let model = self.resolve_model_id(&args.model_id)?;
         if !model.info.user_selectable {
             return Err(
                 acp::Error::invalid_params()
@@ -2157,13 +2152,7 @@ impl acp::Agent for MvpAgent {
             );
         }
         let session_id = args.session_id.clone();
-        let effort_override = parse_reasoning_effort_meta(args.meta.as_ref());
-        let res = crate::agent::handlers::model_switch::apply(
-                self,
-                args,
-                effort_override,
-            )
-            .await;
+        let res = crate::agent::handlers::model_switch::apply(self, args).await;
         if res.is_ok()
             && let Some(unavailable) = self
                 .session_registry
@@ -2207,9 +2196,6 @@ impl acp::Agent for MvpAgent {
             "x.ai/workspaces/list" => {
                 crate::agent::handlers::workspaces::handle(self, &args).await
             }
-            "x.ai/models/list" => {
-                crate::agent::handlers::models::handle(self, &args).await
-            }
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
             }
@@ -2223,7 +2209,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::chat_conversation_history::handle(self, &args).await
             }
             "x.ai/session/search" => {
-                crate::extensions::session_search::handle(self, &args).await
+                crate::extensions::session_search::handle(&args).await
             }
             "x.ai/session/resolve_local_for_worktree_resume"
             | "x.ai/session/rehydrate" => {
@@ -2467,9 +2453,6 @@ impl acp::Agent for MvpAgent {
             "x.ai/privacy/setCodingDataRetention" => {
                 crate::extensions::privacy::handle(self, &args).await
             }
-            "x.ai/consent/record" => {
-                crate::extensions::consent::handle(self, &args).await
-            }
             "x.ai/rollout/survey" => {
                 crate::extensions::rollout::handle(self, &args).await
             }
@@ -2708,42 +2691,47 @@ impl acp::Agent for MvpAgent {
                 );
             }
         }
-        if args.method.as_ref().starts_with("x.ai/queue/")
+        if matches!(
+            args.method.as_ref(),
+            "x.ai/queue/remove"
+                | "x.ai/queue/reorder"
+                | "x.ai/queue/clear"
+                | "x.ai/queue/edit"
+                | "x.ai/queue/interject"
+        )
             && let Ok(params) = serde_json::from_str::<
                 serde_json::Value,
             >(args.params.get())
         {
+            let session_id_str = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let owner = params
                 .get("owner")
                 .or_else(|| params.get("clientIdentifier"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            if let Some(cmd) = crate::agent::ext_parsers::parse_queue_edit_command(
-                args.method.as_ref(),
-                &params,
-                owner,
-            ) {
-                let session_id_str = params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(handle) = self
-                    .resident_handle(&acp::SessionId::new(session_id_str))
-                {
-                    if handle.cmd_tx.send(cmd).is_err() {
-                        tracing::warn!(
-                            session_id = %session_id_str,
-                            method = %args.method,
-                            "queue edit: failed to forward SessionCommand (session actor gone)"
-                        );
-                    }
-                } else {
+            let handle = self.resident_handle(&acp::SessionId::new(session_id_str));
+            if let Some(handle) = handle {
+                let cmd = crate::agent::ext_parsers::parse_queue_edit_command(
+                    args.method.as_ref(),
+                    &params,
+                    owner,
+                );
+                if let Some(cmd) = cmd && handle.cmd_tx.send(cmd).is_err() {
                     tracing::warn!(
                         session_id = %session_id_str,
                         method = %args.method,
-                        "queue edit: session not found"
+                        "queue edit: failed to forward SessionCommand (session actor gone)"
                     );
                 }
+            } else {
+                tracing::warn!(
+                    session_id = %session_id_str,
+                    method = %args.method,
+                    "queue edit: session not found"
+                );
             }
         }
         if args.method.as_ref() == "x.ai/terminal/pty/input"

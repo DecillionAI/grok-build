@@ -378,7 +378,6 @@ pub fn classify_top_level(agent: &AgentView) -> RowState {
         return RowState::NeedsInput;
     }
     if !agent.session.state.is_idle()
-        || agent.wake_turn_active()
         || agent.session.turn_activity().is_some()
         || !agent.session.pending_prompts.is_empty()
     {
@@ -1073,7 +1072,7 @@ mod tests {
             capability_mode: None,
             workflow_run_id: None,
             context_normalized: false,
-            transcript: Default::default(),
+            child_updates_replayed: false,
             parent_prompt_id: None,
             started_at: now,
             last_progress_at: now,

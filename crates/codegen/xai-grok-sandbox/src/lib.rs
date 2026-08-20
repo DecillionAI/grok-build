@@ -26,7 +26,6 @@
 //! sandbox.apply(workspace).expect("sandbox apply failed");
 //! sandbox.install();
 //! ```
-mod allow_path;
 pub mod child_net;
 mod deny;
 mod hook_write_deny;
@@ -62,9 +61,7 @@ pub fn requires_hook_write_deny(profile: &ProfileName, workspace: &Path) -> bool
 }
 #[cfg(all(feature = "enforce", unix))]
 use nono::Sandbox;
-use std::path::Path;
-#[cfg(any(target_os = "linux", test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 static SANDBOX: OnceLock<GlobalSandboxState> = OnceLock::new();

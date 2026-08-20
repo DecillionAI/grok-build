@@ -21,7 +21,6 @@ use tokio_util::sync::CancellationToken;
 
 use xai_grok_test_support::env::env_parse;
 use xai_grok_test_support::resources::{ResourceGrowth, ResourceSnapshot};
-use xai_grok_tools::implementations::grok_build::task::admission::SubagentLimits;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, ChildControl, ChildRunOutput, ChildRunRequest, ChildRunner, CoordinatorConfig,
@@ -82,11 +81,8 @@ impl Metric {
         }
     }
 
-    /// Where a metric must be present and within budget. RSS everywhere;
-    /// threads and open files only on Linux — macOS now samples threads too,
-    /// but the budgets are tuned against Linux nightlies, so a macOS sample
-    /// lands in the summary without being enforced.
-    fn budgeted_on_this_platform(self) -> bool {
+    /// RSS is sampled on every unix; thread and open-file counts are Linux-only.
+    fn expected_on_this_platform(self) -> bool {
         match self {
             Metric::Rss => true,
             Metric::Threads | Metric::Fds => cfg!(target_os = "linux"),
@@ -233,13 +229,11 @@ fn serialize_counts<S: Serializer>(
         pending,
         active,
         completed,
-        queued,
     } = counts;
     let entries = [
         ("pending", pending),
         ("active", active),
         ("completed", completed),
-        ("queued", queued),
     ];
     let mut map = serializer.serialize_map(Some(entries.len()))?;
     for (key, value) in entries {
@@ -324,8 +318,6 @@ impl ChildRunner for SoakRunner {
                 request,
                 cancellation,
                 reporter,
-                queued_for: _,
-                session_running: _,
             } = run;
             let promoted = reporter
                 .started(StartedChild {
@@ -510,24 +502,20 @@ async fn measure(
     }
 }
 
-/// Takes `budgeted` as a parameter so both arms are testable on any platform.
-/// An unbudgeted metric never fails: missing is fine, and a present value
-/// (macOS thread counts) is informational, not measured against a bound
-/// tuned for another platform.
+/// Takes `expected` as a parameter so the skip arm is testable on any platform.
 fn metric_failure(
     metric: Metric,
     value: Option<usize>,
-    budgeted: bool,
+    expected: bool,
     bounds: &Bounds,
 ) -> Option<String> {
-    if !budgeted {
-        return None;
-    }
     let Some(raw) = value else {
-        return Some(format!(
-            "{}: growth sample unavailable; the soak cannot bound it",
-            metric.label()
-        ));
+        return expected.then(|| {
+            format!(
+                "{}: growth sample unavailable; the soak cannot bound it",
+                metric.label()
+            )
+        });
     };
     let growth = metric.growth_in_budget_unit(raw);
     let budget = metric.budget(bounds);
@@ -572,8 +560,8 @@ fn check_bounds(bounds: &Bounds, m: &Measurement) -> Vec<String> {
     }
 
     for metric in Metric::iter() {
-        let budgeted = metric.budgeted_on_this_platform();
-        if let Some(f) = metric_failure(metric, m.growth.value_of(metric), budgeted, bounds) {
+        let expected = metric.expected_on_this_platform();
+        if let Some(f) = metric_failure(metric, m.growth.value_of(metric), expected, bounds) {
             failures.push(f);
         }
     }
@@ -625,14 +613,8 @@ async fn subagent_lifecycle_soak_bounds_threads_open_files_and_heap() {
     local
         .run_until(async move {
             let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-            // The soak measures registry churn, not admission: keep every
-            // spawn unthrottled so cycle counts stay resource-bound.
             let config = CoordinatorConfig {
                 foreground_budget: Duration::from_secs(600),
-                limits: SubagentLimits {
-                    max_concurrent: usize::MAX,
-                    ..SubagentLimits::default()
-                },
                 ..CoordinatorConfig::default()
             };
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -780,7 +762,6 @@ mod tests {
                 pending: 0,
                 active: 0,
                 completed: 0,
-                queued: 0,
             },
             heap,
             quiesced: true,
@@ -810,12 +791,9 @@ mod tests {
     }
 
     #[test]
-    fn metric_failure_covers_unbudgeted_missing_and_budget_arms() {
+    fn metric_failure_covers_expected_missing_unexpected_missing_and_budget() {
         let b = generous_bounds();
         assert!(metric_failure(Metric::Threads, None, false, &b).is_none());
-        // An unbudgeted metric with a present, over-budget value stays
-        // informational (macOS thread counts against Linux-tuned bounds).
-        assert!(metric_failure(Metric::Threads, Some(usize::MAX), false, &b).is_none());
         assert!(
             metric_failure(Metric::Rss, None, true, &b)
                 .unwrap()
@@ -914,28 +892,22 @@ mod tests {
         );
     }
 
-    /// Thread and open-file budgets only bite on Linux; elsewhere the same
-    /// over-budget growth is informational and must not fail the soak.
     #[test]
-    fn check_bounds_flags_thread_and_open_files_over_budget_on_linux_only() {
+    fn check_bounds_flags_thread_and_open_files_over_budget() {
         let growth = ResourceGrowth {
             rss: Some(0),
             threads: Some(200),
             open_files: Some(200),
         };
         let failures = check_bounds(&generous_bounds(), &drained(growth, None));
-        if cfg!(target_os = "linux") {
-            assert!(
-                failures.iter().any(|f| f.starts_with("threads:")),
-                "{failures:?}"
-            );
-            assert!(
-                failures.iter().any(|f| f.starts_with("open_files:")),
-                "{failures:?}"
-            );
-        } else {
-            assert!(failures.is_empty(), "{failures:?}");
-        }
+        assert!(
+            failures.iter().any(|f| f.starts_with("threads:")),
+            "{failures:?}"
+        );
+        assert!(
+            failures.iter().any(|f| f.starts_with("open_files:")),
+            "{failures:?}"
+        );
     }
 
     #[test]

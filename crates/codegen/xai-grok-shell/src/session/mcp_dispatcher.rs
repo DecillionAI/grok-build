@@ -6,7 +6,7 @@
 //! - the [`xai_grok_mcp::servers::GrokClientHandler`] (server-pushed
 //!   `tools/list_changed` and `resources/list_changed`),
 //! - the `ensure_initialized` success/failure path,
-//! - the session MCP config diff path (`UpdateMcpServers` / toggle).
+//! - the session/managed-config diff path.
 //!
 //! Coalesces events in a **50 ms tumbling window** keyed by
 //! `(server_name, McpClientEventKind)`. Two events with the same key
@@ -49,7 +49,8 @@ use xai_grok_mcp::servers::{
     McpClientEvent, McpClientEventKind, McpServerName, McpState, mcp_server_name, mcp_transport_str,
 };
 
-use crate::extensions::mcp::{MANAGED_GATEWAY_ENTRY_PREFIX, McpServerSource};
+use crate::extensions::mcp::McpServerSource;
+use crate::session::managed_mcp::MANAGED_MCP_PREFIX;
 
 /// Tumbling-window coalescing period. See module doc.
 pub(crate) const COALESCE_WINDOW: Duration = Duration::from_millis(50);
@@ -64,9 +65,10 @@ pub const SERVER_STATUS_METHOD: &str = "x.ai/mcp/server_status";
 pub struct McpServerStatusPayload {
     /// Owning session id.
     pub session_id: String,
-    /// MCP server name (`managed_gateway:linear`, `github`, ...).
+    /// MCP server name (`grok_com_linear`, `github`, ...).
     pub name: String,
-    /// `managed` for gateway catalog ids (`managed_gateway:*`), else `local`.
+    /// `managed` (sourced from cli-chat-proxy / `grok_com_` prefix)
+    /// or `local` (user `.grok/config.toml`).
     pub source: McpServerSource,
     /// Current status — see [`McpServerStatus`].
     pub status: McpServerStatus,
@@ -129,14 +131,18 @@ pub enum McpServerStatusReason {
     RestartSucceeded,
     /// The auto-restart path exhausted retries.
     RestartFailed,
-    /// Old leaders still emit this after reactive reauth. Not produced anymore.
+    /// A managed connector's reactive re-auth re-fetched a fresh token,
+    /// swapped the client, and re-handshook successfully. Distinct from
+    /// `RestartSucceeded` (reserved for the transport-close auto-restart
+    /// path) so a recovered managed token is observable on the wire.
     ManagedTokenRefreshed,
 }
 
-/// Build [`McpServerSource`] from a server name. Live managed connectors are
-/// gateway catalog rows (`managed_gateway:*`); everything else is local.
+/// Build [`McpServerSource`] from a server name. Mirrors the
+/// existing convention used by `build_mcp_catalog` and friends:
+/// names with the `MANAGED_MCP_PREFIX` prefix are managed.
 pub(crate) fn classify_source(name: &str) -> McpServerSource {
-    if name.starts_with(MANAGED_GATEWAY_ENTRY_PREFIX) {
+    if name.starts_with(MANAGED_MCP_PREFIX) {
         McpServerSource::Managed
     } else {
         McpServerSource::Local
@@ -386,6 +392,22 @@ pub(crate) fn build_payload(
             McpServerStatusReason::TransportClosed,
             None,
         ),
+        // A managed connector rejected for auth reasons surfaces as
+        // NeedsAuth ("visit grok.com"), not a generic Unavailable, so a
+        // client consuming only `server_status` (not the `mcp/list`
+        // `auth_required` boolean) shows the correct terminal state. Uses
+        // the same `is_auth_rejection_message` classifier the reroute and
+        // the reactive recovery path key on, so they cannot drift.
+        (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { reason, .. })
+            if source == McpServerSource::Managed
+                && xai_grok_mcp::servers::is_auth_rejection_message(reason) =>
+        {
+            (
+                McpServerStatus::NeedsAuth,
+                McpServerStatusReason::AuthExpired,
+                Some(reason.clone()),
+            )
+        }
         (McpClientEventKind::HandshakeFailed, McpClientEvent::HandshakeFailed { reason, .. }) => {
             let detail = reason.clone();
             (
@@ -543,7 +565,8 @@ pub(crate) fn collect_close_candidates(
         .collect()
 }
 
-/// Names eligible for in-place HTTP recovery: enabled HTTP/SSE config entries.
+/// Names eligible for in-place HTTP recovery: HTTP/SSE config entries that
+/// are neither managed (`MANAGED_MCP_PREFIX`) nor disabled.
 ///
 /// MUST match the recovery gate (`SessionActor::is_http_server_configured`).
 /// If the two predicates diverge, a disabled HTTP server still present in
@@ -563,7 +586,7 @@ pub(crate) fn recoverable_http_servers(
             )
         })
         .map(|c| mcp_server_name(c).to_string())
-        .filter(|name| !disabled.contains(name))
+        .filter(|name| !name.starts_with(MANAGED_MCP_PREFIX) && !disabled.contains(name))
         .collect()
 }
 
@@ -689,9 +712,11 @@ pub(crate) async fn run_dispatcher(
         // Classify each configured server's transport (single lock).
         // `http_servers` decides recover-in-place vs evict; `transport_map`
         // feeds the disconnect telemetry below. `recoverable_http_servers`
-        // excludes disabled names so it stays in lockstep with the
+        // excludes managed (`MANAGED_MCP_PREFIX`, server-side rotating
+        // creds) AND disabled names so it stays in lockstep with the
         // recovery gate `is_http_server_configured` — otherwise a disabled
-        // HTTP server would be neither evicted nor recovered.
+        // HTTP server would be neither evicted nor recovered. Only
+        // non-managed, enabled HTTP (e.g. `http-mcp-server`) is recovered.
         let (http_servers, transport_map): (
             HashSet<McpServerName>,
             HashMap<McpServerName, &'static str>,
@@ -959,8 +984,58 @@ mod tests {
         );
     }
 
-    /// Handshake auth wording on a spawned local client stays `Unavailable`
-    /// (local recovery is the OAuth path, not `server_status` NeedsAuth).
+    /// Contract: a managed connector whose handshake is rejected for
+    /// auth reasons surfaces as `NeedsAuth`/`auth_expired` ("visit
+    /// grok.com"), NOT a generic `Unavailable`. Keys on the shared
+    /// `is_auth_rejection_message` classifier.
+    #[test]
+    fn managed_handshake_auth_rejection_maps_to_needs_auth() {
+        let key = (
+            "grok_com_notion".to_string(),
+            McpClientEventKind::HandshakeFailed,
+        );
+        let ev = McpClientEvent::HandshakeFailed {
+            server: "grok_com_notion".to_string(),
+            reason: "Auth required, when send initialize request".to_string(),
+        };
+        let payload = build_payload("sess1", &key, &ev);
+        assert_eq!(payload.source, McpServerSource::Managed);
+        assert_eq!(payload.status, McpServerStatus::NeedsAuth);
+        assert_eq!(payload.reason, McpServerStatusReason::AuthExpired);
+        let json = serde_json::to_value(&payload).unwrap();
+        // `McpServerStatus` serializes lowercase (no underscore); the
+        // reason enum serializes snake_case.
+        assert_eq!(json["status"], "needsauth");
+        assert_eq!(json["reason"], "auth_expired");
+    }
+
+    /// A managed handshake failure that is NOT an auth rejection (e.g. a
+    /// 403 policy denial or a 502) must stay `Unavailable` — the
+    /// `NeedsAuth` arm is auth-only.
+    #[test]
+    fn managed_handshake_non_auth_stays_unavailable() {
+        for reason in ["403 Forbidden", "cli-chat-proxy returned 502"] {
+            let key = (
+                "grok_com_slack".to_string(),
+                McpClientEventKind::HandshakeFailed,
+            );
+            let ev = McpClientEvent::HandshakeFailed {
+                server: "grok_com_slack".to_string(),
+                reason: reason.to_string(),
+            };
+            let payload = build_payload("sess1", &key, &ev);
+            assert_eq!(
+                payload.status,
+                McpServerStatus::Unavailable,
+                "non-auth managed failure must stay Unavailable: {reason}",
+            );
+            assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
+        }
+    }
+
+    /// The `NeedsAuth` arm is managed-only: a local (non-managed) server
+    /// whose handshake error happens to contain auth wording stays
+    /// `Unavailable` (local auth recovery is the OAuth path, not this one).
     #[test]
     fn local_handshake_auth_rejection_stays_unavailable() {
         let key = ("github".to_string(), McpClientEventKind::HandshakeFailed);
@@ -974,14 +1049,29 @@ mod tests {
         assert_eq!(payload.reason, McpServerStatusReason::HandshakeFailed);
     }
 
-    /// Gateway catalog ids are `Managed`; `grok_com_*` spawned names are not.
+    /// Wire contract: the new `ManagedTokenRefreshed` reason (emitted by
+    /// the reactive re-auth success push) serializes to snake_case.
     #[test]
-    fn classify_source_gateway_is_managed() {
-        assert_eq!(
-            classify_source("managed_gateway:linear"),
-            McpServerSource::Managed
-        );
-        assert_eq!(classify_source("grok_com_linear"), McpServerSource::Local);
+    fn managed_token_refreshed_reason_serializes() {
+        let payload = McpServerStatusPayload {
+            session_id: "sess1".to_string(),
+            name: "grok_com_linear".to_string(),
+            source: McpServerSource::Managed,
+            status: McpServerStatus::Ready,
+            reason: McpServerStatusReason::ManagedTokenRefreshed,
+            detail: None,
+            tools: None,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["reason"], "managed_token_refreshed");
+    }
+
+    /// Contract: managed server names (starting with `grok_com_`)
+    /// are classified as `Managed`; everything else as `Local`.
+    #[test]
+    fn classify_source_uses_managed_prefix() {
+        assert_eq!(classify_source("grok_com_linear"), McpServerSource::Managed);
         assert_eq!(classify_source("github"), McpServerSource::Local);
     }
 
@@ -1029,13 +1119,6 @@ mod tests {
         // Wire-level check: serializes to `"initialized"`.
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["reason"], "initialized");
-    }
-
-    #[test]
-    fn managed_token_refreshed_still_deserializes() {
-        let reason: McpServerStatusReason =
-            serde_json::from_str("\"managed_token_refreshed\"").unwrap();
-        assert_eq!(reason, McpServerStatusReason::ManagedTokenRefreshed);
     }
 
     /// A `TransportClosed` carrying the registered client's identity
@@ -1310,21 +1393,19 @@ mod tests {
         )
     }
 
-    /// `recoverable_http_servers` keeps only non-disabled HTTP/SSE entries —
-    /// the same predicate as the recovery gate.
+    /// `recoverable_http_servers` keeps only non-managed, non-disabled
+    /// HTTP/SSE entries — the same predicate as the recovery gate.
     #[test]
-    fn recoverable_http_servers_excludes_stdio_and_disabled() {
+    fn recoverable_http_servers_excludes_managed_stdio_and_disabled() {
         let configs = vec![
             http_cfg("http-mcp-server"),
-            http_cfg("grok_com_slack"),
-            http_cfg("admin_off"),    // disabled
-            stdio_cfg("local_stdio"), // stdio
+            http_cfg("grok_com_slack"), // managed
+            http_cfg("admin_off"),      // disabled
+            stdio_cfg("local_stdio"),   // stdio
         ];
         let disabled: HashSet<String> = ["admin_off".to_string()].into_iter().collect();
         let got = recoverable_http_servers(&configs, &disabled);
-        let want: HashSet<String> = ["http-mcp-server".to_string(), "grok_com_slack".to_string()]
-            .into_iter()
-            .collect();
+        let want: HashSet<String> = ["http-mcp-server".to_string()].into_iter().collect();
         assert_eq!(got, want);
     }
 

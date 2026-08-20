@@ -8,21 +8,6 @@ pub mod meta;
 pub mod model_state;
 pub mod spawn;
 pub mod tracker;
-mod version_mismatch;
-
-pub(crate) use version_mismatch::{is_version_mismatch_banner, version_mismatch_banner};
-
-/// Ext methods that carry a session-scoped update and may stamp `isReplay`.
-/// Shared by TUI/headless dispatch and the session-load ACP barrier so a new
-/// method cannot be handled in one path and classified `Unrelated` in the other.
-pub(crate) fn is_session_update_ext_method(method: &str) -> bool {
-    matches!(method, "x.ai/session_notification" | "x.ai/session/update")
-}
-
-use xai_grok_telemetry::startup;
-pub use xai_grok_telemetry::startup::{
-    AgentKind, Owner, StartupOutcome, StartupPhase, StartupTimer,
-};
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -119,10 +104,8 @@ pub struct AcpConnection {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
     pub subagents: bool,
-    /// CLI memory override set by a legacy compatibility flag.
-    pub memory_enabled_override: Option<bool>,
-    /// Original compatibility flag spelling for leader-mode warnings.
-    pub memory_override_flag: Option<&'static str>,
+    pub experimental_memory: bool,
+    pub no_memory: bool,
     pub disable_web_search: bool,
     /// Session-scoped `--todo-gate` override. Forces
     /// `ReminderPolicy.todo_gate.enabled = true` for this session.
@@ -135,9 +118,6 @@ pub struct ConnectFlags {
     pub laziness_debug_log: Option<std::path::PathBuf>,
     /// Storage mode override.
     pub storage_mode: Option<String>,
-    /// Whether this client will draw a status row, advertised as
-    /// `x.ai/statusLine` so the agent can skip an unpainted payload.
-    pub status_line: bool,
     /// Client identifier for ACP Initialize metadata.
     pub client_identifier: Option<String>,
     /// Hunk tracker mode for ACP Initialize capabilities.
@@ -169,8 +149,11 @@ pub struct ConnectFlags {
 }
 
 /// Connect to an agent: spawn, initialize, authenticate.
+///
+/// This is the main entry point for establishing an ACP connection.
+/// After this returns, the agent is ready to create sessions and receive prompts.
 pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<AcpConnection> {
-    startup::enter(StartupPhase::LoadConfig);
+    // Load agent config from disk
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
     let mut agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
@@ -183,7 +166,8 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         cli_subagents: Some(flags.subagents),
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        memory_enabled_override: flags.memory_enabled_override,
+        cli_experimental_memory: flags.experimental_memory,
+        cli_no_memory: flags.no_memory,
         disable_web_search: flags.disable_web_search,
         todo_gate: flags.todo_gate,
         laziness_debug_log: flags.laziness_debug_log.as_deref(),
@@ -206,12 +190,13 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
 
     apply_config_writes(&flags);
 
+    // Spawn the agent
     let memory_config = agent_config.memory_config.clone();
     let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
     let auth_manager = spawned.auth_manager.clone();
     let (tx, rx) = (spawned.channel.tx, spawned.channel.rx);
 
-    startup::enter(StartupPhase::AcpInitialize);
+    // Initialize
     let (
         models,
         is_grok_shell,
@@ -226,7 +211,6 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
     let (needs_login, login_label, login_method_id, auth_start_mode) =
         startup_auth_metadata(&auth_methods);
 
-    startup::enter(StartupPhase::EagerAuth);
     let (needs_login, login_label, login_method_id, auth_start_mode, auth_meta) =
         bounded_eager_auth(
             &tx,
@@ -281,9 +265,6 @@ pub async fn connect_via_leader(
 
     apply_config_writes(&flags);
 
-    startup::enter(StartupPhase::LoadConfig);
-    // The leader path never runs the managed-policy sync in this process.
-    startup::set_auth_mode(xai_grok_shell::managed_config::classify_auth_mode());
     let mut agent_config = AgentConfig::new_from_toml_cfg(raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
     // resolve_telemetry_mode reads remote_settings.
@@ -304,10 +285,8 @@ pub async fn connect_via_leader(
         terminal: flags.terminal,
         fs_read: flags.fs_read,
         fs_write: flags.fs_write,
-        status_line: flags.status_line,
     };
 
-    startup::enter(StartupPhase::LeaderConnect);
     let conn = connect_or_spawn(
         client_type,
         ClientMode::Stdio,
@@ -332,7 +311,6 @@ pub async fn connect_via_leader(
     )?;
     let (tx, rx) = (bridge.channel.tx, bridge.channel.rx);
 
-    startup::enter(StartupPhase::AcpInitialize);
     let (
         models,
         is_grok_shell,
@@ -346,7 +324,6 @@ pub async fn connect_via_leader(
     let (needs_login, login_label, login_method_id, auth_start_mode) =
         startup_auth_metadata(&auth_methods);
 
-    startup::enter(StartupPhase::EagerAuth);
     let (needs_login, login_label, login_method_id, auth_start_mode, auth_meta) =
         bounded_eager_auth(
             &tx,
@@ -411,8 +388,11 @@ fn warn_unsupported_leader_flags(flags: &ConnectFlags) {
 
 fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if let Some(flag) = flags.memory_override_flag {
-        out.push(flag);
+    if flags.experimental_memory {
+        out.push("--experimental-memory");
+    }
+    if flags.no_memory {
+        out.push("--no-memory");
     }
     if flags.disable_web_search {
         out.push("--disable-web-search");
@@ -484,14 +464,12 @@ fn build_initialize_meta(flags: &ConnectFlags) -> serde_json::Value {
 fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
     let hunk_mode =
         crate::settings::canonical_hunk_tracker_mode(flags.hunk_tracker_mode.as_deref());
-    let mut meta = serde_json::json!({
+    serde_json::json!({
         "x.ai/incrementalBashOutput": true,
         "x.ai/hunkTracker": { "mode": hunk_mode },
         "x.ai/bashOutputNoColor": true,
         "x.ai/gitHeadChanged": true,
-    });
-    meta[xai_grok_status_line::STATUS_LINE_CAPABILITY] = flags.status_line.into();
-    meta
+    })
 }
 
 /// Parse `defaultAuthMethodId` from `InitializeResponse.meta`.
@@ -833,14 +811,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_session_update_ext_method_covers_both_carriers() {
-        assert!(is_session_update_ext_method("x.ai/session_notification"));
-        assert!(is_session_update_ext_method("x.ai/session/update"));
-        assert!(!is_session_update_ext_method("x.ai/task_completed"));
-        assert!(!is_session_update_ext_method("session/update"));
-    }
-
-    #[test]
     fn parse_available_commands_from_meta() {
         let meta = serde_json::json!({
             "availableCommands": [
@@ -1064,29 +1034,20 @@ mod tests {
     #[test]
     fn unsupported_leader_flags_detects_all() {
         let flags = ConnectFlags {
-            memory_enabled_override: Some(true),
-            memory_override_flag: Some("--experimental-memory"),
+            experimental_memory: true,
+            no_memory: true,
             disable_web_search: true,
             storage_mode: Some("writeback".into()),
             subagents: true,
             ..Default::default()
         };
         let detected = unsupported_leader_flags(&flags);
-        assert_eq!(detected.len(), 4);
+        assert_eq!(detected.len(), 5);
         assert!(detected.contains(&"--experimental-memory"));
+        assert!(detected.contains(&"--no-memory"));
         assert!(detected.contains(&"--disable-web-search"));
         assert!(detected.contains(&"--storage-mode"));
         assert!(detected.contains(&"--subagents"));
-    }
-
-    #[test]
-    fn unsupported_leader_flags_preserves_no_memory_spelling() {
-        let flags = ConnectFlags {
-            memory_enabled_override: Some(false),
-            memory_override_flag: Some("--no-memory"),
-            ..Default::default()
-        };
-        assert_eq!(unsupported_leader_flags(&flags), vec!["--no-memory"]);
     }
 
     #[test]
@@ -1151,20 +1112,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(blank["x.ai/hunkTracker"]["mode"], "agent_only");
-    }
-
-    /// The agent gates the whole payload on this key, so a misspelling on
-    /// either side switches the feature off with nothing to show for it.
-    #[test]
-    fn client_capabilities_meta_advertises_the_status_line_the_config_asked_for() {
-        let key = xai_grok_status_line::STATUS_LINE_CAPABILITY;
-        for wants_a_row in [true, false] {
-            let meta = client_capabilities_meta(&ConnectFlags {
-                status_line: wants_a_row,
-                ..Default::default()
-            });
-            assert_eq!(meta[key], wants_a_row, "status_line={wants_a_row}");
-        }
     }
 
     #[test]

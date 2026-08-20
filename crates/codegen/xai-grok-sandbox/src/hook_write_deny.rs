@@ -1,16 +1,17 @@
 //! Grok-owned hook write-deny: plan, identity revalidation, and post-reexec checks.
 //! Namespace lockdown is in [`crate::child_net`].
 
-#[cfg(any(target_os = "linux", all(unix, test)))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use xai_grok_config::{GlobalHookSource, missing_configured_sources, resolve_global_hook_sources};
+use xai_grok_config::{
+    GlobalHookSource, ensure_grok_hook_slots, missing_configured_sources,
+    resolve_global_hook_sources,
+};
 
+#[cfg(target_os = "linux")]
+use xai_grok_config::unique_ancestors_rootward;
 #[cfg(unix)]
 use xai_grok_config::validated_hook_json_files_for_sources;
-#[cfg(target_os = "linux")]
-use xai_grok_config::{ensure_grok_hook_slots, unique_ancestors_rootward};
 
 use crate::paths::grok_home;
 use crate::profiles::ProfileName;
@@ -28,15 +29,12 @@ pub enum HookWriteDenyError {
              Create them outside the sandbox or remove them from hooks-paths."
     )]
     MissingConfigured(String),
-    #[cfg(target_os = "linux")]
     #[error("required hook write-deny path is not effectively read-only: {path}")]
     NotReadOnly { path: PathBuf },
     #[error("cannot verify hook write-deny path {path}: {detail}")]
     VerifyIo { path: PathBuf, detail: String },
-    #[cfg(any(target_os = "linux", all(unix, test)))]
     #[error("hook write-deny path identity changed before apply (possible rename race): {path}")]
     IdentityChanged { path: PathBuf },
-    #[cfg(any(target_os = "linux", all(unix, test)))]
     #[error("hook write-deny path is a symlink (retargetable): {path}")]
     Symlink { path: PathBuf },
     #[error(
@@ -44,7 +42,6 @@ pub enum HookWriteDenyError {
          refuse sandbox rather than leave a writable alias"
     )]
     HardLink { path: PathBuf, nlink: u64 },
-    #[cfg(target_os = "linux")]
     #[error("hook directory JSON snapshot changed before apply: {dir}")]
     JsonSnapshotChanged { dir: PathBuf },
 }
@@ -55,7 +52,6 @@ impl From<xai_grok_config::GlobalHookSourceError> for HookWriteDenyError {
     }
 }
 
-#[cfg(any(target_os = "linux", all(unix, test)))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathIdentity {
     pub path: PathBuf,
@@ -67,7 +63,7 @@ pub struct PathIdentity {
 }
 
 /// No-follow identity; regular files require `st_nlink == 1`.
-#[cfg(any(target_os = "linux", all(unix, test)))]
+#[cfg(unix)]
 pub fn capture_path_identity(path: &Path) -> Result<PathIdentity, HookWriteDenyError> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).map_err(|e| HookWriteDenyError::VerifyIo {
@@ -96,7 +92,7 @@ pub fn capture_path_identity(path: &Path) -> Result<PathIdentity, HookWriteDenyE
     })
 }
 
-#[cfg(any(target_os = "linux", all(unix, test)))]
+#[cfg(unix)]
 pub fn revalidate_path_identity(id: &PathIdentity) -> Result<(), HookWriteDenyError> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(&id.path).map_err(|e| HookWriteDenyError::VerifyIo {
@@ -156,14 +152,12 @@ fn reject_hardlinked_files(_sources: &[GlobalHookSource]) -> Result<(), HookWrit
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct DirJsonSnapshot {
     pub dir: PathBuf,
     pub files: Vec<PathIdentity>,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct HookWriteDenyBwrapPlan {
     pub ancestor_rw_binds: Vec<PathBuf>,
@@ -171,11 +165,13 @@ pub struct HookWriteDenyBwrapPlan {
     pub dir_json_snapshots: Vec<DirJsonSnapshot>,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub enum HookWriteDenyPrepare {
     NotRequired,
+    #[cfg(target_os = "linux")]
     Plan(HookWriteDenyBwrapPlan),
+    #[cfg(not(target_os = "linux"))]
+    Ensured,
 }
 
 pub fn resolve_hook_write_deny_snapshot() -> Result<Vec<GlobalHookSource>, HookWriteDenyError> {
@@ -203,7 +199,6 @@ pub fn resolve_hook_write_deny_snapshot() -> Result<Vec<GlobalHookSource>, HookW
     Ok(resolved.sources)
 }
 
-#[cfg(target_os = "linux")]
 pub fn prepare_hook_write_deny(
     profile: &ProfileName,
 ) -> Result<HookWriteDenyPrepare, HookWriteDenyError> {
@@ -213,8 +208,17 @@ pub fn prepare_hook_write_deny(
     let grok = grok_home();
     ensure_grok_hook_slots(grok.as_path())?;
     let sources = resolve_hook_write_deny_snapshot()?;
-    let plan = build_bwrap_plan(&sources)?;
-    Ok(HookWriteDenyPrepare::Plan(plan))
+
+    #[cfg(target_os = "linux")]
+    {
+        let plan = build_bwrap_plan(&sources)?;
+        Ok(HookWriteDenyPrepare::Plan(plan))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sources;
+        Ok(HookWriteDenyPrepare::Ensured)
+    }
 }
 
 pub fn profile_hook_write_deny(profile: &ProfileName) -> anyhow::Result<Vec<GlobalHookSource>> {
@@ -225,7 +229,7 @@ pub fn profile_hook_write_deny(profile: &ProfileName) -> anyhow::Result<Vec<Glob
 }
 
 /// Top-level sources plus validated immediate discovery JSON under directories.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn enforcement_leaf_paths(
     sources: &[GlobalHookSource],
 ) -> Result<Vec<PathBuf>, HookWriteDenyError> {
@@ -244,7 +248,7 @@ pub fn enforcement_leaf_paths(
     Ok(out)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn capture_dir_json_snapshot(dir: &Path) -> Result<DirJsonSnapshot, HookWriteDenyError> {
     use xai_grok_config::{list_direct_hook_json_files, validate_direct_hook_json_file};
     let listed = list_direct_hook_json_files(dir).map_err(|e| HookWriteDenyError::VerifyIo {

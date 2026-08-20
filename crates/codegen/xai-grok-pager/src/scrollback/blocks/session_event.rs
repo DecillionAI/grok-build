@@ -42,15 +42,6 @@ pub enum SessionEvent {
         /// Wall-clock elapsed time before cancellation.
         elapsed: Duration,
     },
-    /// Agent turn ended because a hook denied it — today only a
-    /// `UserPromptSubmit` block (a `PreToolUse` deny feeds back and the turn
-    /// continues). Distinct from [`SessionEvent::TurnCancelled`] so the
-    /// marker never claims the USER cancelled a policy block; the warning
-    /// annotation above the marker attributes the hook and reason.
-    TurnBlockedByHook {
-        /// Wall-clock elapsed time before the block.
-        elapsed: Duration,
-    },
     /// Agent turn was halted by the system (e.g. doom loop detection).
     TurnHalted {
         /// Wall-clock elapsed time before the turn was halted.
@@ -174,9 +165,6 @@ impl SessionEvent {
             SessionEvent::TurnCompleted { elapsed: None } => "Turn completed.".to_string(),
             SessionEvent::TurnCancelled { elapsed } => {
                 format!("Turn cancelled by user in {}.", format_duration(*elapsed))
-            }
-            SessionEvent::TurnBlockedByHook { elapsed } => {
-                format!("Turn blocked by a hook in {}.", format_duration(*elapsed))
             }
             SessionEvent::TurnHalted { elapsed } => {
                 format!(
@@ -320,7 +308,7 @@ impl SessionEvent {
 
     /// Whether this event marks the end of an agent turn (the "Turn
     /// completed/cancelled/failed" markers). These are the only events that
-    /// can carry the turn's stop-family hook runs inline.
+    /// can carry the turn's stop/stop_failure hook runs inline.
     ///
     /// [`SessionEvent::RequestFailed`] is intentionally excluded — same as
     /// [`SessionEvent::ReAuthRequired`]. RetryState may push it before
@@ -332,7 +320,6 @@ impl SessionEvent {
             self,
             SessionEvent::TurnCompleted { .. }
                 | SessionEvent::TurnCancelled { .. }
-                | SessionEvent::TurnBlockedByHook { .. }
                 | SessionEvent::TurnHalted { .. }
                 | SessionEvent::TurnFailed { .. }
         )
@@ -357,7 +344,7 @@ fn format_tokens(tokens: u64) -> String {
 pub struct SessionEventBlock {
     /// The typed event data.
     pub event: SessionEvent,
-    /// Stop-family hook runs folded into a turn-terminal marker
+    /// Stop/stop_failure hook runs folded into a turn-terminal marker
     /// (`(event_name, runs)` per hook batch). Rendered as a right-justified
     /// `stop  [hooks: N]` summary on the marker line, with per-hook detail
     /// on expand. Always empty for non-terminal events.

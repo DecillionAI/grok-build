@@ -2,7 +2,6 @@
 //! `x.ai/interject` effect, and prompt-history recording. Split out of
 //! `dispatch.rs` verbatim (pure code motion).
 
-use super::ctx::NO_SESSION_NOTICE;
 use super::voice::voice_stop_on_submit;
 use crate::app::actions::Effect;
 use crate::app::agent_view::AgentView;
@@ -40,7 +39,7 @@ pub(super) fn dispatch_interject(
     agent.ephemeral_tip.clear_on_submit();
 
     let Some(session_id) = agent.session.session_id.clone() else {
-        agent.show_toast(NO_SESSION_NOTICE);
+        agent.show_toast("No active session");
         return vec![];
     };
 
@@ -126,7 +125,7 @@ pub(super) fn dispatch_send_prompt_now(
     agent.ephemeral_tip.clear_on_submit();
 
     let Some(session_id) = agent.session.session_id.clone() else {
-        agent.show_toast(NO_SESSION_NOTICE);
+        agent.show_toast("No active session");
         return vec![];
     };
 

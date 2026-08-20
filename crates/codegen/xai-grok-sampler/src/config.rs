@@ -60,9 +60,6 @@ pub struct SamplerConfig {
     /// the URL to derive headers; callers (the session) inject proxy auth
     /// and other access headers here before constructing the config.
     pub extra_headers: IndexMap<String, String>,
-    /// Additional Responses API `include` values not represented by the typed client.
-    #[serde(default)]
-    pub extra_response_includes: Vec<String>,
     /// Query parameters folded into every request URL (percent-encoded).
     #[serde(default)]
     pub query_params: IndexMap<String, String>,
@@ -150,7 +147,6 @@ impl Default for SamplerConfig {
             api_backend: ApiBackend::default(),
             auth_scheme: AuthScheme::default(),
             extra_headers: IndexMap::new(),
-            extra_response_includes: Vec::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 0,
@@ -238,18 +234,17 @@ mod tests {
     #[test]
     fn config_without_doom_loop_recovery_deserializes_to_none() {
         let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();
-        let object = stripped.as_object_mut().unwrap();
-        object.remove("doom_loop_recovery");
-        object.remove("extra_response_includes");
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("doom_loop_recovery");
         let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
         assert!(config.doom_loop_recovery.is_none());
-        assert!(config.extra_response_includes.is_empty());
 
         let with_policy = SamplerConfig {
             doom_loop_recovery: Some(DoomLoopRecoveryPolicy {
                 max_threshold: 8,
                 max_retries: 2,
-                ..Default::default()
             }),
             ..Default::default()
         };

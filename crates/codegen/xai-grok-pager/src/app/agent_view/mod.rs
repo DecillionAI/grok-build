@@ -177,8 +177,6 @@ mod rewind;
 mod selection;
 mod session;
 mod shell_completion;
-#[cfg(test)]
-mod task_status_tests;
 mod viewer;
 mod workflows_overlay;
 use super::actions;
@@ -371,7 +369,9 @@ pub enum PromptInputMode {
     Normal,
     /// Bash mode (`!` prefix): Enter sends `Action::SendBashCommand`.
     Bash,
-    /// Remember mode (`#` prefix): Enter sends `Action::SendRememberNote`.
+    /// Feedback mode (`~` prefix, teal accent): Enter sends `Action::SendFeedback`.
+    Feedback,
+    /// Remember mode (`#` prefix, green accent): Enter sends `Action::SendRememberNote`.
     Remember,
 }
 impl PromptInputMode {
@@ -379,6 +379,7 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some(theme.command),
+            PromptInputMode::Feedback => Some(theme.accent_feedback),
             PromptInputMode::Remember => Some(theme.accent_remember),
         }
     }
@@ -386,12 +387,14 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some(("! ", theme.command)),
+            PromptInputMode::Feedback => Some(("~ ", theme.accent_feedback)),
             PromptInputMode::Remember => Some(("# ", theme.accent_remember)),
         }
     }
     pub fn placeholder_override(self, multiline: bool) -> Option<&'static str> {
         match self {
             PromptInputMode::Normal | PromptInputMode::Bash => None,
+            PromptInputMode::Feedback => Some("Type your feedback..."),
             PromptInputMode::Remember => {
                 if multiline {
                     Some("Save a memory note... (Enter for newline, Shift+Enter to save)")
@@ -405,6 +408,7 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => None,
             PromptInputMode::Bash => Some("Run shell command"),
+            PromptInputMode::Feedback => Some("Send feedback"),
             PromptInputMode::Remember => Some("Save memory note"),
         }
     }
@@ -412,6 +416,7 @@ impl PromptInputMode {
         match self {
             PromptInputMode::Normal => Action::SendPrompt(text),
             PromptInputMode::Bash => Action::SendBashCommand(text),
+            PromptInputMode::Feedback => Action::SendFeedback(text),
             PromptInputMode::Remember => Action::SendRememberNote(text),
         }
     }
@@ -428,6 +433,7 @@ impl PromptInputMode {
                     || ctrl_u
                     || ctrl_c
             }
+            PromptInputMode::Feedback => key.code == KeyCode::Backspace || key.code == KeyCode::Esc,
         }
     }
 }
@@ -548,14 +554,13 @@ pub(super) fn app_should_open_link_on_click_with(
     }
     !link.looks_like_bare_url_text()
 }
-/// Whether double/triple-click performs terminal-like word/paragraph text
-/// selection (and copy) instead of toggling a fold.
+/// Whether double/triple-click performs terminal-like word/line text selection
+/// (and copy) instead of toggling a fold.
 ///
 /// Unified into the `keep_text_selection` setting (the `word_select` mode):
 /// reads the live appearance cache, so a Settings-panel change applies without
 /// a restart and can never drift from the highlight-persistence behavior. The
-/// compile-time default (`flash`) keeps double-click as a fold-toggle;
-/// `word_select` is a staged rollout via a remote flag.
+/// default (`flash`) is fold-toggle, preserving backwards compatibility.
 pub(super) fn is_text_selection_on_double_click() -> bool {
     crate::appearance::cache::load_keep_text_selection().selects_word()
 }
@@ -569,10 +574,6 @@ pub(crate) struct PendingTurnEnd {
     pub stop_reason: Option<String>,
     /// `agentResult` detail from the broadcast (error text, when present).
     pub agent_result: Option<String>,
-    /// `_meta.cancellationCategory` from the broadcast (`"HookDenied"` picks
-    /// the "blocked by a hook" marker over "cancelled by user"). `None` on
-    /// older shells or plain user cancels.
-    pub cancellation_category: Option<String>,
     /// `_meta.cancelTrigger` from the broadcast (`"send_now"` marks a
     /// cancel-and-send whose "Turn cancelled" marker is suppressed). `None`
     /// on older shells / non-cancel ends.
@@ -581,43 +582,8 @@ pub(crate) struct PendingTurnEnd {
     /// [`super::dispatch::TURN_END_RECONCILE_GRACE`].
     pub received_at: std::time::Instant,
 }
-/// The wake turn currently streaming on this session. A wake turn is a turn
-/// the shell starts on its own when background work finishes, to tell the
-/// model about it; the pager never adopts one (`AgentState` stays `Idle`),
-/// so this is the only record that one is in flight. Drives the [stop]/Esc/Ctrl+C cancel
-/// affordance and the status-row chrome; lifecycle on
-/// [`AgentView::note_streaming_wake_turn`].
-#[derive(Debug, Clone)]
-pub(crate) struct RunningWakeTurn {
-    /// The wake turn's synthetic prompt id (`task-completed-…` family).
-    pub prompt_id: String,
-    /// True once a cancel was sent for it: the status row reads Cancelling
-    /// and the cancel-resend reconcile stays armed until the terminal lands.
-    pub cancel_sent: bool,
-}
-/// A cancel sent while the pane is in a cancelling state, awaiting proof the
-/// shell received it. See [`AgentView::pending_cancel_resend`].
-#[derive(Debug, Clone)]
-pub(crate) struct PendingCancelResend {
-    /// The turn the cancel targeted (the wake prompt id or the adopted
-    /// prompt id; `None` for cancels with no adopted prompt, such as
-    /// `/compact`); a record from another target is never reused.
-    pub prompt_id: Option<String>,
-    /// When the cancel was (last) sent.
-    pub sent_at: std::time::Instant,
-    /// Sends so far, capped at [`crate::app::dispatch::turn::CANCEL_RESEND_MAX_ATTEMPTS`].
-    pub attempts: u8,
-    /// The turn-end broadcast arrived, proving the cancel landed: the
-    /// auto-resend stops, but the record stays so a manual retry can reuse
-    /// the recorded subagent choice.
-    pub confirmed: bool,
-    /// The first cancel's subagent decision; retries replay it instead of
-    /// escalating past a one-shot "Continue to run".
-    pub cancel_subagents: bool,
-    /// Replayed so a resend still arms the shell's task-wake barrier.
-    pub trigger: crate::app::actions::CancelTrigger,
-}
-/// Turn-end hook runs held for the live turn's marker. See [`AgentView::pending_stop_hooks`].
+/// Stop/stop_failure hook runs held for the live turn's terminal marker.
+/// See [`AgentView::pending_stop_hooks`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingStopHooks {
     /// The turn the stash belongs to; a stash that can't be matched to the
@@ -636,12 +602,6 @@ pub(crate) struct PendingForkBanner {
     pub parent_sid: String,
     /// Whether the fork created a new worktree.
     pub worktree: bool,
-}
-/// A finish held until its spawn arrives. Output is stripped at insert.
-#[derive(Debug, Clone)]
-pub(crate) struct DeferredSubagentFinish {
-    pub notification: xai_grok_shell::extensions::notification::SessionNotification,
-    pub inserted_at: std::time::Instant,
 }
 /// In-flight reconnect session reload.
 ///
@@ -665,15 +625,19 @@ pub(crate) struct SessionReload {
     /// Reconnect generation (from `ConnectionStatus::Connected`) this reload
     /// was opened for; finalization is rejected for any other generation.
     generation: u64,
-    /// Pre-outage transcript, tracker, todo, and workflow state: the same
-    /// [`ReplayRebuiltState`] every replay detaches, stashed for
-    /// restore-on-failure.
-    stash: ReplayRebuiltState,
+    /// Pre-outage transcript.
+    scrollback: ScrollbackState,
+    /// Pre-outage streaming tracker (paired with `scrollback`).
+    tracker: crate::acp::tracker::AcpUpdateTracker,
+    /// Pre-outage todo list (replayed Plan updates overwrite the live pane).
+    todo: TodoPane,
+    workflow_blocks: std::collections::HashMap<String, crate::scrollback::entry::EntryId>,
+    workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
+    workflow_run_revisions: std::collections::HashMap<String, u64>,
+    cleared_workflow_runs: std::collections::HashSet<String>,
     /// Reconnect cursor as of window open, restored with the stash so a
     /// later reload doesn't skip events the restored transcript never got.
     last_seen_event_id: Option<String>,
-    /// Parsed counter of [`Self::last_seen_event_id`] (same restore rationale).
-    last_seen_event_seq: Option<u64>,
     /// Live dedup highwaters (ACP + xAI) as of window open (same restore
     /// rationale).
     last_applied_event_seq: Option<u64>,
@@ -684,22 +648,6 @@ pub(crate) struct SessionReload {
     /// Whether a Plan update applied during this window: the cursor-merge
     /// outcome then keeps the staging todo list (newer) instead of the stash.
     saw_todo_update: bool,
-    /// Expiry notices staged by replayed tombstones during this window. The keep-stash finalize
-    /// drops staged copies of a line only up to the count the stash already shows (two tasks can
-    /// share identical notice text).
-    replayed_expiry_notices: Vec<crate::scrollback::entry::EntryId>,
-}
-/// The `AgentView` state a session replay rebuilds from disk, detached by
-/// [`AgentView::take_replay_rebuilt_state`] (see its doc for the contract).
-pub(crate) struct ReplayRebuiltState {
-    pub(crate) scrollback: ScrollbackState,
-    pub(crate) tracker: crate::acp::tracker::AcpUpdateTracker,
-    pub(crate) todo: TodoPane,
-    pub(crate) workflow_blocks:
-        std::collections::HashMap<String, crate::scrollback::entry::EntryId>,
-    pub(crate) workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
-    pub(crate) workflow_run_revisions: std::collections::HashMap<String, u64>,
-    pub(crate) cleared_workflow_runs: std::collections::HashSet<String>,
 }
 /// Lifecycle of the inline plugin CTA. `Hidden`/`Matched` cover the idle and
 /// prompt-matched states; `Installing`/`Installed`/`Error` cover an in-TUI
@@ -853,39 +801,21 @@ pub struct AgentView {
     /// chunks look stale (silent live-text loss).
     pub last_applied_event_seq: Option<u64>,
     /// xAI-stream sibling of [`Self::last_applied_event_seq`] (see there for
-    /// why the highwaters are split). Same drop rule, replay-exempt. Durable
-    /// subagent lifecycle events bypass that drop check but still lift this
-    /// highwater via `max` so later ordinary updates on the cursor tail stay
-    /// deduped.
+    /// why the highwaters are split). Same drop rule, replay-exempt.
     pub last_applied_xai_event_seq: Option<u64>,
     /// Raw `eventId` of the most recent update APPLIED to this root session —
     /// replay or live, on both the ACP and xAI paths; dropped updates (dedup,
     /// promptId gate, unexpected replay) don't move it. Sent as `_meta.cursor`
     /// on a reconnect `session/load` so the agent replays only the post-cursor
     /// tail. Why the full string: see
-    /// [`crate::acp::meta::NotificationMeta::event_id`]. Forward-only: a later
-    /// applied lower-ID lifecycle update must not regress this cursor. All
-    /// writers go through [`Self::advance_last_seen_event_id`].
+    /// [`crate::acp::meta::NotificationMeta::event_id`].
     pub last_seen_event_id: Option<String>,
-    /// Parsed counter for [`Self::last_seen_event_id`], kept in lockstep by
-    /// [`Self::advance_last_seen_event_id`] so forward-only compares do not
-    /// re-parse the id string at every writer.
-    pub last_seen_event_seq: Option<u64>,
-    /// Terminal lifecycle updates that arrived before their spawn. Bounded,
-    /// output-stripped, and cleared on session rebind; the spawn path drains
-    /// an entry before a later reconnect cursor can strand the finish.
-    pub(crate) deferred_subagent_finishes: HashMap<String, DeferredSubagentFinish>,
     /// Open reconnect reload window, if any. See [`SessionReload`].
     pub(crate) session_reload: Option<SessionReload>,
     /// Unexpected-replay drops since the last reload window opened. Gates the
     /// drop log to one `warn!` per incident (a late replay is one line per
     /// event — thousands for a large transcript).
     pub(crate) unexpected_replay_drops: u32,
-    /// After `SessionLoaded` clears `loading_replay`, keep accepting this-session
-    /// `isReplay` until this instant (or the first this-session live update).
-    /// The load barrier may release on an Unrelated firehose timeout while
-    /// remaining replay still sits behind the ACP peek.
-    pub(crate) late_replay_until: Option<std::time::Instant>,
     /// Prompt ids whose durable `TurnCompleted` terminal arrived during THIS
     /// load's replay window (`loading_replay`). The running turn is not adopted
     /// until replay finishes, so a terminal seen mid-replay can't be finalized
@@ -898,17 +828,10 @@ pub struct AgentView {
     /// errored wake terminal must not stack a second "Turn failed" row (the
     /// output-epoch dedupe only covers chatty closes; failures bypass it).
     pub(crate) failed_wake_marker_for: Option<String>,
-    /// Wake prompts whose terminals landed; a late delta for one must not
-    /// revive the stop affordance (see `note_streaming_wake_turn`). Cleared
-    /// at replay-window entry; a queue broadcast naming one as running again
-    /// removes that entry.
-    pub(crate) finished_wake_prompts: std::collections::HashSet<String>,
-    /// The wake turn currently streaming, if any. See [`RunningWakeTurn`].
-    pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
     /// Current mode of the prompt widget (normal vs editing a queued prompt).
     pub prompt_mode: PromptMode,
-    /// Current special prompt input mode (Normal/Bash/Remember).
+    /// Current special prompt input mode (Normal/Bash/Feedback/Remember).
     pub prompt_input_mode: PromptInputMode,
     /// Multiline input mode: swap Enter (insert newline) and Shift+Enter (send).
     /// Toggled by `Ctrl+M` or `/multiline`. Not persisted across sessions.
@@ -950,21 +873,10 @@ pub struct AgentView {
     pub(crate) modal_hovered_key: Option<char>,
     /// Cached server-reported context state.
     pub context_state: Option<xai_grok_shell::session::ContextInfo>,
-    pub status_context: Option<xai_grok_status_line::StatusLineContext>,
-    /// Held across a frame that clamps the row away, so a script keeps the size
-    /// it last painted at.
-    pub last_status_line_size: Option<crate::views::status_line::RowSize>,
     /// Gateway light-frontend session (`kind: "chat"` / `--chat` / conversation
     /// resume). Suppresses Build credits / local sampler context telemetry so the
     /// status bar and prompt never imply remote usage from wrong metrics.
-    /// OR'd with sticky `--chat` for UI/focus matching — not the ACP rename
-    /// `kind` bit; see [`Self::conversation_entry`].
     pub chat_kind: bool,
-    /// Whether this session opened on the chat lane (ACP `kind=chat`).
-    /// True for conversation-entry loads, `/chat` create, and sticky
-    /// `--chat` gateway resumes. False for history-bypass local-disk
-    /// Build rows (those keep [`Self::chat_kind`] for UI only).
-    pub conversation_entry: bool,
     /// Process-wide `--chat` (mirrors `AppView::chat_mode`; set via
     /// [`Self::apply_app_scoped_gates`]). UI policy only: hides picker
     /// source filter / delete / deep search on a conversations-only list.
@@ -990,8 +902,10 @@ pub struct AgentView {
     pub cleared_workflow_runs: std::collections::HashSet<String>,
     pub show_workflows: bool,
     pub workflows_view: crate::views::workflows::WorkflowsViewState,
-    /// Turn-end hook runs waiting for the turn's marker, which they race. Consumed or flushed
-    /// by `push_turn_terminal_marker`; dropped on every replay-window entry.
+    /// Live `stop`/`stop_failure` hook runs held for the turn's terminal
+    /// marker (driver order: the hooks arrive before the `PromptResponse`
+    /// that pushes it). Consumed or flushed by `push_turn_terminal_marker`;
+    /// dropped on every replay-window entry.
     pub(crate) pending_stop_hooks: Option<PendingStopHooks>,
     /// Goal id of the most recently cleared goal, captured from the dropped
     /// state (the `cleared` event itself carries an empty id). Drops a late
@@ -1163,6 +1077,7 @@ pub struct AgentView {
     pub last_context_click_at: Option<Instant>,
     /// Whether the mouse is hovering over the prompt widget.
     pub hovered_prompt: bool,
+    pub hit_badge: HitArea,
     pub hit_context: HitArea,
     pub hit_credits: HitArea,
     pub hit_todo_close: HitArea,
@@ -1176,6 +1091,7 @@ pub struct AgentView {
     #[allow(dead_code)]
     pub(crate) last_bg_click: Option<Instant>,
     pub hit_queue_close: HitArea,
+    pub hit_queue_badge: HitArea,
     pub hit_plan_button: HitArea,
     pub hit_plan_approval_status: HitArea,
     pub hit_follow_indicator: HitArea,
@@ -1239,12 +1155,6 @@ pub struct AgentView {
     /// Protocol-prepared image bytes keyed by file path. Used for dimension
     /// decoding and iTerm2 re-sends. Kitty transmits once and re-places.
     pub(crate) inline_media_cache: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
-    /// Paths that failed to decode/extract, keyed by the file stamp at
-    /// failure: skips per-frame decode/ffmpeg retries while the file is
-    /// unchanged, and self-heals when it changes (e.g. caught mid-write).
-    /// Cleared with the byte cache on eviction.
-    pub(crate) inline_media_load_failed:
-        std::collections::HashMap<std::path::PathBuf, media::MediaFileStamp>,
     /// Kitty GPU image IDs per media path. Each path gets a unique ID (2+)
     /// so switching between images is a cheap re-place (~80 bytes) instead
     /// of a full re-transmit. ID 1 is reserved for modal overlays.
@@ -1425,10 +1335,6 @@ pub struct AgentView {
     /// per-request — stashing happens on the `empty -> non-empty` transition
     /// and restoring on the `non-empty -> empty` transition.
     pub permission_stashed_prompt: Option<StashedPrompt>,
-    /// `exit_plan_mode` deferred freeform prefill because permission owned the
-    /// keyboard. Cleared when `restore_permission_stashes` applies it (or plan
-    /// review ends). Must not run on unrelated restore calls (e.g. YOLO).
-    pub plan_freeform_prefill_deferred: bool,
     /// Scrollback focus stolen for a permission prompt; restored when the queue empties.
     pub permission_stashed_pane: Option<AgentPane>,
     /// Free-form "Always allow" pattern editor buffer for the front request.
@@ -1570,17 +1476,12 @@ pub struct AgentView {
     /// from disk on resume (`TaskResult::SessionMetaFromDisk`). Drives the
     /// prompt-border inline title and wins precedence for the dashboard
     /// modal label and the OSC terminal title. The on-disk write is
-    /// best-effort (failure surfaces a system block through the existing
+    /// best-effort (failure surfaces a toast through the existing
     /// `RenameSessionFailed` arm).
     pub display_name: Option<String>,
     /// Short title from shell `SessionSummaryGenerated` or `summary.json` on load/resume.
     /// Precedence in the dashboard title is below `display_name`, above first-prompt text.
     pub generated_session_title: Option<String>,
-    /// Shell already fanned out `titleIsManual: false` for this unpin. A
-    /// dropped RPC then surfaces `ResetSessionTitleFailed`; restoring the
-    /// pin would stick a manual title that later absent-meta auto titles
-    /// refuse to clear.
-    pub title_unpin_committed: bool,
     /// Ultra-short summary of the most recent successful turn (shell
     /// `LastTurnSummary`), preferred over the last-message preview for the
     /// idle dashboard row's secondary line. Shown until replaced by the next
@@ -1614,11 +1515,6 @@ pub struct AgentView {
     /// (a lost response would otherwise leave the TUI on "Cancelling…" with
     /// Esc and the input dead until a restart).
     pub(crate) pending_turn_end_reconcile: Option<PendingTurnEnd>,
-    /// Armed whenever `Effect::CancelTurn` leaves the pane cancelling:
-    /// `session/cancel` is fire-and-forget with known loss windows, so the
-    /// event loop re-sends the idempotent cancel after
-    /// [`super::dispatch::CANCEL_RESEND_GRACE`] while still cancelling.
-    pub(crate) pending_cancel_resend: Option<PendingCancelResend>,
     /// Send-now cancel expectation: the client-minted id of an explicit
     /// cancel-and-send this client dispatched into a running turn (send-now
     /// chord / `SendPromptNow`, or queue-row "Send now"). The running turn's
@@ -1865,9 +1761,6 @@ fn translate_local_submit(
             InputOutcome::Action(Action::DeleteCurrentSessionAnswered {
                 confirmed: *idx == 0,
             })
-        }
-        LocalQuestionKind::Feedback => {
-            unreachable!("feedback submits through submit_feedback_pane, which returns first")
         }
     }
 }
@@ -2308,7 +2201,6 @@ pub(crate) mod test_fixtures {
             active_idx: 0,
             bash_highlights: None,
             bash_selection_count: 0,
-            bash_deny_selection_count: 0,
             bash_command_raw: None,
             mcp_scope: None,
             title: String::new(),
@@ -2483,7 +2375,7 @@ pub(crate) mod test_fixtures {
         assert!(
             matches!(
                 activity,
-                Some(TurnActivity::Waiting(WaitingReason::Subagent { .. }))
+                Some(TurnActivity::Waiting(WaitingReason::Subagent))
             ),
             "expected Subagent wait, got {activity:?}"
         );
@@ -2530,7 +2422,7 @@ pub(crate) mod test_fixtures {
             prompt: None,
             child_cwd: None,
             worktree_path: None,
-            transcript: Default::default(),
+            child_updates_replayed: false,
         }
     }
     /// Count of "Worked for X" (`TurnCompleted`) marker blocks in the
@@ -3630,6 +3522,10 @@ mod prompt_input_mode_tests {
             Some(theme.command)
         );
         assert_eq!(
+            PromptInputMode::Feedback.accent_color(&theme),
+            Some(theme.accent_feedback)
+        );
+        assert_eq!(
             PromptInputMode::Remember.accent_color(&theme),
             Some(theme.accent_remember)
         );
@@ -3643,6 +3539,10 @@ mod prompt_input_mode_tests {
             Some(("! ", theme.command))
         );
         assert_eq!(
+            PromptInputMode::Feedback.prefix_override(&theme),
+            Some(("~ ", theme.accent_feedback))
+        );
+        assert_eq!(
             PromptInputMode::Remember.prefix_override(&theme),
             Some(("# ", theme.accent_remember))
         );
@@ -3653,6 +3553,14 @@ mod prompt_input_mode_tests {
         assert_eq!(PromptInputMode::Normal.placeholder_override(true), None);
         assert_eq!(PromptInputMode::Bash.placeholder_override(false), None);
         assert_eq!(PromptInputMode::Bash.placeholder_override(true), None);
+        assert_eq!(
+            PromptInputMode::Feedback.placeholder_override(false),
+            Some("Type your feedback...")
+        );
+        assert_eq!(
+            PromptInputMode::Feedback.placeholder_override(true),
+            Some("Type your feedback...")
+        );
         assert_eq!(
             PromptInputMode::Remember.placeholder_override(false),
             Some("Save a memory note... (Shift+Enter for multiline)")
@@ -3670,6 +3578,10 @@ mod prompt_input_mode_tests {
             Some("Run shell command")
         );
         assert_eq!(
+            PromptInputMode::Feedback.prompt_info_override(),
+            Some("Send feedback")
+        );
+        assert_eq!(
             PromptInputMode::Remember.prompt_info_override(),
             Some("Save memory note")
         );
@@ -3685,6 +3597,11 @@ mod prompt_input_mode_tests {
         assert!(matches!(
             PromptInputMode::Bash.send_action(t2.clone()),
             Action::SendBashCommand(t) if t == t2
+        ));
+        let t3 = "this is feedback".to_string();
+        assert!(matches!(
+            PromptInputMode::Feedback.send_action(t3.clone()),
+            Action::SendFeedback(t) if t == t3
         ));
         let t4 = "remember this".to_string();
         assert!(matches!(
@@ -3713,6 +3630,18 @@ mod prompt_input_mode_tests {
             assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
             assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
             assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+            assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
         }
+    }
+    #[test]
+    fn is_exit_key_feedback_uses_stricter_set() {
+        let mode = PromptInputMode::Feedback;
+        assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(mode.is_exit_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!mode.is_exit_key(&KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)));
     }
 }

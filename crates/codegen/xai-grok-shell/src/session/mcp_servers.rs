@@ -41,24 +41,26 @@ fn resolve_overrides(
 pub(crate) fn build_config_resolved_event(
     configs: &[acp::McpServer],
     cwd: &Path,
-) -> xai_grok_session_events::Event {
+) -> xai_file_utils::events::Event {
     let disabled: Vec<String> = crate::util::config::disabled_mcp_server_names(cwd)
         .into_iter()
         .collect();
     let servers = configs
         .iter()
-        .map(|c| xai_grok_session_events::McpConfigServer {
+        .map(|c| xai_file_utils::events::McpConfigServer {
             name: inner::mcp_server_name(c).to_string(),
             transport: inner::mcp_transport_str(c).to_string(),
-            source:
-                match crate::session::mcp_dispatcher::classify_source(inner::mcp_server_name(c)) {
-                    crate::extensions::mcp::McpServerSource::Managed => "managed",
-                    crate::extensions::mcp::McpServerSource::Local => "local",
-                }
-                .to_string(),
+            source: if inner::mcp_server_name(c)
+                .starts_with(crate::session::managed_mcp::MANAGED_MCP_PREFIX)
+            {
+                "managed"
+            } else {
+                "local"
+            }
+            .to_string(),
         })
         .collect();
-    xai_grok_session_events::Event::McpConfigResolved { servers, disabled }
+    xai_file_utils::events::Event::McpConfigResolved { servers, disabled }
 }
 
 pub(crate) async fn start_mcp_server(

@@ -13,8 +13,6 @@ pub enum ConfigSource {
     SystemManagedConfig,
     ManagedConfig,
     UserConfig,
-    /// A value injected via the `GROK_CONFIG` / `GROK_CONFIG_PATH` overlay.
-    EnvOverlay,
     Config,
     Remote,
     Default,
@@ -39,28 +37,22 @@ impl<T: std::fmt::Display> std::fmt::Display for Resolved<T> {
     }
 }
 /// Resolve a boolean feature flag: requirement > cli > env > config > managed > feature flag > default.
-pub struct BoolFlag {
+pub struct BoolFlag<'a> {
     requirement: Option<bool>,
     cli: Option<bool>,
-    env: Option<bool>,
+    env_var: &'a str,
     config: Option<bool>,
     managed: Option<bool>,
     feature_flag: Option<bool>,
     default: bool,
 }
 
-impl BoolFlag {
-    pub fn env(env_var: &str) -> Self {
-        Self::env_value(env_bool(env_var))
-    }
-
-    /// The environment tier already read, for a resolver handed every tier
-    /// rather than reading the process itself.
-    pub fn env_value(env: Option<bool>) -> Self {
+impl<'a> BoolFlag<'a> {
+    pub fn env(env_var: &'a str) -> Self {
         Self {
             requirement: None,
             cli: None,
-            env,
+            env_var,
             config: None,
             managed: None,
             feature_flag: None,
@@ -97,7 +89,7 @@ impl BoolFlag {
         resolve_bool_flag(
             self.requirement,
             self.cli,
-            self.env,
+            self.env_var,
             self.config,
             self.managed,
             self.feature_flag,
@@ -109,7 +101,7 @@ impl BoolFlag {
 fn resolve_bool_flag(
     requirement: Option<bool>,
     cli_arg: Option<bool>,
-    env_val: Option<bool>,
+    env_var: &str,
     config_val: Option<bool>,
     managed_val: Option<bool>,
     feature_flag_val: Option<bool>,
@@ -121,7 +113,7 @@ fn resolve_bool_flag(
     if let Some(val) = cli_arg {
         return Resolved::new(val, ConfigSource::Cli);
     }
-    if let Some(val) = env_val {
+    if let Some(val) = env_bool(env_var) {
         return Resolved::new(val, ConfigSource::Env);
     }
     if let Some(val) = config_val {

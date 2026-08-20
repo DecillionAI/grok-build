@@ -244,8 +244,10 @@ impl GboomState {
         }
         let in_region = self.in_mouse_region(mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if in_region => {
-                self.game.queue_fire();
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_region {
+                    self.game.queue_fire();
+                }
             }
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
                 if !in_region {

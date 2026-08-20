@@ -443,9 +443,14 @@ impl AgentView {
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting);
                 if let Some(ref mut pav) = self.plan_approval_view {
                     pav.focus = PlanApprovalFocus::Preview;
+                    if was_commenting {
+                        pav.commenting_range = None;
+                        pav.editing_comment_id = None;
+                        pav.stashed_feedback_prompt = None;
+                    }
                 }
                 if was_commenting {
-                    self.discard_in_progress_comment();
+                    self.prompt.set_text("");
                 }
             }
             return InputOutcome::Changed;
@@ -544,20 +549,15 @@ impl AgentView {
                 if let Some(ref mut pav) = self.plan_approval_view {
                     pav.focus = PlanApprovalFocus::Preview;
                     if was_commenting {
+                        // Same rule as Tab: clicking back into the modal
+                        // discards the in-progress comment draft.
                         pav.commenting_range = None;
                         pav.editing_comment_id = None;
+                        pav.stashed_feedback_prompt = None;
                     }
                 }
                 if was_commenting {
-                    let stashed = self
-                        .plan_approval_view
-                        .as_mut()
-                        .and_then(|pav| pav.stashed_feedback_prompt.take());
-                    if let Some(stashed) = stashed {
-                        self.prompt.restore(stashed);
-                    } else {
-                        self.prompt.set_text("");
-                    }
+                    self.prompt.set_text("");
                 }
                 // Forward below.
             }
@@ -685,17 +685,15 @@ impl AgentView {
                         let hi = start.max(end);
                         let range = lo..hi + 1;
                         if let Some(ref mut pav) = self.plan_approval_view {
-                            // First-entry-only stash (same as enter_plan_commenting): a second
-                            // gutter drag while Commenting must not replace frozen freeform.
-                            if pav.stashed_feedback_prompt.is_none() {
-                                pav.stashed_feedback_prompt = Some(self.prompt.stash());
-                            }
+                            pav.stashed_feedback_prompt = Some(self.prompt.stash());
                             pav.commenting_range = Some(range);
                             pav.editing_comment_id = None;
                             pav.focus = PlanApprovalFocus::Commenting;
                             self.prompt.set_text("");
                         } else {
-                            // First-entry-only stash; see enter_casual_plan_commenting.
+                            // First-entry-only stash; see
+                            // `enter_casual_plan_commenting` for the
+                            // same guard rationale.
                             if self.casual_stashed_prompt.is_none() {
                                 self.casual_stashed_prompt = Some(self.prompt.stash());
                             }

@@ -93,9 +93,7 @@ pub fn paint_peek_live_tail(scrollback: &ScrollbackState, area: Rect, buf: &mut 
 
     let mut y = area.y;
     if let Some(line) = pin {
-        // Mirrors the scrollback pane's content paint so the same rows read
-        // the same direction in the peek preview.
-        buf.set_line_safe_bidi(area.x, y, &line, content_w);
+        buf.set_line_safe(area.x, y, &line, content_w);
         y = y.saturating_add(1);
     }
     if ellipsis {
@@ -108,7 +106,7 @@ pub fn paint_peek_live_tail(scrollback: &ScrollbackState, area: Rect, buf: &mut 
         if y >= area.y.saturating_add(area.height) {
             break;
         }
-        buf.set_line_safe_bidi(area.x, y, line, content_w);
+        buf.set_line_safe(area.x, y, line, content_w);
         y = y.saturating_add(1);
     }
 }

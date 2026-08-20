@@ -10,8 +10,7 @@ use super::interject;
 use super::permissions::drain_permission_queue;
 use super::queue::{
     apply_turn_start_shim, drain_prompt_state_to_last_queued, immediate_server_send_eligible,
-    maybe_drain_queue, note_peek_page_flip, push_and_page_flip, push_server_queue_echo,
-    retire_optimistic_echo,
+    maybe_drain_queue, note_peek_page_flip, push_server_queue_echo, retire_optimistic_echo,
 };
 use super::router::dispatch;
 use super::voice::{merge_prompt_with_voice_interim, voice_stop_on_submit};
@@ -25,9 +24,6 @@ use crate::scrollback::blocks::SessionEvent;
 use crate::slash::command::DoctorRequest;
 use agent_client_protocol as acp;
 use xai_grok_telemetry::session_ctx::log_event;
-
-/// Shared by every submit guard that refuses while the session reconnects.
-pub(super) const RECONNECTING_NOTICE: &str = "Reconnecting, please wait...";
 
 /// Chat kind for the next create: CLI `--chat` (`app.chat_mode`) or one-shot
 /// `/chat` (`deferred_startup.pending_chat`, consumed here).
@@ -203,15 +199,10 @@ pub(super) fn dispatch_open_history_search(app: &mut AppView) -> Vec<Effect> {
     with_active_agent(app, |agent| {
         let history = agent.combined_prompt_history();
         let current_text = agent.prompt.text().to_string();
-        let opened = agent
+        agent
             .prompt
             .history_search
             .activate(&history, &current_text);
-        if !opened {
-            // Matcher thread didn't start: the overlay stays closed on
-            // purpose (nothing could ever populate it).
-            tracing::debug!("history search unavailable: matcher spawn failed");
-        }
     });
     vec![]
 }
@@ -447,7 +438,7 @@ pub(super) fn dispatch_send_prompt_inner(
     };
 
     if app.reconnect_pending {
-        app.show_toast(RECONNECTING_NOTICE);
+        app.show_toast("Reconnecting, please wait...");
         return vec![];
     }
 
@@ -602,9 +593,6 @@ pub(super) fn dispatch_send_prompt_inner(
                     // filtered out of every completion surface, but it stays
                     // resolvable so a fully-typed invocation earns a hint that
                     // names the way out instead of leaking to the model.
-                    // A refusal added here must also extend the pre-check in `EditedCommandGate`
-                    // (`dispatch::queue`): that caller has to know the command will be refused
-                    // before it drops the queued row the text came from.
                     if let Some(refusal) = command
                         .mode_support()
                         .refusal(invocation.token, ctx.screen_mode)
@@ -640,14 +628,14 @@ pub(super) fn dispatch_send_prompt_inner(
                 if consume_input {
                     agent.prompt.set_text("");
                 }
-                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
+                agent.scrollback.push_block(RenderBlock::system(msg));
                 return vec![];
             }
             CommandResult::Message(msg) => {
                 if consume_input {
                     agent.prompt.set_text("");
                 }
-                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
+                agent.scrollback.push_block(RenderBlock::system(msg));
                 return vec![];
             }
             CommandResult::Doctor(request) => {
@@ -877,10 +865,7 @@ pub(super) fn dispatch_send_prompt_inner(
                 Some(&sid_str),
                 Some(serde_json::json!({ "kind": "prompt", "len": text.len() })),
             );
-            if queued_while_running
-                && !parked_sendable_wait
-                && !crate::appearance::cache::load_follow_up_steer()
-            {
+            if queued_while_running && !parked_sendable_wait {
                 maybe_show_send_now_tip(app);
             }
             return vec![Effect::SendPrompt {
@@ -952,7 +937,7 @@ pub(super) fn dispatch_send_prompt_inner(
 /// the execute block from the shell IS the visual entry.
 pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> Vec<Effect> {
     if app.reconnect_pending {
-        app.show_toast(RECONNECTING_NOTICE);
+        app.show_toast("Reconnecting, please wait...");
         return vec![];
     }
 
@@ -1177,15 +1162,7 @@ pub(super) fn handle_prompt_response(
                 }
                 // Resolved-without-running never adopts; explicit for the
                 // session-less arm (no note_queue_echo_retired above).
-                // Exception: an active-goal Send Now painted block still awaiting
-                // its interjection claim stays put — the `RemovedFromQueue`
-                // response is the expected outcome of routing the Send Now as an
-                // interjection, and `handle_interjection` converts the block in
-                // place. Retiring it here (before that claim wins the race) would
-                // drop and re-push the message at the scrollback end.
-                if !agent.is_send_now_awaiting_interjection_claim(response_pid) {
-                    agent.retire_send_now_painted_block(response_pid);
-                }
+                agent.retire_send_now_painted_block(response_pid);
                 return vec![];
             }
         }
@@ -1201,7 +1178,7 @@ pub(super) fn handle_prompt_response(
         let wire_cancel_trigger = result.as_ref().ok().and_then(|pr| {
             pr.meta
                 .as_ref()?
-                .get(crate::app::turn_completion::CANCEL_TRIGGER_KEY)?
+                .get("cancelTrigger")?
                 .as_str()
                 .map(str::to_string)
         });
@@ -1210,15 +1187,6 @@ pub(super) fn handle_prompt_response(
                 Some(trigger) => trigger == "send_now",
                 None => expected_send_now.is_some(),
             };
-        // A hook-denied end rides the cancelled stop reason but is a policy
-        // block, not a user cancel — `cancelled_turn_event` picks the marker.
-        let wire_cancellation_category = result.as_ref().ok().and_then(|pr| {
-            pr.meta
-                .as_ref()?
-                .get(crate::app::turn_completion::CANCELLATION_CATEGORY_KEY)?
-                .as_str()
-                .map(str::to_string)
-        });
         let rate_limited = agent.session.rate_limited;
         // Fallback mirroring the credit-limit race guard below: if the retry
         // notification lost the race with (or never reached) this
@@ -1346,10 +1314,9 @@ pub(super) fn handle_prompt_response(
             // Send-now cancel: no marker (the new prompt is the next turn); the
             // `None` still flushes any held stop hooks standalone.
             (Ok(_), true) if send_now_cancel => None,
-            (Ok(_), true) => Some(crate::app::turn_completion::cancelled_turn_event(
-                wire_cancellation_category.as_deref(),
-                elapsed.unwrap_or_default(),
-            )),
+            (Ok(_), true) => Some(SessionEvent::TurnCancelled {
+                elapsed: elapsed.unwrap_or_default(),
+            }),
             (Ok(_), false) if agent.bash_turn => None,
             (Ok(_), false) => Some(SessionEvent::TurnCompleted {
                 // Legacy copy on purpose: unknown elapsed keeps the "in 0.0s"
@@ -1600,7 +1567,6 @@ pub(super) fn handle_prompt_response(
         effects.push(Effect::FetchBilling {
             agent_id,
             silent: true,
-            nonce: 0,
         });
         note_peek_page_flip(app, agent_id, page_flip_entry);
         return effects;

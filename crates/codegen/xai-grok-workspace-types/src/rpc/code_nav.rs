@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{RpcActivityClass, WorkspaceRpc};
+use super::WorkspaceRpc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGotoDefinitionReq {
@@ -15,7 +15,6 @@ pub struct CodeGotoDefinitionReq {
 
 impl WorkspaceRpc for CodeGotoDefinitionReq {
     const METHOD: &'static str = "workspace.code_goto_definition";
-    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = CodeNavResponse;
 }
 
@@ -32,7 +31,6 @@ pub struct CodeGotoReferencesReq {
 
 impl WorkspaceRpc for CodeGotoReferencesReq {
     const METHOD: &'static str = "workspace.code_goto_references";
-    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = CodeNavResponse;
 }
 
@@ -46,7 +44,6 @@ pub struct CodeFindDefinitionsReq {
 
 impl WorkspaceRpc for CodeFindDefinitionsReq {
     const METHOD: &'static str = "workspace.code_find_definitions";
-    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = CodeNavResponse;
 }
 
@@ -60,7 +57,6 @@ pub struct CodeFindReferencesReq {
 
 impl WorkspaceRpc for CodeFindReferencesReq {
     const METHOD: &'static str = "workspace.code_find_references";
-    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = CodeNavResponse;
 }
 
@@ -72,7 +68,6 @@ pub struct CodeIndexStatusReq {
 
 impl WorkspaceRpc for CodeIndexStatusReq {
     const METHOD: &'static str = "workspace.code_index_status";
-    const ACTIVITY: RpcActivityClass = RpcActivityClass::Read;
     type Response = CodeIndexStatusResponse;
 }
 

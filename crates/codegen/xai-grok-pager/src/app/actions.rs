@@ -7,11 +7,9 @@
 //! - [`Effect`] — produced by dispatch, consumed by the event loop (async).
 //! - [`TaskResult`] — produced by spawned tasks, fed back into dispatch.
 use super::agent::AgentId;
-use crate::app::status_line::StatusLineRun;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
-use xai_grok_shell::session::unified_list::SessionKind;
 /// Typed error for model switch failures. Replaces the raw `String` in
 /// `TaskResult::SwitchModelComplete` so dispatch can match on the variant
 /// instead of parsing strings.
@@ -255,20 +253,6 @@ pub enum Action {
         /// the original server-side text, not the edit. Atomicity semantics
         /// live on [`Effect::QueueInterject`].
         new_text: Option<String>,
-    },
-    /// A queued-row edit whose saved text is a complete pager builtin invocation: drop the row,
-    /// then run the command through the normal slash dispatch. The view only classifies; dispatch
-    /// stays the sole execution owner, and it removes the row only after its own guards pass, so a
-    /// failed run leaves the row queued.
-    RunEditedQueuedCommand {
-        /// `PromptMode::EditingQueued.id`: the local `pending_prompts` id, or the synthesized
-        /// selection id for a server row (unused there).
-        local_id: u64,
-        /// `Some` for a server-authoritative row. `None` covers both a local row and a server row
-        /// that vanished from the mirror before Enter: with nothing to remove, no versioned
-        /// `x.ai/queue/remove` request is sent.
-        server: Option<SharedQueueTarget>,
-        text: String,
     },
     /// Focus the prompt pane.
     FocusPrompt,
@@ -555,17 +539,12 @@ pub enum Action {
     SetTimeline(bool),
     /// Set `[ui].page_flip_on_send` (default ON). Persists via `Effect::PersistSetting`.
     SetPageFlipOnSend(bool),
-    /// Set `[ui].confirm_before_rewind` (default ON). Persists via `Effect::PersistSetting`.
-    SetConfirmBeforeRewind(bool),
     /// Set whether the drain call site merges the run of leading queued
     /// `Prompt` entries into one turn instead of sending them one by one.
     /// SHARED-owned: updates the process-wide cache mirror (read by the
     /// drain site) and persists to `[ui].combine_queued_prompts` via
     /// `Effect::PersistSetting`.
     SetCombineQueuedPrompts(bool),
-    /// Mid-turn follow-up routing (`queue` | `steer`).
-    /// SHARED-owned: `[ui].follow_up_behavior`.
-    SetFollowUpBehavior(crate::appearance::FollowUpBehavior),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).
@@ -685,11 +664,6 @@ pub enum Action {
     /// workspace, mark trust resolved, and replay any deferred session startup.
     /// (Declining quits via [`Action::Quit`]; there is no decline action.)
     TrustFolder,
-    /// Replays any session startup deferred behind the notice.
-    /// (Declining quits via [`Action::Quit`]; there is no decline action.)
-    AcceptConsent,
-    /// Opens the notice's nth link. The url is re-read from validated state, never carried here.
-    OpenConsentLink(usize),
     /// A spawned task completed.
     TaskComplete(TaskResult),
     /// Share the current session via URL.
@@ -705,8 +679,6 @@ pub enum Action {
     RenameSession {
         title: String,
     },
-    /// Unpin the current session title (`/rename --auto`).
-    ResetSessionTitleToAuto,
     /// Show detailed context usage (progress bar, token breakdown, stats).
     ShowContextInfo,
     /// `/usage` — session token/cost, plus consumer credits when visible.
@@ -731,9 +703,9 @@ pub enum Action {
     /// to config.toml). `/plan <desc>` uses `EnterPlanMode` instead
     /// because it also starts a turn.
     SetPlanMode(PlanModeKind),
-    /// Open the freeform feedback bottom pane (bare `/feedback`).
-    OpenFeedbackPane,
-    /// Submit feedback text (inline `/feedback <text>` or pane submit).
+    /// Enter feedback mode (visual prompt change, not a send).
+    EnterFeedbackMode,
+    /// Send feedback text collected in feedback mode.
     SendFeedback(String),
     /// Enter remember mode (visual prompt change, not a send).
     EnterRememberMode,
@@ -1015,11 +987,12 @@ pub enum Action {
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),
-    RewindConfirm(usize),
-    /// Confirm rewind and turn off `confirm_before_rewind` for future rewinds.
-    RewindConfirmNeverAsk(usize),
+    RewindSelectMode(crate::views::rewind::RewindMode, usize),
+    RewindConfirm(usize, crate::views::rewind::RewindMode),
+    RewindConversationOnlyConfirm(usize),
     RewindCancelOffer,
     RewindDismiss,
+    RewindBackToModeSelect,
     RewindDismissError,
     /// Submit an inline edit: conversation-only rewind to that prompt, then
     /// resubmit the edited text (state lives on `AgentView::inline_edit`).
@@ -1030,12 +1003,6 @@ pub enum Action {
     JumpPickerSelect(EntryId),
     /// Close the picker and restore the stashed viewport.
     JumpDismiss,
-}
-/// A server-authoritative queue row plus the version its removal is checked against.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SharedQueueTarget {
-    pub id: String,
-    pub expected_version: u64,
 }
 /// Persist-and-notify semantics for [`Effect::PersistPermissionMode`].
 ///
@@ -1177,9 +1144,16 @@ impl PlanModeKind {
         if b { Self::On } else { Self::Off }
     }
 }
-/// What user gesture triggered a turn cancel; sent as `session/cancel`'s
-/// `_meta.cancelTrigger`. The shell's deny-list treats every gesture value
-/// as a stop, so new variants need no shell change.
+/// Async side effect produced by [`super::dispatch::dispatch`].
+///
+/// The event loop spawns these into a `JoinSet`. When they complete,
+/// the result is wrapped in [`TaskResult`] and fed back through
+/// `Action::TaskComplete`.
+/// What user gesture triggered a turn cancel. Recorded on `session/cancel`'s
+/// `_meta.cancelTrigger` so the agent's `mid_turn_abort` telemetry can tell
+/// ESC from Ctrl+C (and a mouse click on the cancel button) apart. Free-form
+/// on the wire (the agent stores it in `cancellation_context`), so adding a
+/// variant needs no agent/schema change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelTrigger {
     /// Wire value `"esc"` (bare Esc mid-turn cancel in minimal / non-vim
@@ -1189,9 +1163,6 @@ pub enum CancelTrigger {
     CtrlC,
     /// The on-screen cancel button was clicked.
     Mouse,
-    /// The dashboard's stop key (Ctrl+X), from the overlay or a busy row,
-    /// downgraded to a turn cancel.
-    DashboardStop,
 }
 impl CancelTrigger {
     /// Snake_case wire string sent as `_meta.cancelTrigger`.
@@ -1200,7 +1171,6 @@ impl CancelTrigger {
             Self::Esc => "esc",
             Self::CtrlC => "ctrl_c",
             Self::Mouse => "mouse",
-            Self::DashboardStop => "dashboard_stop",
         }
     }
 }
@@ -1412,13 +1382,8 @@ pub enum AfterSessionDelete {
     /// `/delete` from a dashboard-attached agent, or dashboard row delete.
     Dashboard,
 }
-/// Async side effect produced by [`super::dispatch::dispatch`]. The event
-/// loop spawns these into a `JoinSet`; completions come back through
-/// [`TaskResult`] as `Action::TaskComplete`.
 #[derive(Debug)]
 pub enum Effect {
-    /// Run a `command` status line.
-    RunStatusLineCommand(StatusLineRun),
     /// Create a new ACP session.
     CreateSession {
         agent_id: AgentId,
@@ -1479,7 +1444,7 @@ pub enum Effect {
     /// Scan enabled foreign session stores without delaying the native list.
     ScanForeignSessions {
         cwd: std::path::PathBuf,
-        compat: xai_grok_foreign_sessions::EnabledForeignSessionSources,
+        compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources,
         grok_home: std::path::PathBuf,
         coordinator: crate::app::ForeignScanCoordinator,
         seq: u64,
@@ -1492,7 +1457,7 @@ pub enum Effect {
     /// Detect the newest resumable foreign session without delaying first paint.
     DetectForeignResumeHint {
         canonical_cwd: std::path::PathBuf,
-        compat: xai_grok_foreign_sessions::EnabledForeignSessionSources,
+        compat: xai_grok_workspace::foreign_sessions::EnabledForeignSessionSources,
         grok_home: std::path::PathBuf,
         launch_token: u64,
     },
@@ -1571,9 +1536,14 @@ pub enum Effect {
         /// `mid_turn_abort` telemetry can distinguish them. `None` for
         /// programmatic cancels (login/reauth flows).
         trigger: Option<CancelTrigger>,
-        /// `_meta.rewindIfNoOutput` + `_meta.promptId` of the locally rewound turn.
-        /// Set only when the pager restored the prompt into the composer.
-        rewind_prompt_id: Option<String>,
+        /// Ask the shell to trim the in-flight prompt from session history when
+        /// the turn is still pristine (no server activity), sent as
+        /// `_meta.rewindIfPristine`. Set true ONLY when the pager has locally
+        /// rewound the prompt back into the composer, so the shell's history
+        /// matches the UI. Without it the shell keeps the prompt plus an
+        /// interruption marker, and a later resend pairs the kept copy with the
+        /// resend — the send+Ctrl+C double-prompt bug.
+        rewind_if_pristine: bool,
     },
     /// Run a manual `/compact` command.
     Compact {
@@ -1584,7 +1554,6 @@ pub enum Effect {
     KillBgTask {
         session_id: acp::SessionId,
         task_id: String,
-        source: xai_grok_shell::extensions::task::TaskKillSource,
     },
     /// Cancel a subagent via `x.ai/subagent/cancel`.
     KillSubagent {
@@ -1622,15 +1591,6 @@ pub enum Effect {
     },
     /// Persist `[privacy].privacy_banner_acked` (RFC 3339 dismiss time).
     PersistPrivacyBannerAcked { acked_at: String },
-    /// Persist the consent answer to `[consent]` in config.toml.
-    PersistConsentAnswer {
-        account: Option<String>,
-        notice_id: String,
-        version: i32,
-        acked: bool,
-    },
-    /// Files the acceptance server side; the local marker is what stops the re-prompt if it fails.
-    RecordConsentUpstream { notice_id: String, version: i32 },
     /// Persist memory modal fullscreen preference to `[hints]` in config.toml.
     PersistMemoryFullscreen { fullscreen: bool },
     /// Persist the dashboard's `[dashboard]` configuration to `~/.grok/config.toml`.
@@ -1936,15 +1896,11 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
         show_resolved_model: bool,
-        /// Usage-modal fetch generation; echoed back on the task result.
-        nonce: u64,
     },
     /// Fetch and display detailed context usage via x.ai/session/info.
     ShowContextInfo {
         agent_id: AgentId,
         session_id: acp::SessionId,
-        /// Usage-modal fetch generation; echoed back on the task result.
-        nonce: u64,
     },
     /// Fetch current bundle cache status via `x.ai/bundle/status`.
     FetchBundleStatus,
@@ -2065,17 +2021,6 @@ pub enum Effect {
         session_id: acp::SessionId,
         title: String,
         cwd: std::path::PathBuf,
-        kind: SessionKind,
-    },
-    /// Unpin the current session title (`/rename --auto`).
-    ResetSessionTitle {
-        agent_id: AgentId,
-        session_id: acp::SessionId,
-        cwd: std::path::PathBuf,
-        kind: SessionKind,
-        /// Pre-clear caches so `ResetSessionTitleFailed` can restore the pin.
-        previous_display_name: Option<String>,
-        previous_generated_title: Option<String>,
     },
     /// Delete a session's stored data (local + remote) via
     /// `x.ai/session/delete`.
@@ -2119,22 +2064,23 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
+    RewindPreview {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        target_prompt_index: usize,
+        mode: crate::views::rewind::RewindMode,
+    },
     RewindExecute {
         agent_id: AgentId,
         session_id: acp::SessionId,
         target_prompt_index: usize,
+        mode: crate::views::rewind::RewindMode,
     },
     /// Fetch billing/credit usage from the agent's `x.ai/billing` extension.
     /// When `silent` is true the result updates `credit_balance` without
     /// pushing a system message into scrollback (used for automatic refreshes
     /// on session init and after each turn).
-    FetchBilling {
-        agent_id: AgentId,
-        silent: bool,
-        /// Usage-modal fetch generation (`0` = background refresh; those
-        /// never touch the modal's loading/error flags).
-        nonce: u64,
-    },
+    FetchBilling { agent_id: AgentId, silent: bool },
     /// Fetch billing data at the app level (no agent required).
     /// Used on startup to populate the welcome-screen credit warning.
     FetchAppBilling,
@@ -2142,8 +2088,6 @@ pub enum Effect {
     FetchSessionUsage {
         agent_id: AgentId,
         session_id: acp::SessionId,
-        /// Usage-modal fetch generation; echoed back on the task result.
-        nonce: u64,
     },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
@@ -2207,45 +2151,6 @@ pub enum Effect {
         plan: Box<crate::diagnostics::FixPlan>,
     },
 }
-/// Wire params for `x.ai/session/rename`. Shared with the effect executor
-/// so dispatch tests can pin the exact camelCase payload.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RenameSessionRequest {
-    pub session_id: String,
-    pub title: String,
-    pub cwd: String,
-    pub kind: SessionKind,
-    /// Empty-title + `true` is the unpin convention. Omitted when false so
-    /// ordinary rename payloads stay byte-identical for old shells.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reset_to_auto: bool,
-}
-impl RenameSessionRequest {
-    pub(crate) fn for_rename(
-        session_id: String,
-        title: String,
-        cwd: String,
-        kind: SessionKind,
-    ) -> Self {
-        Self {
-            session_id,
-            title,
-            cwd,
-            kind,
-            reset_to_auto: false,
-        }
-    }
-    pub(crate) fn for_reset(session_id: String, cwd: String, kind: SessionKind) -> Self {
-        Self {
-            session_id,
-            title: String::new(),
-            cwd,
-            kind,
-            reset_to_auto: true,
-        }
-    }
-}
 /// Outcome of an `x.ai/subagent/cancel` request, telling dispatch whether the
 /// pager must finalize the subagent row itself.
 #[derive(Debug)]
@@ -2275,28 +2180,9 @@ pub enum DoctorPlanningOutcome {
 /// Result from a completed async [`Effect`].
 ///
 /// Wrapped in `Action::TaskComplete` and dispatched synchronously.
-impl TaskResult {
-    /// True for results that deliver the first usable session. A quit
-    /// before dispatch abandons instead of recording; accepted so the
-    /// token stays single-owner.
-    pub fn ends_startup(&self) -> bool {
-        matches!(
-            self,
-            TaskResult::SessionCreated { .. }
-                | TaskResult::SessionLoaded { .. }
-                | TaskResult::WorktreeSessionCreated { .. }
-                | TaskResult::WorktreeForked { .. }
-        )
-    }
-}
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
-    /// A `command` status line finished.
-    StatusLineCommandFinished {
-        id: crate::app::status_line::RunId,
-        outcome: crate::app::status_line::RunOutcome,
-    },
     /// Session was created successfully.
     SessionCreated {
         agent_id: AgentId,
@@ -2414,7 +2300,7 @@ pub enum TaskResult {
     ForeignResumeHintDetected {
         canonical_cwd: std::path::PathBuf,
         launch_token: u64,
-        hint: Option<xai_grok_foreign_sessions::RecentForeignSession>,
+        hint: Option<xai_grok_workspace::foreign_sessions::RecentForeignSession>,
     },
     /// Session list fetch failed.
     SessionListFailed {
@@ -2502,16 +2388,6 @@ pub enum TaskResult {
     /// Cancel notification was sent (fire-and-forget).
     /// The real turn end comes via PromptResponse.
     CancelComplete,
-    /// The marker can stop advertising itself as unsent.
-    ConsentRecorded {
-        notice_id: String,
-        version: i32,
-    },
-    /// The answer stands for this run, but nothing on disk holds it,
-    /// so the notice returns at the next launch.
-    ConsentPersistFailed {
-        error: String,
-    },
     /// Response to `x.ai/subagent/cancel`; see [`SubagentKillOutcome`].
     KillSubagentComplete {
         session_id: acp::SessionId,
@@ -2705,20 +2581,13 @@ pub enum TaskResult {
     /// Session info fetched successfully.
     SessionInfoComplete {
         agent_id: AgentId,
-        session_id: acp::SessionId,
         info: Box<xai_grok_shell::session::SessionInfoResponse>,
-        /// Plain-text block for minimal-mode scrollback.
         text: String,
-        /// Structured rows for the modal (built upstream from typed data).
-        fields: Vec<crate::views::usage_modal::SessionInfoField>,
-        nonce: u64,
     },
     /// Session info fetch failed.
     SessionInfoFailed {
         agent_id: AgentId,
-        session_id: acp::SessionId,
         error: String,
-        nonce: u64,
     },
     /// Coding data sharing preference updated.
     CodingDataSharingUpdated {
@@ -2743,17 +2612,6 @@ pub enum TaskResult {
         agent_id: AgentId,
         error: String,
     },
-    /// `/rename --auto` completed successfully.
-    ResetSessionTitleComplete {
-        agent_id: AgentId,
-    },
-    /// `/rename --auto` failed.
-    ResetSessionTitleFailed {
-        agent_id: AgentId,
-        error: String,
-        previous_display_name: Option<String>,
-        previous_generated_title: Option<String>,
-    },
     /// Session delete completed successfully.
     DeleteSessionComplete {
         source: String,
@@ -2766,39 +2624,33 @@ pub enum TaskResult {
         session_id: String,
         error: String,
     },
-    /// Context info fetched successfully. Drop if `session_id` no longer matches.
+    /// Context info fetched successfully.
     ContextInfoComplete {
         agent_id: AgentId,
-        session_id: acp::SessionId,
         info: Box<xai_grok_shell::session::SessionInfoResponse>,
-        nonce: u64,
     },
-    /// Context info fetch failed. Drop if `session_id` no longer matches.
+    /// Context info fetch failed.
     ContextInfoFailed {
         agent_id: AgentId,
-        session_id: acp::SessionId,
         error: String,
-        nonce: u64,
     },
     /// `/usage` session ledger fetched. Drop if `session_id` no longer matches.
     SessionUsageComplete {
         agent_id: AgentId,
         session_id: acp::SessionId,
         usage: Box<xai_grok_shell::extensions::notification::PromptUsage>,
-        nonce: u64,
     },
     /// `/usage` session ledger fetch failed. Drop if `session_id` no longer matches.
     SessionUsageFailed {
         agent_id: AgentId,
         session_id: acp::SessionId,
         error: String,
-        nonce: u64,
     },
     /// Feedback submitted successfully (fire-and-forget).
     FeedbackComplete {
         agent_id: AgentId,
     },
-    /// Feedback submission failed. The shell already persisted the report locally, so only the error is surfaced.
+    /// Feedback submission failed.
     FeedbackFailed {
         agent_id: AgentId,
         error: String,
@@ -2936,6 +2788,16 @@ pub enum TaskResult {
         agent_id: AgentId,
         error: String,
     },
+    RewindPreviewComplete {
+        agent_id: AgentId,
+        response: crate::views::rewind::RewindResponse,
+        target_prompt_index: usize,
+        mode: crate::views::rewind::RewindMode,
+    },
+    RewindPreviewFailed {
+        agent_id: AgentId,
+        error: String,
+    },
     RewindExecuteComplete {
         agent_id: AgentId,
         response: crate::views::rewind::RewindResponse,
@@ -2954,8 +2816,6 @@ pub enum TaskResult {
         subscription_tier: Option<String>,
         /// Auto top-up rule fetch result; `Unchanged` keeps any cached rule.
         autotopup: crate::views::credit_bar::AutoTopupFetch,
-        /// Usage-modal fetch generation (`0` = background refresh).
-        nonce: u64,
     },
     /// App-level billing data (welcome screen).
     AppBillingFetched {
@@ -2971,8 +2831,6 @@ pub enum TaskResult {
         error: String,
         /// When true, swallow the error silently (background refresh).
         silent: bool,
-        /// Usage-modal fetch generation (`0` = background refresh).
-        nonce: u64,
     },
     /// Debounce timer for shell suggestions expired. Routed by the arming
     /// `agent_id`, like the sibling `PluginCtaDebounceExpired`.

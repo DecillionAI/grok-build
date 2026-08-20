@@ -38,24 +38,9 @@ use xai_chat_state::compaction_utils::{
 };
 
 use crate::sampling::Client as OaiCompatClient;
-use crate::session::helpers::prepared_compaction_history::{
-    PreparedCompactionHistory, build_compaction_chat_history,
-};
 use crate::session::helpers::session_compact::{
-    CompactFailure, CompactOutput, generate_session_compact,
+    CompactFailure, CompactOutput, build_compaction_chat_history, generate_session_compact,
 };
-
-#[derive(Default)]
-struct SamplerState {
-    last_success: Option<CompactOutput>,
-    last_attempted_items: Option<Vec<ConversationItem>>,
-}
-
-impl SamplerState {
-    fn record_attempt(&mut self, history: &PreparedCompactionHistory) {
-        self.last_attempted_items = Some(history.items.clone());
-    }
-}
 
 /// Wraps `generate_session_compact` as the shared engine's
 /// [`CompactionSampler`] for grok-build's full-replace pass.
@@ -69,14 +54,13 @@ impl SamplerState {
 /// short-prompt harness uses the short self-summarization prompt; everyone
 /// else the structured grok-build prompt), so the shared `CompactionPrompt`
 /// the engine passes is ignored — the engine builds the grok-build prompt,
-/// which equals what [`build_compaction_chat_history`] appends, and the
-/// short-prompt harness needs its own variant the engine can't produce.
+/// which equals what `build_compaction_chat_history(.., false)` appends, and
+/// the short-prompt harness needs its own variant the engine can't produce.
 pub(crate) struct ShellCompactionSampler {
     use_short_prompt: bool,
     user_context: Option<String>,
     tools: Vec<ToolSpec>,
     hosted_tools: Vec<HostedTool>,
-    compaction_tool_tokens: u64,
     client: OaiCompatClient,
     session_id: acp::SessionId,
     sampling_config: SamplingConfig,
@@ -89,7 +73,8 @@ pub(crate) struct ShellCompactionSampler {
     wall_clock_budget_secs: u64,
     tool_choice: crate::util::config::CompactionToolChoice,
     cancel: tokio_util::sync::CancellationToken,
-    state: Mutex<SamplerState>,
+    /// Full output of the most recent successful sample (for L5 telemetry).
+    last_success: Mutex<Option<CompactOutput>>,
 }
 
 impl ShellCompactionSampler {
@@ -99,7 +84,6 @@ impl ShellCompactionSampler {
         user_context: Option<String>,
         tools: Vec<ToolSpec>,
         hosted_tools: Vec<HostedTool>,
-        compaction_tool_tokens: u64,
         client: OaiCompatClient,
         session_id: acp::SessionId,
         sampling_config: SamplingConfig,
@@ -113,7 +97,6 @@ impl ShellCompactionSampler {
             user_context,
             tools,
             hosted_tools,
-            compaction_tool_tokens,
             client,
             session_id,
             sampling_config,
@@ -121,18 +104,13 @@ impl ShellCompactionSampler {
             wall_clock_budget_secs,
             tool_choice,
             cancel,
-            state: Mutex::new(SamplerState::default()),
+            last_success: Mutex::new(None),
         }
     }
 
     /// Take the [`CompactOutput`] of the most recent successful sample, if any.
     pub(crate) fn take_last_success(&self) -> Option<CompactOutput> {
-        self.state.lock().unwrap().last_success.take()
-    }
-
-    /// Take the exact image-budgeted items from the latest transport attempt.
-    pub(crate) fn take_last_attempted_items(&self) -> Option<Vec<ConversationItem>> {
-        self.state.lock().unwrap().last_attempted_items.take()
+        self.last_success.lock().unwrap().take()
     }
 }
 
@@ -153,13 +131,10 @@ impl CompactionSampler for ShellCompactionSampler {
             turns.to_vec(),
             self.user_context.as_deref(),
             self.use_short_prompt,
-            self.compaction_tool_tokens,
         );
-        self.state.lock().unwrap().record_attempt(&chat_history);
 
         match generate_session_compact(
             chat_history,
-            self.compaction_tool_tokens,
             self.tools.clone(),
             self.hosted_tools.clone(),
             self.client.clone(),
@@ -174,7 +149,7 @@ impl CompactionSampler for ShellCompactionSampler {
         {
             Ok(output) => {
                 let response = output.content.clone();
-                self.state.lock().unwrap().last_success = Some(output);
+                *self.last_success.lock().unwrap() = Some(output);
                 Ok(LlmCompactionOutput {
                     response,
                     thinking: String::new(),
@@ -208,10 +183,6 @@ fn compact_failure_to_sample_error(failure: CompactFailure) -> CompactionSampleE
         CompactionSampleError::Other(anyhow::anyhow!(message))
     }
 }
-
-#[cfg(test)]
-#[path = "full_replace_compaction_tests.rs"]
-mod tests;
 
 /// Render the human-readable detail an `acp::Error` carries in its `data`
 /// field (where `classify_*` stash `"compact failed: <upstream>"`).

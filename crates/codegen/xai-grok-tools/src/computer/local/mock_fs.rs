@@ -74,10 +74,6 @@ impl AsyncFileSystem for MockFs {
         self.files.write().await.remove(path);
         Ok(())
     }
-
-    async fn file_exists(&self, path: &Path) -> Result<bool, ComputerError> {
-        Ok(self.files.read().await.contains_key(path))
-    }
 }
 
 #[cfg(test)]
@@ -90,7 +86,6 @@ mod tests {
 
         // File doesn't exist initially
         assert!(fs.read_file(Path::new("/test.txt")).await.is_err());
-        assert!(!fs.file_exists(Path::new("/test.txt")).await.unwrap());
 
         // Write a file
         fs.write_file(Path::new("/test.txt"), b"hello world")
@@ -100,7 +95,6 @@ mod tests {
         // Read it back
         let content = fs.read_file(Path::new("/test.txt")).await.unwrap();
         assert_eq!(content, b"hello world");
-        assert!(fs.file_exists(Path::new("/test.txt")).await.unwrap());
     }
 
     #[tokio::test]

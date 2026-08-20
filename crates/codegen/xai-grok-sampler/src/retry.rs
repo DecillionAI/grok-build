@@ -19,10 +19,8 @@
 //! - 429 (rate limited) — waits the full `Retry-After`, so the attempt
 //!   count is what bounds the total wait
 //!
-//! **Special handling**:
-//! - 413 / image processing errors → strip images and retry. Debits the
-//!   retry budget but is never blocked by it; a repeat with nothing left to
-//!   strip is fatal, so at most one strip cycle per request.
+//! **Special handling** (not counted against retry budget):
+//! - 413 / image processing errors → strip images and retry once
 //!
 //! **Not retried** (Fatal immediately):
 //! - 400, 401, 403, 404, 408, 422 (client errors)
@@ -194,8 +192,8 @@ pub fn classify_error(
         return RetryDecision::RetryWithImageStrip;
     }
 
-    // Image processing errors (direct 400, proxy-wrapped 500, or mid-stream
-    // SSE error): strip images and retry, same recovery as 413.
+    // Image processing errors (direct 400 or proxy-wrapped 500): strip
+    // images and retry, same recovery as 413.
     if err.is_image_processing_error() {
         return RetryDecision::RetryWithImageStrip;
     }
@@ -361,7 +359,6 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
         SamplingError::StreamError {
             error_type,
             message,
-            ..
         } => {
             format!(
                 "{}Server stream error ({}): {}. The server encountered an error while streaming the response.",
@@ -436,24 +433,20 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             model_metadata,
             retry_after_secs,
             should_retry,
-            error_code,
         } => SamplingError::Api {
             status: *status,
             message: message.clone(),
             model_metadata: model_metadata.clone(),
             retry_after_secs: *retry_after_secs,
             should_retry: *should_retry,
-            error_code: error_code.clone(),
         },
         SamplingError::EventStreamError(msg) => SamplingError::EventStreamError(msg.clone()),
         SamplingError::StreamError {
             error_type,
             message,
-            code,
         } => SamplingError::StreamError {
             error_type: error_type.clone(),
             message: message.clone(),
-            code: code.clone(),
         },
         SamplingError::IdleTimeout { elapsed_secs } => SamplingError::IdleTimeout {
             elapsed_secs: *elapsed_secs,
@@ -476,7 +469,6 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
-    use xai_grok_sampling_types::ApiErrorCode;
 
     fn api_err(status: StatusCode, message: &str) -> SamplingError {
         SamplingError::Api {
@@ -485,7 +477,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
-            error_code: None,
         }
     }
 
@@ -496,7 +487,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: Some(retry_after),
             should_retry: None,
-            error_code: None,
         }
     }
 
@@ -634,50 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_image_400_strips_even_with_should_retry_false() {
-        // The server stamps invalid-image 400s with `x-should-retry: false`;
-        // that verdict only covers resending the SAME payload, and the strip
-        // retry sends a different one — the code must beat the header veto.
-        let err = SamplingError::Api {
-            status: StatusCode::BAD_REQUEST,
-            message: "some future wording without the legacy phrase".into(),
-            model_metadata: None,
-            retry_after_secs: None,
-            should_retry: Some(false),
-            error_code: Some(ApiErrorCode::InvalidImage),
-        };
-        assert!(matches!(
-            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
-        ));
-    }
-
-    #[test]
-    fn classify_image_stream_error_strips_instead_of_blind_retry() {
-        // Coded mid-stream image rejections must strip immediately; a
-        // code-less stream error keeps the ordinary retry path.
-        let err = SamplingError::StreamError {
-            error_type: "invalid_request_error".into(),
-            message: "Base64 string of provided image cannot be decoded.".into(),
-            code: Some(ApiErrorCode::InvalidImage),
-        };
-        assert!(matches!(
-            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
-        ));
-
-        let unrelated = SamplingError::StreamError {
-            error_type: "overloaded_error".into(),
-            message: "The server is overloaded.".into(),
-            code: None,
-        };
-        assert!(!matches!(
-            classify_error(&unrelated, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::RetryWithImageStrip
-        ));
-    }
-
-    #[test]
     fn classify_rate_limited_uses_retry_after() {
         let err = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 7);
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
@@ -770,7 +716,6 @@ mod tests {
                 model_metadata: None,
                 retry_after_secs: None,
                 should_retry,
-                error_code: None,
             };
             match classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD) {
                 RetryDecision::Fatal(SamplingError::Api { status, .. }) => {
@@ -841,7 +786,6 @@ mod tests {
         let err = SamplingError::StreamError {
             error_type: "transient".into(),
             message: "x".into(),
-            code: None,
         };
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::RetryWithClientRebuild { .. } => {}
@@ -897,22 +841,6 @@ mod tests {
         );
     }
 
-    /// The tee cell captures mid-stream errors via `clone_error`; dropping
-    /// the code there would silently disable mid-stream strip recovery.
-    #[test]
-    fn clone_error_preserves_stream_error_code() {
-        let cloned = clone_error(&SamplingError::StreamError {
-            error_type: "invalid_request_error".into(),
-            message: "bad image".into(),
-            code: Some(ApiErrorCode::InvalidImage),
-        });
-        let SamplingError::StreamError { code, .. } = &cloned else {
-            panic!("expected StreamError, got {cloned:?}");
-        };
-        assert_eq!(*code, Some(ApiErrorCode::InvalidImage));
-        assert!(cloned.is_image_processing_error());
-    }
-
     #[test]
     fn classify_serialization_is_fatal_on_first_attempt() {
         match classify_error(&serialization_err(), 0, 15, RATE_LIMIT_RETRY_THRESHOLD) {
@@ -959,7 +887,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: Some(false),
-            error_code: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
@@ -977,7 +904,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
-            error_code: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
@@ -993,7 +919,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: Some(true),
-            error_code: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
@@ -1009,7 +934,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: None,
-            error_code: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
@@ -1045,7 +969,6 @@ mod tests {
             model_metadata: None,
             retry_after_secs: Some(10),
             should_retry: Some(false),
-            error_code: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),

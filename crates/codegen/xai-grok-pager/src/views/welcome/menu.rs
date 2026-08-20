@@ -9,10 +9,6 @@ use crate::theme::Theme;
 
 use super::logo::logo_visual_width;
 
-fn cols(text: &str) -> u16 {
-    unicode_width::UnicodeWidthStr::width(text) as u16
-}
-
 /// Render the welcome menu rows as `label … shortcut`, padded within each row.
 /// Returns the Rect for each item row (for hit-testing clicks and hover).
 pub fn render_menu(
@@ -40,7 +36,7 @@ pub fn render_menu(
     // readability.
     let content_min: u16 = items
         .iter()
-        .map(|(key, label)| cols(key) + cols(label) + 4)
+        .map(|(key, label)| (key.len() + label.len() + 4) as u16)
         .max()
         .unwrap_or(0);
     let menu_width = logo_visual_width(area.height)
@@ -64,13 +60,8 @@ pub fn render_menu(
         }
 
         let is_selected = selected == Some(i);
-        let key_width = cols(key);
-        // The key sits at the right edge, so the label is cut to leave room for it.
-        let label = crate::render::line_utils::truncate_str(
-            label,
-            menu_centered.width.saturating_sub(key_width + 1) as usize,
-        );
-        let label_len = cols(&label);
+        let key_width = key.len() as u16;
+        let label_len = label.len() as u16;
 
         let row_rect = Rect {
             x: menu_centered.x,
@@ -96,12 +87,7 @@ pub fn render_menu(
         } else {
             label_style
         };
-        buf.set_span(
-            menu_centered.x,
-            y,
-            &Span::styled(&*label, lstyle),
-            label_len,
-        );
+        buf.set_span(menu_centered.x, y, &Span::styled(*label, lstyle), label_len);
 
         // Key shortcut flush with the right edge of the menu column.
         let kstyle = if is_selected {
