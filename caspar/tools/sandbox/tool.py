@@ -1375,7 +1375,57 @@ class ModalBackend(Backend):
         if path.startswith("/"):
             return path
         base = str(cwd) if cwd else MODAL_WORKDIR
+        # The new Modal FS API rejects relative paths, so always resolve to an
+        # absolute path (under the workspace by default).
         return posixpath.normpath(posixpath.join(base, path))
+
+    # Modal removed the legacy handle-based FS API (`sb.open`, `sb.mkdir`, …);
+    # the supported surface is the path-oriented `sb.filesystem` namespace
+    # (`write_bytes` / `read_bytes` / `make_directory` / `list_files`). These
+    # helpers use it, and fall back to `sb.exec` (always available) when a given
+    # version doesn't expose the method — so the tool works across Modal
+    # releases and never depends on the removed handle API.
+
+    def _fs_mkdir(self, sb: Any, path: str) -> None:
+        fs = getattr(sb, "filesystem", None)
+        if fs is not None and hasattr(fs, "make_directory"):
+            try:
+                fs.make_directory(path, create_parents=True)
+            except TypeError:  # older signature without the kwarg
+                fs.make_directory(path)
+            return
+        sb.exec("sh", "-c", f"mkdir -p {shlex.quote(path)}").wait()
+
+    def _fs_write_bytes(self, sb: Any, path: str, data: bytes) -> None:
+        parent = posixpath.dirname(path)
+        if parent and parent != "/":
+            self._fs_mkdir(sb, parent)
+        fs = getattr(sb, "filesystem", None)
+        if fs is not None and hasattr(fs, "write_bytes"):
+            try:
+                fs.write_bytes(data, path)   # documented order: (data, remote_path)
+            except TypeError:                # tolerate the opposite argument order
+                fs.write_bytes(path, data)
+            return
+        # Fallback: pipe base64 through the shell (binary-safe).
+        b64 = base64.b64encode(data).decode("ascii")
+        sb.exec("sh", "-c",
+                f"printf %s {shlex.quote(b64)} | base64 -d > {shlex.quote(path)}").wait()
+
+    def _fs_read_bytes(self, sb: Any, path: str) -> bytes:
+        fs = getattr(sb, "filesystem", None)
+        if fs is not None and hasattr(fs, "read_bytes"):
+            data = fs.read_bytes(path)
+            if not isinstance(data, (bytes, bytearray)):
+                data = str(data).encode("utf-8")
+            return bytes(data[:MAX_READ_BYTES])
+        proc = sb.exec("sh", "-c", f"head -c {MAX_READ_BYTES} {shlex.quote(path)} | base64")
+        out = proc.stdout.read() or ""
+        proc.wait()
+        try:
+            return base64.b64decode(out)
+        except Exception:  # noqa: BLE001
+            return b""
 
     def write(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         entries = _file_entries(payload)
@@ -1383,12 +1433,7 @@ class ModalBackend(Backend):
 
         def run(sb: Any) -> str:
             for path, data in entries:
-                target = self._abs(path, cwd)
-                parent = posixpath.dirname(target)
-                if parent and parent != "/":
-                    sb.exec("sh", "-c", f"mkdir -p {shlex.quote(parent)}").wait()
-                with sb.open(target, "wb") as fh:
-                    fh.write(data)
+                self._fs_write_bytes(sb, self._abs(path, cwd), data)
             return sb.object_id
 
         sid = self._with_sandbox(space_id, run)
@@ -1404,8 +1449,7 @@ class ModalBackend(Backend):
         target = self._abs(path, payload.get("cwd"))
 
         def run(sb: Any) -> Tuple[bytes, str]:
-            with sb.open(target, "rb") as fh:
-                return fh.read()[:MAX_READ_BYTES], sb.object_id
+            return self._fs_read_bytes(sb, target), sb.object_id
 
         data, sid = self._with_sandbox(space_id, run)
         result = {"ok": True, "action": "read", "space_id": space_id,
@@ -1426,7 +1470,7 @@ class ModalBackend(Backend):
         target = self._abs(path, payload.get("cwd"))
 
         def run(sb: Any) -> str:
-            sb.exec("sh", "-c", f"mkdir -p {shlex.quote(target)}").wait()
+            self._fs_mkdir(sb, target)
             return sb.object_id
 
         sid = self._with_sandbox(space_id, run)
