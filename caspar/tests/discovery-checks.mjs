@@ -20,7 +20,7 @@
 import assert from "node:assert/strict";
 
 import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
-import { DEFAULT_BUILTIN_FS_TOOLS, disallowedBuiltinTools } from "../grokRunner.mjs";
+import { DEFAULT_BUILTIN_FS_TOOLS, SANDBOX_LOCAL_FS_READERS, disallowedBuiltinTools } from "../grokRunner.mjs";
 import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
@@ -202,6 +202,36 @@ async function main() {
     const noSb = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: [], disabledBuiltins: denied });
     assert.ok(/NO LOCAL SHELL OR FILESYSTEM/i.test(noSb));
     assert.ok(/DISABLED/i.test(noSb));
+  });
+
+  await check("with the sandbox backend active, only the local-disk search tools are denied", () => {
+    const denied = disallowedBuiltinTools({ env: {}, sandboxActive: true });
+    // Exactly the tools that read the CLI's own container (never the backends).
+    assert.deepEqual(denied, SANDBOX_LOCAL_FS_READERS);
+    for (const off of ["list_dir", "glob", "grep", "grep_files", "hashline_grep"]) {
+      assert.ok(denied.includes(off), `${off} must stay denied under the sandbox — it reads local disk`);
+    }
+    // Everything that DOES route through SandboxTerminalBackend / SandboxFileSystem
+    // stays enabled — those built-ins ARE the sandbox now.
+    for (const keep of ["bash", "run_terminal_cmd", "read_file", "read", "write", "edit", "search_replace", "apply_patch"]) {
+      assert.ok(!denied.includes(keep), `${keep} must stay enabled under the sandbox (routes to the VM)`);
+    }
+    // The background-task family stays ON so grok's `task` requirement on
+    // get_task_output + kill_task is satisfied (denying them broke session init).
+    for (const fam of ["task", "get_task_output", "kill_task", "wait_tasks", "monitor"]) {
+      assert.ok(!denied.includes(fam), `${fam} must stay enabled under the sandbox (task requirement)`);
+    }
+    // The denied set is a strict subset of the no-sandbox deny list, so it can
+    // never make a grok tool requirement newly unsatisfiable.
+    for (const t of denied) {
+      assert.ok(DEFAULT_BUILTIN_FS_TOOLS.includes(t), `${t} is a subset of the no-sandbox deny list`);
+    }
+    // Operator escapes: fully re-enable, or override the exact list.
+    assert.deepEqual(disallowedBuiltinTools({ env: { GROK_CREATURE_SANDBOX_DENY_LOCAL_SEARCH: "0" }, sandboxActive: true }), []);
+    assert.deepEqual(
+      disallowedBuiltinTools({ env: { GROK_CREATURE_DISALLOWED_TOOLS: "glob, foo" }, sandboxActive: true }),
+      ["glob", "foo"],
+    );
   });
 
   // ── live fetch over the real gateway wire ──────────────────────────────────

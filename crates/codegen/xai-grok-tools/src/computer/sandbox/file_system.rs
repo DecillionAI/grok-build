@@ -13,23 +13,34 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 use super::client::{SandboxClient, SandboxClientError};
+use super::path_map::PathMap;
 use crate::computer::types::{AsyncFileSystem, ComputerError};
 
 /// The sandbox-backed file system.
 #[derive(Clone)]
 pub struct SandboxFileSystem {
     client: SandboxClient,
+    /// Rewrites grok's local-workspace paths to sandbox-relative ones so the
+    /// agent's workspace resolves against the sandbox home. Identity unless the
+    /// host set `GROK_SANDBOX_LOCAL_ROOT`.
+    path_map: PathMap,
 }
 
 impl SandboxFileSystem {
+    /// Build with an identity path map (no translation). Prefer [`from_env`]
+    /// outside tests so local-workspace paths are rewritten for the sandbox.
     pub fn new(client: SandboxClient) -> Self {
-        Self { client }
+        Self::with_path_map(client, PathMap::identity())
     }
 
-    /// Build from `GROK_SANDBOX_SOCKET`. `None` means the caller should fall
-    /// back to a local filesystem.
+    pub fn with_path_map(client: SandboxClient, path_map: PathMap) -> Self {
+        Self { client, path_map }
+    }
+
+    /// Build from `GROK_SANDBOX_SOCKET` (+ `GROK_SANDBOX_LOCAL_ROOT`). `None`
+    /// means the caller should fall back to a local filesystem.
     pub fn from_env() -> Option<Self> {
-        SandboxClient::from_env().map(Self::new)
+        SandboxClient::from_env().map(|c| Self::with_path_map(c, PathMap::from_env()))
     }
 
     pub fn client(&self) -> SandboxClient {
@@ -51,10 +62,6 @@ fn ce(err: SandboxClientError) -> ComputerError {
     }
 }
 
-fn path_str(path: &Path) -> String {
-    path.to_string_lossy().to_string()
-}
-
 const FS_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[async_trait]
@@ -64,7 +71,7 @@ impl AsyncFileSystem for SandboxFileSystem {
             .client
             .call(
                 "read",
-                json!({ "path": path_str(path) }),
+                json!({ "path": self.path_map.map_os_path(path) }),
                 Some(FS_REQUEST_TIMEOUT),
             )
             .await
@@ -80,9 +87,9 @@ impl AsyncFileSystem for SandboxFileSystem {
             .and_then(Value::as_str)
             .unwrap_or("text");
         if encoding == "base64" {
-            BASE64.decode(content).map_err(|e| {
-                ComputerError::io(format!("sandbox read: invalid base64 body: {e}"))
-            })
+            BASE64
+                .decode(content)
+                .map_err(|e| ComputerError::io(format!("sandbox read: invalid base64 body: {e}")))
         } else {
             Ok(content.as_bytes().to_vec())
         }
@@ -92,7 +99,7 @@ impl AsyncFileSystem for SandboxFileSystem {
         // Send everything as base64 so we don't have to guess whether the bytes
         // are valid UTF-8 or need escaping through JSON.
         let body = json!({
-            "path": path_str(path),
+            "path": self.path_map.map_os_path(path),
             "content": BASE64.encode(data),
             "encoding": "base64",
         });
@@ -107,7 +114,7 @@ impl AsyncFileSystem for SandboxFileSystem {
         // The sandbox creature has no dedicated delete action yet; use `exec`
         // with `rm -f` (quoted). `rm -f` is idempotent on missing files, which
         // matches the trait's semantic contract for delete.
-        let cmd = format!("rm -f -- {}", shell_quote(&path_str(path)));
+        let cmd = format!("rm -f -- {}", shell_quote(&self.path_map.map_os_path(path)));
         let body = json!({ "command": cmd, "timeout_ms": 15000_u64 });
         let reply = self
             .client

@@ -325,6 +325,16 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     try {
       await sandboxBridge.start();
       extraEnv.GROK_SANDBOX_SOCKET = sandboxSocketPath;
+      // Grok joins model file paths and the default shell cwd onto its LOCAL
+      // session workspace; those paths don't exist in the sandbox VM. Hand the
+      // backends that local root so they rewrite paths under it to
+      // sandbox-relative (served from the sandbox home). Canonicalize to match
+      // the cwd grok itself resolves `--cwd` to.
+      try {
+        extraEnv.GROK_SANDBOX_LOCAL_ROOT = fs.realpathSync(workspace);
+      } catch {
+        extraEnv.GROK_SANDBOX_LOCAL_ROOT = workspace;
+      }
     } catch (err) {
       log("GROK_BOOT", { sandbox_bridge_error: String(err?.message || err) });
       sandboxBridge = null;
@@ -367,11 +377,13 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   });
   const sharedEnv = sharedEnvDef ? { name: qualify(sharedEnvDef.name), description: sharedEnvDef.description } : undefined;
   // Force shell + filesystem work onto the shared sandbox. Two paths:
-  //  • Sandbox backend active (`sandboxBridge` up): the CLI's built-ins
-  //    `bash`, `read_file`, `edit`, `list_dir`, `glob`, `grep`, `task`,
-  //    `get_task_output`, `kill_task` all route through
-  //    `SandboxTerminalBackend` + `SandboxFileSystem` to the space's shared
-  //    VM. Nothing to disable — the built-ins ARE the sandbox now.
+  //  • Sandbox backend active (`sandboxBridge` up): `bash`, `read_file`,
+  //    `write`, `edit`, `apply_patch` and the task family route through
+  //    `SandboxTerminalBackend` + `SandboxFileSystem` to the space's shared VM
+  //    — the built-ins ARE the sandbox now. The exception is `list_dir` /
+  //    `glob` / `grep`: those read the CLI's own local container (WalkBuilder /
+  //    a locally-spawned rg), never the backends, so they stay denied and the
+  //    agent lists/searches via `bash` (which does route to the VM).
   //  • No sandbox: keep the legacy deny list so the agent can't do throwaway
   //    work inside its private container.
   const sandboxActive = Boolean(sandboxBridge);

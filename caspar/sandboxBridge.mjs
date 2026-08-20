@@ -1,15 +1,17 @@
 /**
  * The grok ⇄ per-space sandbox bridge.
  *
- * Grok's built-in terminal + filesystem tools (`bash`, `read_file`, `edit`,
- * `list_dir`, `glob`, `grep`, `task`/`get_task_output`/`kill_task`, …) all
- * route through two Rust traits inside the CLI — `TerminalBackend` and
- * `AsyncFileSystem` — and normally hit the container the CLI itself runs in.
- * For Decillion agents that container is private and ephemeral, so we swap the
- * backend for one that forwards every call to the space's shared cloud sandbox
- * (the `sandbox` creature). Then `bash /app/build.sh` in one subagent
- * and `pytest -q` in another are just two POSTs to the same VM — no per-agent
- * workspace magic, no shell replacement.
+ * Grok's built-in terminal + filesystem tools (`bash`, `read_file`, `write`,
+ * `edit`, `apply_patch`, `task`/`get_task_output`/`kill_task`, …) route through
+ * two Rust traits inside the CLI — `TerminalBackend` and `AsyncFileSystem` —
+ * and normally hit the container the CLI itself runs in. For Decillion agents
+ * that container is private and ephemeral, so we swap the backend for one that
+ * forwards every call to the space's shared cloud sandbox (the `sandbox`
+ * creature). Then `bash /app/build.sh` in one subagent and `pytest -q` in
+ * another are just two POSTs to the same VM — no per-agent workspace magic, no
+ * shell replacement. (`list_dir`/`glob`/`grep` do NOT go through these traits —
+ * they read the CLI's local disk — so the deploy denies them under the sandbox;
+ * the agent lists/searches via `bash` instead. See `disallowedBuiltinTools`.)
  *
  * This module is the JS half of that swap:
  *

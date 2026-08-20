@@ -16,13 +16,21 @@
 
 pub mod client;
 pub mod file_system;
+pub mod path_map;
 pub mod terminal;
 
 pub use client::{SandboxClient, SandboxClientError};
 pub use file_system::SandboxFileSystem;
+pub use path_map::PathMap;
 pub use terminal::SandboxTerminalBackend;
 
 /// The env var the host sets on the grok child pointing at the sandbox bridge
 /// socket. When present, the shell picks the sandbox backends over the local
 /// ones. Absent means "use the local backend" (self-tests, development runs).
 pub const SANDBOX_SOCKET_ENV: &str = "GROK_SANDBOX_SOCKET";
+
+/// The env var the host sets to grok's LOCAL session-workspace root. The
+/// sandbox backends rewrite any path at or under it to a path relative to the
+/// sandbox home (see [`PathMap`]), so the agent's workspace lines up with the
+/// sandbox VM's current directory. Absent means "no translation" (identity).
+pub const SANDBOX_LOCAL_ROOT_ENV: &str = "GROK_SANDBOX_LOCAL_ROOT";
