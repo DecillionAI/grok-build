@@ -441,6 +441,87 @@ def register_platform_tool(client, manifest: Dict[str, Any], *, key: str,
     return False
 
 
+def tool_commands_from_metadata(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The chat commands a tool understands, drawn from its ``point.metadata.json``.
+
+    A tool declares its operations in the ``tools`` array (``{name, desc, args}``);
+    older metadata may use ``functions`` or an ``argSchema`` keyed ``function``. We
+    reduce whichever is present to the registry shape ``{name, description, args}``
+    so the client can offer them as @tool command suggestions in chat."""
+    d = normalize_descriptor(meta) or {}
+    raw = d.get("tools")
+    if not isinstance(raw, list):
+        raw = meta.get("tools") if isinstance(meta.get("tools"), list) else None
+    if not isinstance(raw, list):
+        raw = d.get("functions") if isinstance(d.get("functions"), list) else None
+    out: List[Dict[str, Any]] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("function") or item.get("slash") or "").strip()
+        if not name:
+            continue
+        cmd: Dict[str, Any] = {"name": name}
+        desc = item.get("desc") or item.get("description") or item.get("hint") or item.get("prompt")
+        if desc:
+            cmd["description"] = str(desc)
+        if isinstance(item.get("args"), dict):
+            cmd["args"] = item["args"]
+        # A command may declare a widget template — the tool then chooses at call
+        # time whether to answer that command with a chat message or a filled
+        # widget. Registered here so the client knows the command supports it.
+        if isinstance(item.get("widget"), dict):
+            cmd["widget"] = item["widget"]
+        out.append(cmd)
+    # Fall back to the single default `function` when a tool ships no command list,
+    # so even a one-operation tool is addressable by name in chat.
+    if not out:
+        fn = str(d.get("function") or meta.get("function") or "").strip()
+        if fn:
+            out.append({"name": fn})
+    return out
+
+
+def register_tool_commands(client, manifest: Dict[str, Any], *, key: str,
+                           program_id: str, creature_id: str, entity_id: str,
+                           metadata: Dict[str, Any]) -> bool:
+    """Announce a just-deployed tool's chat commands into the ``tools`` command
+    registry creature (``tools/registerCommands``), the "whoever deploys a tool
+    registers it" half for commands — the same deploy-time path
+    :func:`register_platform_tool` uses for the market platform bucket.
+
+    Best-effort: with no ``tools/registerCommands`` endpoint in the manifest (a node
+    that predates this creature) it warns and returns False, leaving the tool
+    deployed but its commands unregistered — the client simply won't offer @tool
+    command suggestions for it until the registry creature is deployed."""
+    reg = manifest_endpoint(manifest, "tools/registerCommands")
+    if not reg:
+        warn("no tools/registerCommands endpoint in the manifest — cannot register "
+             f"the {key} tool's chat commands on-chain (is the tools creature deployed?)")
+        return False
+    d = normalize_descriptor(metadata)
+    commands = tool_commands_from_metadata(metadata)
+    payload = {
+        "key": key,
+        "toolId": str(d.get("tool_id") or metadata.get("tool_id") or key),
+        "name": str(d.get("name") or key),
+        "programId": program_id,
+        "creatureId": creature_id,
+        "entityId": entity_id or key,
+        "commands": commands,
+    }
+    res = client.signal_wasm_endpoint(
+        creature_id=reg["creatureId"], program_id=reg["programId"],
+        action="registerCommands", payload=payload,
+    )
+    if isinstance(res, dict) and res.get("ok"):
+        ok(f"registered {len(commands)} chat command(s) for tool {key} (program {program_id})")
+        return True
+    warn(f"registerCommands signal for {key} did not confirm: "
+         f"{(res or {}).get('error') if isinstance(res, dict) else res}")
+    return False
+
+
 def platform_registered(client, manifest: Dict[str, Any], program_id: str) -> bool:
     """Whether ``program_id`` appears in the market creature's ``platform`` bucket."""
     for row in list_platform_registry(client, manifest):

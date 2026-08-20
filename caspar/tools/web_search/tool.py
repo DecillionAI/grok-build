@@ -529,8 +529,25 @@ def _a_answer(payload: Dict[str, Any]) -> Dict[str, Any]:
         parts = [f"- {r['title']}: {r['snippet']}" for r in out["results"][:5] if r.get("snippet")]
         answer = ("Based on the top results:\n" + "\n".join(parts)) if parts else \
             "No answer could be synthesised from the available results."
-    return {"ok": True, "action": "answer", "query": out["query"], "provider": out["provider"],
-            "answer": answer, "sources": out["results"][:5]}
+    sources = out["results"][:5]
+    result: Dict[str, Any] = {"ok": True, "action": "answer", "query": out["query"],
+                              "provider": out["provider"], "answer": answer, "sources": sources}
+    # Choose the reply shape by how we were called: a chat command (the client
+    # stamps `chat_text`/`args`) gets a filled "answer" widget — the widget
+    # template this command registered — so the user sees an interactive answer
+    # card; an agent (structured `query`, no chat markers) gets the plain result.
+    if payload.get("chat_text") or payload.get("args"):
+        result["widget"] = {
+            "kind": "answer",
+            "title": f"Answer · {out['query']}"[:80],
+            "summary": answer if len(answer) <= 400 else answer[:400] + "…",
+            "status": out["provider"],
+            "data": {
+                "answer": answer,
+                "sources": [{"title": s.get("title"), "url": s.get("url")} for s in sources],
+            },
+        }
+    return result
 
 
 # --------------------------------------------------------------------------- #

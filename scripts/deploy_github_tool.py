@@ -75,6 +75,7 @@ from caspar_deploy_common import (  # noqa: E402
     load_manifest,
     ok,
     register_platform_tool,
+    register_tool_commands,
     resolve_operator,
     stamp_context,
     truthy,
@@ -307,6 +308,14 @@ def main() -> int:
     # addable-tools list reads this bucket via market/listPlatform. Verifies the
     # write landed so a wire failure surfaces here rather than as a missing tool.
     register_platform_tool(
+        client, load_manifest(),
+        key=TOOL_ID, program_id=program_id, creature_id=creature_id,
+        entity_id=entity_id, metadata=descriptor(),
+    )
+
+    # Register the tool's chat commands so the client can offer them as @tool
+    # command suggestions in a space's chat (the tools/registerCommands registry).
+    register_tool_commands(
         client, load_manifest(),
         key=TOOL_ID, program_id=program_id, creature_id=creature_id,
         entity_id=entity_id, metadata=descriptor(),
