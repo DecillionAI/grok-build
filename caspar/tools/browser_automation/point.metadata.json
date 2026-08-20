@@ -27,110 +27,333 @@
   "bindSpace": false,
   "autoAttach": false,
   "function": "navigate",
-  "requiredArgs": ["function"],
-  "categories": ["automation", "web"],
-  "routes": { "automation": "navigate", "web": "navigate" },
+  "requiredArgs": [
+    "function"
+  ],
+  "categories": [
+    "automation",
+    "web"
+  ],
+  "routes": {
+    "automation": "navigate",
+    "web": "navigate"
+  },
   "argSchema": {
-    "function": { "type": "string", "description": "operation: navigate (default) | text | content | links | screenshot | click | fill | type | press | evaluate | scroll | wait_for | back | forward | reload | set_viewport | current | pdf | sessions | close" },
-    "url": { "type": "string", "description": "for navigate: the page URL to open" },
-    "selector": { "type": "string", "description": "a CSS/text selector, for text/click/fill/press/screenshot/wait_for" },
-    "text": { "type": "string", "description": "for fill/type: the text to enter into the selected field" },
-    "key": { "type": "string", "description": "for press: a key or chord, e.g. \"Enter\", \"Control+A\"" },
-    "script": { "type": "string", "description": "for evaluate: a JavaScript expression to run in the page" },
-    "format": { "type": "string", "description": "for screenshot: jpeg (default) | png" },
-    "full_page": { "type": "bool", "description": "for screenshot: capture the whole scrollable page" },
-    "enter": { "type": "bool", "description": "for fill: press Enter after typing (submit)" },
-    "to": { "type": "string", "description": "for scroll: top | bottom (or use dy for a pixel delta)" },
-    "session": { "type": "string", "description": "name a parallel browsing session (tab); default is one shared session" }
+    "function": {
+      "type": "string",
+      "description": "operation: navigate (default) | text | content | links | screenshot | click | fill | type | press | evaluate | scroll | wait_for | back | forward | reload | set_viewport | current | pdf | sessions | close"
+    },
+    "url": {
+      "type": "string",
+      "description": "for navigate: the page URL to open"
+    },
+    "selector": {
+      "type": "string",
+      "description": "a CSS/text selector, for text/click/fill/press/screenshot/wait_for"
+    },
+    "text": {
+      "type": "string",
+      "description": "for fill/type: the text to enter into the selected field"
+    },
+    "key": {
+      "type": "string",
+      "description": "for press: a key or chord, e.g. \"Enter\", \"Control+A\""
+    },
+    "script": {
+      "type": "string",
+      "description": "for evaluate: a JavaScript expression to run in the page"
+    },
+    "format": {
+      "type": "string",
+      "description": "for screenshot: jpeg (default) | png"
+    },
+    "full_page": {
+      "type": "bool",
+      "description": "for screenshot: capture the whole scrollable page"
+    },
+    "enter": {
+      "type": "bool",
+      "description": "for fill: press Enter after typing (submit)"
+    },
+    "to": {
+      "type": "string",
+      "description": "for scroll: top | bottom (or use dy for a pixel delta)"
+    },
+    "session": {
+      "type": "string",
+      "description": "name a parallel browsing session (tab); default is one shared session"
+    }
   },
   "tools": [
     {
       "name": "navigate",
       "desc": "open a URL in the session's page and wait for it to load; the usual first step",
       "args": {
-        "url": { "type": "STRING", "desc": "the page URL to open" },
-        "wait_until": { "type": "STRING", "desc": "load (default) | domcontentloaded | networkidle" }
+        "url": {
+          "type": "STRING",
+          "desc": "the page URL to open"
+        },
+        "wait_until": {
+          "type": "STRING",
+          "desc": "load (default) | domcontentloaded | networkidle"
+        }
+      },
+      "widget": {
+        "details": [
+          "url",
+          "title",
+          "status"
+        ]
       }
     },
     {
       "name": "text",
       "desc": "return the rendered (visible) text of the page or a selected element",
-      "args": { "selector": { "type": "STRING", "desc": "optional CSS selector (default: whole body)" } }
+      "args": {
+        "selector": {
+          "type": "STRING",
+          "desc": "optional CSS selector (default: whole body)"
+        }
+      },
+      "widget": {
+        "text": [
+          "text"
+        ],
+        "sub": [
+          "url"
+        ]
+      }
     },
     {
       "name": "content",
       "desc": "return the page's current HTML (after JavaScript has run)",
-      "args": {}
+      "args": {},
+      "widget": {
+        "text": [
+          "content",
+          "html"
+        ],
+        "sub": [
+          "url"
+        ]
+      }
     },
     {
       "name": "links",
       "desc": "list the page's outbound links as {text, url}",
-      "args": { "limit": { "type": "NUMBER", "desc": "how many (default 100, max 500)" } }
+      "args": {
+        "limit": {
+          "type": "NUMBER",
+          "desc": "how many (default 100, max 500)"
+        }
+      },
+      "widget": {
+        "heading": "Links",
+        "list": "links",
+        "row": {
+          "title": [
+            "text"
+          ],
+          "url": [
+            "url"
+          ]
+        }
+      }
     },
     {
       "name": "screenshot",
       "desc": "capture the page (or an element) and return a base64 image",
       "args": {
-        "format": { "type": "STRING", "desc": "jpeg (default) | png" },
-        "full_page": { "type": "BOOL", "desc": "capture the whole scrollable page" },
-        "selector": { "type": "STRING", "desc": "optional element to capture instead of the viewport" }
+        "format": {
+          "type": "STRING",
+          "desc": "jpeg (default) | png"
+        },
+        "full_page": {
+          "type": "BOOL",
+          "desc": "capture the whole scrollable page"
+        },
+        "selector": {
+          "type": "STRING",
+          "desc": "optional element to capture instead of the viewport"
+        }
+      },
+      "widget": {
+        "heading": "Screenshot",
+        "image": [
+          "image"
+        ],
+        "imageFormat": "format",
+        "details": [
+          "url",
+          "title"
+        ]
       }
     },
     {
       "name": "click",
       "desc": "click the element matching a selector",
-      "args": { "selector": { "type": "STRING", "desc": "CSS or text= selector to click" } }
+      "args": {
+        "selector": {
+          "type": "STRING",
+          "desc": "CSS or text= selector to click"
+        }
+      }
     },
     {
       "name": "fill",
       "desc": "type text into an input/textarea (optionally pressing Enter to submit)",
       "args": {
-        "selector": { "type": "STRING", "desc": "the field selector" },
-        "text": { "type": "STRING", "desc": "the text to enter" },
-        "enter": { "type": "BOOL", "desc": "press Enter after typing" }
+        "selector": {
+          "type": "STRING",
+          "desc": "the field selector"
+        },
+        "text": {
+          "type": "STRING",
+          "desc": "the text to enter"
+        },
+        "enter": {
+          "type": "BOOL",
+          "desc": "press Enter after typing"
+        }
       }
     },
     {
       "name": "press",
       "desc": "press a keyboard key or chord (on a selector, or the focused element)",
       "args": {
-        "key": { "type": "STRING", "desc": "e.g. Enter, Escape, Control+A" },
-        "selector": { "type": "STRING", "desc": "optional target selector" }
+        "key": {
+          "type": "STRING",
+          "desc": "e.g. Enter, Escape, Control+A"
+        },
+        "selector": {
+          "type": "STRING",
+          "desc": "optional target selector"
+        }
       }
     },
     {
       "name": "evaluate",
       "desc": "run a JavaScript expression in the page and return its result",
-      "args": { "script": { "type": "STRING", "desc": "a JS expression, e.g. document.title" } }
+      "args": {
+        "script": {
+          "type": "STRING",
+          "desc": "a JS expression, e.g. document.title"
+        }
+      },
+      "widget": {
+        "text": [
+          "result"
+        ]
+      }
     },
     {
       "name": "scroll",
       "desc": "scroll the page (to top/bottom, or by a pixel delta)",
-      "args": { "to": { "type": "STRING", "desc": "top | bottom" }, "dy": { "type": "NUMBER", "desc": "pixels to scroll by" } }
+      "args": {
+        "to": {
+          "type": "STRING",
+          "desc": "top | bottom"
+        },
+        "dy": {
+          "type": "NUMBER",
+          "desc": "pixels to scroll by"
+        }
+      }
     },
     {
       "name": "wait_for",
       "desc": "wait for a selector to appear (or a load state / a fixed delay)",
       "args": {
-        "selector": { "type": "STRING", "desc": "selector to wait for" },
-        "state": { "type": "STRING", "desc": "visible (default) | attached | hidden | detached" }
+        "selector": {
+          "type": "STRING",
+          "desc": "selector to wait for"
+        },
+        "state": {
+          "type": "STRING",
+          "desc": "visible (default) | attached | hidden | detached"
+        }
       }
     },
-    { "name": "back", "desc": "go back in history", "args": {} },
-    { "name": "forward", "desc": "go forward in history", "args": {} },
-    { "name": "reload", "desc": "reload the current page", "args": {} },
+    {
+      "name": "back",
+      "desc": "go back in history",
+      "args": {}
+    },
+    {
+      "name": "forward",
+      "desc": "go forward in history",
+      "args": {}
+    },
+    {
+      "name": "reload",
+      "desc": "reload the current page",
+      "args": {}
+    },
     {
       "name": "set_viewport",
       "desc": "resize the browser viewport",
-      "args": { "width": { "type": "NUMBER", "desc": "px" }, "height": { "type": "NUMBER", "desc": "px" } }
+      "args": {
+        "width": {
+          "type": "NUMBER",
+          "desc": "px"
+        },
+        "height": {
+          "type": "NUMBER",
+          "desc": "px"
+        }
+      }
     },
-    { "name": "current", "desc": "report the session's current URL and title", "args": {} },
-    { "name": "pdf", "desc": "render the current page to a PDF and return it as base64", "args": {} },
-    { "name": "sessions", "desc": "list the open browsing sessions", "args": {} },
+    {
+      "name": "current",
+      "desc": "report the session's current URL and title",
+      "args": {},
+      "widget": {
+        "heading": "Current page",
+        "details": [
+          "url",
+          "title"
+        ]
+      }
+    },
+    {
+      "name": "pdf",
+      "desc": "render the current page to a PDF and return it as base64",
+      "args": {},
+      "widget": {
+        "heading": "PDF",
+        "details": [
+          "url",
+          "title",
+          "bytes"
+        ],
+        "note": "PDF ready"
+      }
+    },
+    {
+      "name": "sessions",
+      "desc": "list the open browsing sessions",
+      "args": {},
+      "widget": {
+        "heading": "Sessions",
+        "list": "sessions",
+        "row": {
+          "title": [
+            "name",
+            "session",
+            "id"
+          ]
+        }
+      }
+    },
     {
       "name": "close",
       "desc": "close a browsing session (frees the browser context)",
-      "args": { "session": { "type": "STRING", "desc": "the session name (default: the shared one)" } }
+      "args": {
+        "session": {
+          "type": "STRING",
+          "desc": "the session name (default: the shared one)"
+        }
+      }
     }
   ]
 }

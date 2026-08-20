@@ -479,6 +479,15 @@ def tool_commands_from_metadata(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         fn = str(d.get("function") or meta.get("function") or "").strip()
         if fn:
             out.append({"name": fn})
+    # Every tool gains a synthetic `help` command that lists its commands and
+    # their parameters (the client renders it from the registered list). Append
+    # it unless the tool declared its own.
+    if not any(str(c.get("name") or "").strip().lower() == "help" for c in out):
+        out.append({
+            "name": "help",
+            "description": "List this tool's chat commands and what each parameter means",
+            "args": {"command": {"type": "STRING", "desc": "optional — a command name to show only its help"}},
+        })
     return out
 
 

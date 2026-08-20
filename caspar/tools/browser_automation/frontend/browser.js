@@ -365,6 +365,12 @@ function buildReplyWidget(view) {
   top.add(col);
   root.add(top);
   var body = RN.scroll({ style: { flex: 1 } });
+  var image = (view != null && view.image != null) ? '' + view.image : '';
+  if (image !== '') {
+    // A real React-Native <Image> needs an explicit height (it does not auto-size
+    // from its natural dimensions); `contain` fits the capture keeping its aspect.
+    body.add(RN.image({ src: image, resizeMode: 'contain', style: { width: '100%', height: 320, backgroundColor: '#000', borderRadius: 8, marginBottom: 8 } }));
+  }
   var text = (view != null && view.text != null) ? '' + view.text : '';
   if (text !== '') body.add(RN.text(text, { color: TT.text, fontSize: 13 }));
   var rows = (view != null && view.rows != null) ? view.rows : null;
@@ -372,9 +378,25 @@ function buildReplyWidget(view) {
     var n = 0;
     while (n < rows.length && n < 20) { body.add(replyRow(TT, rows[n])); n = n + 1; }
   }
-  if (text === '' && (rows == null || rows.length === 0)) {
+  var details = (view != null && view.details != null) ? view.details : null;
+  if (details != null) {
+    var di = 0;
+    while (di < details.length) {
+      var d = details[di];
+      var drow = RN.row({ style: { paddingVertical: 4, borderTopWidth: 1, borderTopColor: TT.line } });
+      drow.add(RN.text((d != null && d.label != null) ? '' + d.label : '', { color: TT.muted, fontSize: 11, style: { width: 100 } }));
+      drow.add(RN.text((d != null && d.value != null) ? '' + d.value : '', { color: TT.text, fontSize: 12, style: { flex: 1 } }));
+      body.add(drow);
+      di = di + 1;
+    }
+  }
+  var hasRows = rows != null && rows.length > 0;
+  var hasDetails = details != null && details.length > 0;
+  if (text === '' && image === '' && !hasRows && !hasDetails) {
     var note = (view != null && view.note != null && view.note !== '') ? '' + view.note : 'The tool returned no preview.';
     body.add(RN.text(note, { color: TT.muted, fontSize: 12 }));
+  } else if (view != null && view.note != null && view.note !== '') {
+    body.add(RN.text('' + view.note, { color: TT.muted, fontSize: 11, style: { marginTop: 6 } }));
   }
   root.add(body);
   RN.mount(root);

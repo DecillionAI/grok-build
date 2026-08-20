@@ -27,56 +27,195 @@
   "bindSpace": false,
   "autoAttach": false,
   "function": "search",
-  "requiredArgs": ["function"],
-  "categories": ["research", "web"],
-  "routes": { "research": "search", "web": "search" },
+  "requiredArgs": [
+    "function"
+  ],
+  "categories": [
+    "research",
+    "web"
+  ],
+  "routes": {
+    "research": "search",
+    "web": "search"
+  },
   "argSchema": {
-    "function": { "type": "string", "description": "operation: search (default) | news | answer | fetch | read | providers" },
-    "query": { "type": "string", "description": "for search/news/answer: what to search for" },
-    "url": { "type": "string", "description": "for fetch/read: the page URL to download and read" },
-    "count": { "type": "number", "description": "for search/news: how many results to return (1-25, default 10)" },
-    "topic": { "type": "string", "description": "for search: set to \"news\" to bias toward recent news" },
-    "freshness": { "type": "string", "description": "for news (brave/bing): recency window, e.g. pd (day), pw (week), pm (month)" },
-    "days": { "type": "number", "description": "for news (tavily): only results from the last N days" }
+    "function": {
+      "type": "string",
+      "description": "operation: search (default) | news | answer | fetch | read | providers"
+    },
+    "query": {
+      "type": "string",
+      "description": "for search/news/answer: what to search for"
+    },
+    "url": {
+      "type": "string",
+      "description": "for fetch/read: the page URL to download and read"
+    },
+    "count": {
+      "type": "number",
+      "description": "for search/news: how many results to return (1-25, default 10)"
+    },
+    "topic": {
+      "type": "string",
+      "description": "for search: set to \"news\" to bias toward recent news"
+    },
+    "freshness": {
+      "type": "string",
+      "description": "for news (brave/bing): recency window, e.g. pd (day), pw (week), pm (month)"
+    },
+    "days": {
+      "type": "number",
+      "description": "for news (tavily): only results from the last N days"
+    }
   },
   "tools": [
     {
       "name": "search",
       "desc": "run a web search and return a ranked list of {title, url, snippet}; the default and most-used operation",
       "args": {
-        "query": { "type": "STRING", "desc": "what to search for" },
-        "count": { "type": "NUMBER", "desc": "how many results (1-25, default 10)" }
+        "query": {
+          "type": "STRING",
+          "desc": "what to search for"
+        },
+        "count": {
+          "type": "NUMBER",
+          "desc": "how many results (1-25, default 10)"
+        }
+      },
+      "widget": {
+        "heading": "Results",
+        "list": [
+          "results",
+          "items"
+        ],
+        "row": {
+          "title": [
+            "title"
+          ],
+          "subtitle": [
+            "snippet",
+            "description"
+          ],
+          "url": [
+            "url"
+          ]
+        },
+        "sub": [
+          "query"
+        ]
       }
     },
     {
       "name": "news",
       "desc": "search recent news for a topic and return dated results",
       "args": {
-        "query": { "type": "STRING", "desc": "the news topic to search for" },
-        "count": { "type": "NUMBER", "desc": "how many results (1-25, default 10)" },
-        "freshness": { "type": "STRING", "desc": "recency window: pd | pw | pm (brave/bing)" }
+        "query": {
+          "type": "STRING",
+          "desc": "the news topic to search for"
+        },
+        "count": {
+          "type": "NUMBER",
+          "desc": "how many results (1-25, default 10)"
+        },
+        "freshness": {
+          "type": "STRING",
+          "desc": "recency window: pd | pw | pm (brave/bing)"
+        }
+      },
+      "widget": {
+        "heading": "News",
+        "list": [
+          "results",
+          "items"
+        ],
+        "row": {
+          "title": [
+            "title"
+          ],
+          "subtitle": [
+            "snippet",
+            "description"
+          ],
+          "url": [
+            "url"
+          ]
+        },
+        "sub": [
+          "query"
+        ]
       }
     },
     {
       "name": "answer",
       "desc": "return a short synthesised answer to a question plus the sources it is drawn from",
-      "args": { "query": { "type": "STRING", "desc": "the question to answer" } },
+      "args": {
+        "query": {
+          "type": "STRING",
+          "desc": "the question to answer"
+        }
+      },
       "widget": {
         "kind": "answer",
         "title": "Answer",
-        "fields": ["answer", "sources"],
-        "desc": "When asked in chat, answers with a filled answer card (summary + sources) instead of a plain message."
+        "fields": [
+          "answer",
+          "sources"
+        ],
+        "desc": "When asked in chat, answers with a filled answer card (summary + sources) instead of a plain message.",
+        "text": [
+          "answer"
+        ],
+        "list": "sources",
+        "row": {
+          "title": [
+            "title"
+          ],
+          "url": [
+            "url"
+          ]
+        },
+        "sub": [
+          "query"
+        ]
       }
     },
     {
       "name": "fetch",
       "desc": "download a URL and return its readable text (HTML stripped to article text), title and outbound links",
-      "args": { "url": { "type": "STRING", "desc": "the page URL to read" } }
+      "args": {
+        "url": {
+          "type": "STRING",
+          "desc": "the page URL to read"
+        }
+      },
+      "widget": {
+        "text": [
+          "text",
+          "content"
+        ],
+        "sub": [
+          "url"
+        ]
+      }
     },
     {
       "name": "read",
       "desc": "alias of fetch — read the readable content of a URL",
-      "args": { "url": { "type": "STRING", "desc": "the page URL to read" } }
+      "args": {
+        "url": {
+          "type": "STRING",
+          "desc": "the page URL to read"
+        }
+      },
+      "widget": {
+        "text": [
+          "text",
+          "content"
+        ],
+        "sub": [
+          "url"
+        ]
+      }
     },
     {
       "name": "providers",

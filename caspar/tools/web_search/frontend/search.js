@@ -467,6 +467,68 @@ function widgetResultRow(r) {
   return row;
 }
 
+// Render the client-computed `_view` (heading / sub / text / image / rows /
+// details / note) — the canonical render-ready view the app builds from any tool
+// reply. Used for the generic fallback and for replies (help, screenshots,
+// scalar-only results) that have no native answer/results/sources shape.
+function replyViewRow(row) {
+  var url = (row != null && row.url != null) ? '' + row.url : '';
+  var title = (row != null && row.title != null && row.title !== '') ? '' + row.title : (url !== '' ? url : 'item');
+  var sub = (row != null && row.subtitle != null) ? '' + row.subtitle : '';
+  var el;
+  if (url !== '') {
+    el = RN.pressable({ onPress: linkHandler(url), style: { paddingVertical: 8, borderTopWidth: 1, borderTopColor: T.line } });
+  } else {
+    el = RN.column({ style: { paddingVertical: 8, borderTopWidth: 1, borderTopColor: T.line } });
+  }
+  el.add(RN.text(title, { color: (url !== '' ? T.link : T.text), fontSize: 13, fontWeight: '600' }));
+  if (url !== '') el.add(RN.text(hostOfUrl(url), { color: T.muted, fontSize: 10 }));
+  if (sub !== '') el.add(RN.text(sub, { color: T.muted, fontSize: 11, style: { marginTop: 2 } }));
+  return el;
+}
+
+function buildReplyWidgetView(view) {
+  T = theme();
+  var root = RN.column({ style: { flex: 1, backgroundColor: T.bg, padding: 12 } });
+  var heading = (view != null && view.heading != null && view.heading !== '') ? '' + view.heading : 'Result';
+  var sub = (view != null && view.sub != null) ? '' + view.sub : '';
+  widgetHead(root, '🧩', heading, sub);
+  var body = RN.scroll({ style: { flex: 1 } });
+  var image = (view != null && view.image != null) ? '' + view.image : '';
+  if (image !== '') {
+    body.add(RN.image({ src: image, resizeMode: 'contain', style: { width: '100%', height: 320, backgroundColor: '#000', borderRadius: 8, marginBottom: 8 } }));
+  }
+  var text = (view != null && view.text != null) ? '' + view.text : '';
+  if (text !== '') body.add(RN.text(text, { color: T.text, fontSize: 13 }));
+  var rows = (view != null && view.rows != null) ? view.rows : null;
+  if (rows != null) {
+    var n = 0;
+    while (n < rows.length && n < 20) { body.add(replyViewRow(rows[n])); n = n + 1; }
+  }
+  var details = (view != null && view.details != null) ? view.details : null;
+  if (details != null) {
+    var di = 0;
+    while (di < details.length) {
+      var d = details[di];
+      var drow = RN.row({ style: { paddingVertical: 4, borderTopWidth: 1, borderTopColor: T.line } });
+      drow.add(RN.text((d != null && d.label != null) ? '' + d.label : '', { color: T.muted, fontSize: 11, style: { width: 100 } }));
+      drow.add(RN.text((d != null && d.value != null) ? '' + d.value : '', { color: T.text, fontSize: 12, style: { flex: 1 } }));
+      body.add(drow);
+      di = di + 1;
+    }
+  }
+  var hasRows = rows != null && rows.length > 0;
+  var hasDetails = details != null && details.length > 0;
+  if (text === '' && image === '' && !hasRows && !hasDetails) {
+    var note = (view != null && view.note != null && view.note !== '') ? '' + view.note : 'The tool returned no preview.';
+    body.add(RN.text(note, { color: T.muted, fontSize: 12 }));
+  } else if (view != null && view.note != null && view.note !== '') {
+    body.add(RN.text('' + view.note, { color: T.muted, fontSize: 11, style: { marginTop: 6 } }));
+  }
+  root.add(body);
+  RN.mount(root);
+}
+
 function buildDataWidget(data, command) {
   T = theme();
   var root = RN.column({ style: { flex: 1, backgroundColor: T.bg, padding: 12 } });
@@ -507,7 +569,10 @@ function buildDataWidget(data, command) {
     return;
   }
 
-  // Readable fallback — a text field or a short note, never a raw JSON dump.
+  // Readable fallback — prefer the client-computed `_view` (handles help,
+  // screenshots, key/value scalar replies), else a text field or a short note.
+  var view = (data != null && data._view != null) ? data._view : null;
+  if (view != null) { buildReplyWidgetView(view); return; }
   var text = '';
   if (data != null) {
     if (data.text != null && data.text !== '') text = '' + data.text;
