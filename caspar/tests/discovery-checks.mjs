@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
 import { DEFAULT_BUILTIN_FS_TOOLS, SANDBOX_LOCAL_FS_READERS, disallowedBuiltinTools } from "../grokRunner.mjs";
 import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
+import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
 import { FakeGateway } from "./fakeGateway.mjs";
@@ -232,6 +233,51 @@ async function main() {
       disallowedBuiltinTools({ env: { GROK_CREATURE_DISALLOWED_TOOLS: "glob, foo" }, sandboxActive: true }),
       ["glob", "foo"],
     );
+  });
+
+  await check("prewarm spawns each tool/agent container once, sandbox via start, no prompts", () => {
+    const calls = [];
+    const invoker = { invoke: (name, args) => { calls.push({ name, args }); return Promise.resolve({ ok: true }); } };
+    const toolDefs = [
+      { name: "sandbox" },
+      { name: "web_search" },
+      { name: "researcher" },   // an agent
+      { name: "dashboard" },    // a frontend — skipped
+      { name: "generate_media" }, // in-process, no machine — skipped
+      { name: "sandbox_dup" },  // shares the sandbox's target — deduped
+    ];
+    const byName = new Map([
+      ["sandbox", { name: "sandbox", kind: "tool", program_id: "px-sandbox", defaults: { space_id: "s1" } }],
+      ["web_search", { name: "web_search", kind: "tool", program_id: "px-web" }],
+      ["researcher", { name: "researcher", kind: "agent", program_id: "px-research" }],
+      ["dashboard", { name: "dashboard", kind: "frontend", program_id: "px-front" }],
+      ["generate_media", { name: "generate_media", kind: "media" }],
+      ["sandbox_dup", { name: "sandbox_dup", kind: "tool", program_id: "px-sandbox" }],
+    ]);
+    const fired = prewarmToolContainers(invoker, toolDefs, byName, { sandboxToolName: "sandbox" });
+
+    // One warm per distinct target: sandbox, web_search, researcher. Frontend,
+    // media (no machine), and the duplicate sandbox target are all skipped.
+    assert.deepEqual(fired.map((f) => f.tool).sort(), ["researcher", "sandbox", "web_search"]);
+    assert.equal(calls.length, 3);
+    const bySandbox = calls.find((c) => c.name === "sandbox");
+    assert.equal(bySandbox.args.function, "start", "sandbox is warmed with start (boots the VM too)");
+    for (const other of ["web_search", "researcher"]) {
+      const c = calls.find((x) => x.name === other);
+      assert.equal(c.args.function, WARM_FUNCTION, `${other} warmed with the reserved no-op function`);
+    }
+    // Critically: no warm carries an objective/prompt/skill, so an agent proxy's
+    // decodeTaskSignal drops it (no LLM run).
+    for (const c of calls) {
+      for (const k of ["objective", "prompt", "skill"]) {
+        assert.ok(!(k in c.args), `warm args must not carry ${k}`);
+      }
+    }
+    // Master switch off → nothing fired.
+    const noneFired = prewarmToolContainers(invoker, toolDefs, byName, { sandboxToolName: "sandbox", env: { GROK_CREATURE_PREWARM_TOOLS: "0" } });
+    assert.deepEqual(noneFired, []);
+    // A null invoker (no bridge) is a safe no-op.
+    assert.deepEqual(prewarmToolContainers(null, toolDefs, byName, {}), []);
   });
 
   // ── live fetch over the real gateway wire ──────────────────────────────────
