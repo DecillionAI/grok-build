@@ -39,6 +39,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use super::client::{SandboxClient, SandboxClientError};
+use super::path_map::PathMap;
 use crate::computer::types::{
     BackgroundHandle, ComputerError, KillOutcome, TaskKind, TaskSnapshot, TerminalBackend,
     TerminalRunRequest, TerminalRunResult,
@@ -125,22 +126,35 @@ pub struct SandboxTerminalBackend {
     /// record on disk, so this is only about how big of a slice we hand back
     /// to `TaskSnapshot::output`.
     max_inline_output: usize,
+    /// Rewrites grok's local-workspace cwd to a sandbox-relative one so a plain
+    /// shell call lands in the sandbox home instead of a `cd` to a path that
+    /// only exists on the CLI's own container. Identity unless the host set
+    /// `GROK_SANDBOX_LOCAL_ROOT`.
+    path_map: PathMap,
 }
 
 impl SandboxTerminalBackend {
-    /// Build from an existing client. Prefer [`from_env`] outside tests.
+    /// Build from an existing client with an identity path map (no
+    /// translation). Prefer [`from_env`] outside tests so the local cwd is
+    /// rewritten for the sandbox.
     pub fn new(client: SandboxClient) -> Self {
+        Self::with_path_map(client, PathMap::identity())
+    }
+
+    pub fn with_path_map(client: SandboxClient, path_map: PathMap) -> Self {
         Self {
             client,
             inner: Arc::new(Mutex::new(Inner::default())),
             max_inline_output: 256 * 1024,
+            path_map,
         }
     }
 
-    /// Build from `GROK_SANDBOX_SOCKET`; returns `None` when unset so the
-    /// caller falls back to the local backend without issuing failing calls.
+    /// Build from `GROK_SANDBOX_SOCKET` (+ `GROK_SANDBOX_LOCAL_ROOT`); returns
+    /// `None` when the socket is unset so the caller falls back to the local
+    /// backend without issuing failing calls.
     pub fn from_env() -> Option<Self> {
-        SandboxClient::from_env().map(Self::new)
+        SandboxClient::from_env().map(|c| Self::with_path_map(c, PathMap::from_env()))
     }
 
     /// Access the underlying client — useful when the caller wants to share
@@ -315,20 +329,22 @@ fn write_output_file(path: &std::path::Path, contents: &str) {
     let _ = std::fs::write(path, contents.as_bytes());
 }
 
-fn args_for_run(request: &TerminalRunRequest) -> Value {
+fn args_for_run(request: &TerminalRunRequest, path_map: &PathMap) -> Value {
     let mut env = serde_json::Map::new();
     for (k, v) in &request.env {
         env.insert(k.clone(), Value::String(v.clone()));
     }
     json!({
         "command": request.command,
-        "cwd": request.working_directory.to_string_lossy(),
+        // A local-workspace cwd is rewritten to a sandbox-relative one (empty ==
+        // the sandbox home); the sandbox skips the `cd` on an empty cwd.
+        "cwd": path_map.map_os_path(&request.working_directory),
         "env": Value::Object(env),
         "timeout_ms": request.timeout.as_millis() as u64,
     })
 }
 
-fn args_for_background(request: &TerminalRunRequest, task_id: &str) -> Value {
+fn args_for_background(request: &TerminalRunRequest, task_id: &str, path_map: &PathMap) -> Value {
     let mut env = serde_json::Map::new();
     for (k, v) in &request.env {
         env.insert(k.clone(), Value::String(v.clone()));
@@ -336,7 +352,7 @@ fn args_for_background(request: &TerminalRunRequest, task_id: &str) -> Value {
     json!({
         "task_id": task_id,
         "command": request.command,
-        "cwd": request.working_directory.to_string_lossy(),
+        "cwd": path_map.map_os_path(&request.working_directory),
         "env": Value::Object(env),
     })
 }
@@ -402,17 +418,14 @@ fn build_task_state(
 
 #[async_trait]
 impl TerminalBackend for SandboxTerminalBackend {
-    async fn run(
-        &self,
-        request: TerminalRunRequest,
-    ) -> Result<TerminalRunResult, ComputerError> {
+    async fn run(&self, request: TerminalRunRequest) -> Result<TerminalRunResult, ComputerError> {
         let byte_limit = if request.output_byte_limit == 0 {
             self.max_inline_output
         } else {
             request.output_byte_limit
         };
         let output_file = request.output_file.clone();
-        let args = args_for_run(&request);
+        let args = args_for_run(&request, &self.path_map);
         // Bound the bridge wait a little longer than the command's own
         // timeout so a wedged POST cannot hang the shell indefinitely.
         let wait = request.timeout.saturating_add(Duration::from_secs(30));
@@ -443,7 +456,7 @@ impl TerminalBackend for SandboxTerminalBackend {
         // Our task_id is our source of truth — grok cross-references it, so
         // we generate on this side and the sandbox mirrors it.
         let task_id = new_task_id();
-        let args = args_for_background(&request, &task_id);
+        let args = args_for_background(&request, &task_id, &self.path_map);
         let reply = self
             .client
             .call("exec_background", args, Some(Duration::from_secs(60)))
@@ -697,6 +710,28 @@ mod tests {
             owner_session_id: owner.map(String::from),
             description: None,
         }
+    }
+
+    #[test]
+    fn run_args_rewrite_local_workspace_cwd_to_sandbox_relative() {
+        let map = PathMap::with_local_root("/data/workspaces/grok-x");
+        // The default shell cwd (the workspace root) → empty == sandbox home.
+        let mut req = dummy_request(None, false);
+        req.working_directory = PathBuf::from("/data/workspaces/grok-x");
+        assert_eq!(args_for_run(&req, &map)["cwd"], "");
+        // A subdirectory → sandbox-relative.
+        req.working_directory = PathBuf::from("/data/workspaces/grok-x/src");
+        assert_eq!(args_for_run(&req, &map)["cwd"], "src");
+        assert_eq!(args_for_background(&req, "t-1", &map)["cwd"], "src");
+        // A path outside the workspace is left untouched.
+        req.working_directory = PathBuf::from("/etc");
+        assert_eq!(args_for_run(&req, &map)["cwd"], "/etc");
+        // Identity map (no GROK_SANDBOX_LOCAL_ROOT) passes the local path through.
+        req.working_directory = PathBuf::from("/data/workspaces/grok-x/src");
+        assert_eq!(
+            args_for_run(&req, &PathMap::identity())["cwd"],
+            "/data/workspaces/grok-x/src"
+        );
     }
 
     #[test]

@@ -110,7 +110,6 @@ pub enum WorkspaceGoneReason {
     NotBound,
     /// Target hub liveness key absent (origin reaper or forward-time check).
     InstanceGone,
-    Hibernated,
     #[serde(other)]
     Unknown,
 }
@@ -140,21 +139,15 @@ pub struct WorkspaceUnavailableDetails {
 }
 
 /// Build the recognizable "workspace gone" error as a [`ToolErrorWire::Custom`].
-///
-/// `details.retryable` is the client contract. `false` (only the hibernated
-/// route miss) means do not blind-retry: the call becomes servable again
-/// once the workspace is revived, e.g. by the next successful bind.
 pub fn workspace_unavailable_wire(
     reason: WorkspaceGoneReason,
     phase: WorkspaceGonePhase,
 ) -> ToolErrorWire {
-    let retryable = !(matches!(reason, WorkspaceGoneReason::Hibernated)
-        && matches!(phase, WorkspaceGonePhase::RouteMissing));
     let details = serde_json::to_value(WorkspaceUnavailableDetails {
         code: WORKSPACE_UNAVAILABLE_SUBCODE.to_owned(),
         reason,
         phase,
-        retryable,
+        retryable: true,
     });
     // This plain struct serializes infallibly; a missing `details` would make
     // the error unrecognizable, so guard the invariant in debug builds.
@@ -171,13 +164,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const REASONS: [WorkspaceGoneReason; 6] = [
+    const REASONS: [WorkspaceGoneReason; 5] = [
         WorkspaceGoneReason::IdleTimeout,
         WorkspaceGoneReason::Disconnect,
         WorkspaceGoneReason::Shutdown,
         WorkspaceGoneReason::NotBound,
         WorkspaceGoneReason::InstanceGone,
-        WorkspaceGoneReason::Hibernated,
     ];
     const PHASES: [WorkspaceGonePhase; 3] = [
         WorkspaceGonePhase::InFlightCancelled,
@@ -194,7 +186,6 @@ mod tests {
             WorkspaceGoneReason::Shutdown => "shutdown",
             WorkspaceGoneReason::NotBound => "not_bound",
             WorkspaceGoneReason::InstanceGone => "instance_gone",
-            WorkspaceGoneReason::Hibernated => "hibernated",
             WorkspaceGoneReason::Unknown => "unknown",
         }
     }
@@ -205,11 +196,6 @@ mod tests {
             WorkspaceGonePhase::Attach => "attach",
             WorkspaceGonePhase::Unknown => "unknown",
         }
-    }
-
-    fn expected_retryable(reason: WorkspaceGoneReason, phase: WorkspaceGonePhase) -> bool {
-        !(matches!(reason, WorkspaceGoneReason::Hibernated)
-            && matches!(phase, WorkspaceGonePhase::RouteMissing))
     }
 
     #[test]
@@ -223,39 +209,7 @@ mod tests {
                 assert_eq!(v["details"]["code"], json!(WORKSPACE_UNAVAILABLE_SUBCODE));
                 assert_eq!(v["details"]["reason"], json!(reason_wire(reason)));
                 assert_eq!(v["details"]["phase"], json!(phase_wire(phase)));
-                assert_eq!(
-                    v["details"]["retryable"],
-                    json!(expected_retryable(reason, phase)),
-                    "retryable for {reason:?}/{phase:?}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn hibernated_route_missing_is_the_only_non_retryable_shape() {
-        let v = serde_json::to_value(workspace_unavailable_wire(
-            WorkspaceGoneReason::Hibernated,
-            WorkspaceGonePhase::RouteMissing,
-        ))
-        .unwrap();
-        assert_eq!(v["details"]["reason"], json!("hibernated"));
-        assert_eq!(v["details"]["phase"], json!("route_missing"));
-        assert_eq!(v["details"]["retryable"], json!(false));
-
-        for reason in REASONS {
-            for phase in PHASES {
-                if matches!(reason, WorkspaceGoneReason::Hibernated)
-                    && matches!(phase, WorkspaceGonePhase::RouteMissing)
-                {
-                    continue;
-                }
-                let v = serde_json::to_value(workspace_unavailable_wire(reason, phase)).unwrap();
-                assert_eq!(
-                    v["details"]["retryable"],
-                    json!(true),
-                    "{reason:?}/{phase:?} must stay retryable",
-                );
+                assert_eq!(v["details"]["retryable"], json!(true));
             }
         }
     }

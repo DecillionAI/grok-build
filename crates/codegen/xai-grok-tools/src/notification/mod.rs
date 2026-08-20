@@ -28,7 +28,6 @@ pub use types::PlanModeExited;
 pub use types::ScheduledTaskCreated;
 pub use types::ScheduledTaskFired;
 pub use types::ScheduledTaskRemoved;
-pub use types::ScheduledTaskRemovedReason;
 pub use types::ToolNotification;
 pub use types::UserQuestionAsked;
 pub use types::notification_schema_catalog;

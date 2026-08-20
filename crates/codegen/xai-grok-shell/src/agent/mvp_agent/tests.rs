@@ -939,32 +939,6 @@ fn read_session_or_init_meta_str_ignores_non_string_values() {
     );
 }
 #[test]
-fn startup_hints_from_meta_prefers_session_request_over_init() {
-    let session = serde_json::json!({
-        "startupHints": { "nonInteractive": true, "deliveryTools": ["srv__post"] }
-    });
-    let init = serde_json::json!({ "startupHints": { "nonInteractive": false } });
-    let hints = startup_hints_from_meta(session.as_object(), init.as_object());
-    assert!(hints.non_interactive);
-    assert_eq!(hints.delivery_tools, vec!["srv__post"]);
-    assert!(startup_hints_from_meta(None, session.as_object()).non_interactive);
-}
-#[test]
-fn startup_hints_from_meta_session_object_wins_whole_not_merged() {
-    let session = serde_json::json!({ "startupHints": { "skipGitStatus": true } });
-    let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
-    let hints = startup_hints_from_meta(session.as_object(), init.as_object());
-    assert!(hints.skip_git_status);
-    assert!(!hints.non_interactive);
-}
-#[test]
-fn startup_hints_from_meta_unparseable_falls_through_then_defaults() {
-    let bad = serde_json::json!({ "startupHints": "yes" });
-    let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
-    assert!(startup_hints_from_meta(bad.as_object(), init.as_object()).non_interactive);
-    assert!(!startup_hints_from_meta(None, None).non_interactive);
-}
-#[test]
 fn system_prompt_override_from_meta_prefers_session_and_rejects_empty() {
     let session = serde_json::json!({ "systemPromptOverride": "from session" });
     let init = serde_json::json!({ "systemPromptOverride": "from init" });
@@ -1188,7 +1162,6 @@ fn make_test_handle(
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_servers: vec![],
         initial_client_mcp_servers: vec![],
         display_cwd: None,
@@ -1214,7 +1187,6 @@ fn make_test_handle(
         }),
         code_nav_enabled: false,
         ask_user_question_enabled: true,
-        non_interactive: false,
         plan_mode: std::sync::Arc::new(parking_lot::Mutex::new(
             crate::session::plan_mode::PlanModeTracker::new(std::path::PathBuf::from("/tmp")),
         )),
@@ -1328,174 +1300,6 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
         read_effort(&agent.model_state(Some(&unset))).as_deref(),
         Some("low"),
         "absent session effort falls back to the global default",
-    );
-}
-#[tokio::test]
-async fn apply_supported_effort_assigns_only_when_supported() {
-    use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use crate::agent::mvp_agent::reasoning_effort::EffortTarget;
-    use xai_grok_sampling_types::ReasoningEffort;
-    let agent = build_minimal_agent_for_tests();
-    let mut supported = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
-    supported.info.supports_reasoning_effort = true;
-    agent
-        .models_manager
-        .insert_test_entry("effort-model", supported.clone());
-    let plain = ModelEntry::fallback("plain-model", &EndpointsConfig::default());
-    agent
-        .models_manager
-        .insert_test_entry("plain-model", plain.clone());
-    let sid = acp::SessionId::new("meta-effort-sess");
-    let mut supported_cfg = agent.prepare_sampling_config_for_model(&supported, None);
-    supported_cfg.reasoning_effort = None;
-    agent.models_manager.apply_supported_effort(
-        &mut supported_cfg,
-        Some(ReasoningEffort::High),
-        &sid,
-        EffortTarget::NewSession,
-    );
-    assert_eq!(supported_cfg.reasoning_effort, Some(ReasoningEffort::High));
-    let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
-    plain_cfg.reasoning_effort = None;
-    agent.models_manager.apply_supported_effort(
-        &mut plain_cfg,
-        Some(ReasoningEffort::High),
-        &sid,
-        EffortTarget::NewSession,
-    );
-    assert_eq!(plain_cfg.reasoning_effort, None);
-    let mut none_cfg = agent.prepare_sampling_config_for_model(&supported, None);
-    none_cfg.reasoning_effort = Some(ReasoningEffort::Low);
-    agent.models_manager.apply_supported_effort(
-        &mut none_cfg,
-        None,
-        &sid,
-        EffortTarget::NewSession,
-    );
-    assert_eq!(none_cfg.reasoning_effort, Some(ReasoningEffort::Low));
-}
-#[test]
-fn split_new_session_effort_routes_hint_to_one_slot() {
-    use crate::agent::mvp_agent::reasoning_effort::{NewSessionEffort, split_new_session_effort};
-    use xai_grok_sampling_types::ReasoningEffort;
-    assert_eq!(
-        split_new_session_effort(None, Some(ReasoningEffort::High)),
-        NewSessionEffort::Spawn(ReasoningEffort::High),
-    );
-    assert_eq!(
-        split_new_session_effort(Some("custom-model"), Some(ReasoningEffort::High)),
-        NewSessionEffort::Switch(ReasoningEffort::High),
-    );
-    assert_eq!(split_new_session_effort(None, None), NewSessionEffort::None,);
-    assert_eq!(
-        split_new_session_effort(Some("custom-model"), None),
-        NewSessionEffort::None,
-    );
-}
-/// New-session default-model path: composing `parse_reasoning_effort_meta` ->
-/// `split_new_session_effort` -> `apply_supported_effort` seeds a
-/// `_meta.reasoningEffort` hint into the spawn sampling for a supported model and
-/// drops it (keeping the catalog default) for an unsupported one.
-#[tokio::test]
-async fn new_session_meta_effort_seeds_spawn_for_supported_model_and_drops_for_unsupported() {
-    use crate::agent::config::{EndpointsConfig, ModelEntry};
-    use crate::agent::mvp_agent::reasoning_effort::{
-        EffortTarget, NewSessionEffort, split_new_session_effort,
-    };
-    use xai_grok_sampling_types::{
-        REASONING_EFFORT_META_KEY, ReasoningEffort, parse_reasoning_effort_meta,
-        reasoning_effort_meta_value,
-    };
-    let agent = build_minimal_agent_for_tests();
-    let mut supported = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
-    supported.info.supports_reasoning_effort = true;
-    supported.info.reasoning_effort = Some(ReasoningEffort::Low);
-    agent
-        .models_manager
-        .insert_test_entry("effort-model", supported.clone());
-    let plain = ModelEntry::fallback("plain-model", &EndpointsConfig::default());
-    agent
-        .models_manager
-        .insert_test_entry("plain-model", plain.clone());
-    let mut meta = acp::Meta::new();
-    meta.insert(
-        REASONING_EFFORT_META_KEY.to_string(),
-        reasoning_effort_meta_value(ReasoningEffort::High),
-    );
-    let request = acp::NewSessionRequest::new("/tmp").meta(Some(meta));
-    let route = split_new_session_effort(None, parse_reasoning_effort_meta(request.meta.as_ref()));
-    assert_eq!(route, NewSessionEffort::Spawn(ReasoningEffort::High));
-    let spawn_effort = match route {
-        NewSessionEffort::Spawn(effort) => Some(effort),
-        NewSessionEffort::Switch(_) | NewSessionEffort::None => None,
-    };
-    let sid = acp::SessionId::new("new-session-meta-effort");
-    let mut supported_cfg = agent.prepare_sampling_config_for_model(&supported, None);
-    agent.models_manager.apply_supported_effort(
-        &mut supported_cfg,
-        spawn_effort,
-        &sid,
-        EffortTarget::NewSession,
-    );
-    assert_eq!(supported_cfg.reasoning_effort, Some(ReasoningEffort::High));
-    let mut plain_cfg = agent.prepare_sampling_config_for_model(&plain, None);
-    agent.models_manager.apply_supported_effort(
-        &mut plain_cfg,
-        spawn_effort,
-        &sid,
-        EffortTarget::NewSession,
-    );
-    assert_eq!(plain_cfg.reasoning_effort, None);
-}
-/// Drive the real `restore_persisted_model` for a session pinned to an
-/// effort-capable model and report the effort it lands on the session handle.
-async fn restore_effort_via_load(
-    initial: Option<xai_grok_sampling_types::ReasoningEffort>,
-    persisted: Option<xai_grok_sampling_types::ReasoningEffort>,
-) -> Option<xai_grok_sampling_types::ReasoningEffort> {
-    use crate::agent::config::{EndpointsConfig, ModelEntry};
-    let agent = build_minimal_agent_for_tests();
-    let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
-    entry.info.supports_reasoning_effort = true;
-    agent
-        .models_manager
-        .insert_test_entry("effort-model", entry);
-    let sid = acp::SessionId::new("restore-precedence-sess");
-    let (handle, _cmd_tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            if let crate::session::SessionCommand::SetSessionModel {
-                sampling_config,
-                responds_to,
-                ..
-            } = cmd
-            {
-                let _ = responds_to.send(Ok(acp::ModelId::new(sampling_config.model)));
-            }
-        }
-    });
-    agent.insert_resident(&sid, handle);
-    let info = crate::session::info::Info {
-        id: sid.clone(),
-        cwd: "/tmp".to_string(),
-    };
-    let mut summary =
-        crate::session::persistence::Summary::new(&info, acp::ModelId::new("effort-model"))
-            .unwrap();
-    summary.reasoning_effort = persisted;
-    agent.restore_persisted_model(&sid, &summary, initial).await;
-    agent.resident_handle(&sid).and_then(|h| h.reasoning_effort)
-}
-#[tokio::test]
-async fn load_effort_precedence_prefers_meta_hint_over_persisted() {
-    use xai_grok_sampling_types::ReasoningEffort;
-    assert_eq!(
-        restore_effort_via_load(Some(ReasoningEffort::High), Some(ReasoningEffort::Low)).await,
-        Some(ReasoningEffort::High),
-    );
-    assert_eq!(
-        restore_effort_via_load(None, Some(ReasoningEffort::Low)).await,
-        Some(ReasoningEffort::Low),
     );
 }
 /// A session persisted under a routing *slug* (not the catalog map key) must
@@ -1806,196 +1610,64 @@ async fn ext_method_routes_auth_cleared_and_refreshes_resident_sessions() {
         })
         .await;
 }
-fn empty_gateway_catalog() -> crate::session::managed_mcp::GatewayToolCatalog {
-    crate::session::managed_mcp::GatewayToolCatalog {
-        tools: vec![],
-        total_tools: 0,
-        connectors_needing_reauth: vec![],
-    }
-}
-fn assert_no_update_mcp_servers(cmds: &[SessionCommand]) {
-    assert!(
-        !cmds
-            .iter()
-            .any(|c| matches!(c, SessionCommand::UpdateMcpServers { .. })),
-        "mcp/list must not push UpdateMcpServers"
-    );
-}
-/// `mcp/list` refresh: two resident sessions, cache=false + committed catalog
-/// fans `RefreshMcpSearchIndex`; failed catalog and cache=true do not.
+/// Fresh managed catalog sync must push UpdateMcpServers with the injected
+/// managed connector. The `search_tool` rebuild is a SEPARATE broadcast
+/// (`refresh_mcp_search_index_in_sessions`), so it is not asserted here.
 #[tokio::test(flavor = "current_thread")]
-async fn mcp_list_gateway_refresh_fans_only_on_committed_uncached_catalog() {
+async fn sync_fresh_managed_mcp_pushes_update() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            use crate::session::managed_mcp::GatewayToolCatalogCache;
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            let list_hits = std::sync::Arc::new(AtomicUsize::new(0));
-            let list_hits_route = list_hits.clone();
-            let app = axum::Router::new().route(
-                "/mcp/tools/list",
-                axum::routing::get(move || {
-                    list_hits_route.fetch_add(1, Ordering::SeqCst);
-                    async {
-                        axum::Json(serde_json::json!({
-                            "tools": [{
-                                "connector_id": "gmail",
-                                "connector_name": "Gmail",
-                                "tool_id": "search",
-                                "tool_name": "Search",
-                                "call_id": "gmail_search",
-                                "description": "d",
-                                "json_schema": {"type": "object"}
-                            }],
-                            "total_tools": 1,
-                            "connectors_needing_reauth": []
-                        }))
-                    }
-                }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let (agent, _rx) = build_agent_with_auth_and_proxy(
-                crate::auth::GrokAuth {
-                    key: "eligible".into(),
-                    auth_mode: crate::auth::AuthMode::WebLogin,
-                    ..crate::auth::GrokAuth::test_default()
-                },
-                proxy_url,
-                crate::agent::config::AgentMode::Generic,
-            );
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            let sid_a = acp::SessionId::new("sess-list-a");
-            let sid_b = acp::SessionId::new("sess-list-b");
-            let (handle_a, _tx_a, mut cmd_rx_a) = make_live_session_handle(&sid_a, None);
-            let (handle_b, _tx_b, mut cmd_rx_b) = make_live_session_handle(&sid_b, None);
-            agent.insert_resident(&sid_a, handle_a);
-            agent.insert_resident(&sid_b, handle_b);
-            {
-                let mut state = agent.managed_mcp_cache.lock().await;
-                state.enable_gateway_tools();
-                let epoch = state.start_gateway_tool_fetch().unwrap();
-                assert!(state.complete_gateway_tool_fetch(epoch, empty_gateway_catalog()));
-            }
-            let cached = agent.fetch_gateway_catalog_for_mcp_list(true).await;
-            let cached = cached.expect("cache=true should hit Ready catalog");
-            assert!(
-                cached.tools.is_empty() && cached.total_tools == 0,
-                "cache=true must return the seeded empty catalog, not a mock refetch"
-            );
-            assert_eq!(
-                list_hits.load(Ordering::SeqCst),
-                0,
-                "cache=true must not hit /mcp/tools/list"
-            );
-            assert!(
-                cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err(),
-                "cache=true must not fan RefreshMcpSearchIndex"
-            );
-            match &agent.managed_mcp_cache.lock().await.gateway_tool_cache {
-                GatewayToolCatalogCache::Ready(catalog) => {
-                    assert!(
-                        catalog.tools.is_empty() && catalog.total_tools == 0,
-                        "in-memory cache must stay the seeded empty Ready catalog"
-                    );
-                }
-                GatewayToolCatalogCache::NotFetched => {
-                    panic!("expected Ready(empty), got NotFetched")
-                }
-                GatewayToolCatalogCache::Fetching(_) => {
-                    panic!("expected Ready(empty), got Fetching")
-                }
-            }
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = false;
-            let failed = agent.fetch_gateway_catalog_for_mcp_list(false).await;
-            assert!(failed.is_none(), "gateway off after invalidate is None");
-            assert!(
-                cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err(),
-                "failed catalog must not fan RefreshMcpSearchIndex"
-            );
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            let fresh = agent.fetch_gateway_catalog_for_mcp_list(false).await;
-            assert!(
-                fresh.is_some_and(|c| !c.tools.is_empty()),
-                "cache=false should refetch a non-empty catalog"
-            );
-            assert!(
-                list_hits.load(Ordering::SeqCst) >= 1,
-                "cache=false refetch must hit /mcp/tools/list"
-            );
-            let cmd_a = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx_a.recv())
-                .await
-                .expect("session A RefreshMcpSearchIndex")
-                .expect("channel open");
-            let cmd_b = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx_b.recv())
-                .await
-                .expect("session B RefreshMcpSearchIndex")
-                .expect("channel open");
-            assert!(matches!(cmd_a, SessionCommand::RefreshMcpSearchIndex));
-            assert!(matches!(cmd_b, SessionCommand::RefreshMcpSearchIndex));
-            assert_no_update_mcp_servers(&[cmd_a, cmd_b]);
-            assert!(cmd_rx_a.try_recv().is_err() && cmd_rx_b.try_recv().is_err());
-            server.abort();
-        })
-        .await;
-}
-/// mcp/list with gateway off must disable the cache, same as initialize.
-#[tokio::test(flavor = "current_thread")]
-async fn mcp_list_gateway_off_disables_cached_catalog() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            use crate::session::managed_mcp::GatewayToolCatalogCache;
-            let (agent, _rx) = build_agent_with_auth_and_proxy(
-                crate::auth::GrokAuth {
-                    key: "eligible".into(),
-                    auth_mode: crate::auth::AuthMode::WebLogin,
-                    ..crate::auth::GrokAuth::test_default()
-                },
-                "http://127.0.0.1:1".into(),
-                crate::agent::config::AgentMode::Generic,
-            );
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = true;
-            let sid = acp::SessionId::new("sess-list-off");
+            let agent = build_agent_with_auth(crate::auth::GrokAuth {
+                key: "eligible".into(),
+                auth_mode: crate::auth::AuthMode::WebLogin,
+                ..crate::auth::GrokAuth::test_default()
+            });
+            let sid = acp::SessionId::new("sess-managed-sync");
             let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
             agent.insert_resident(&sid, handle);
-            {
-                let mut state = agent.managed_mcp_cache.lock().await;
-                state.enable_gateway_tools();
-                let epoch = state.start_gateway_tool_fetch().unwrap();
-                assert!(state.complete_gateway_tool_fetch(epoch, empty_gateway_catalog()));
-            }
-            agent.cfg.borrow_mut().managed_mcp_gateway_tools_enabled = false;
+            let managed = vec![crate::session::managed_mcp::ManagedMcpConfig {
+                name: "Linear".into(),
+                endpoint: "https://mcp.example.com/linear".into(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".into(),
+                    "Bearer tok".into(),
+                )]),
+                token_expires_at: None,
+                scope: None,
+                scope_id: None,
+                scope_name: None,
+            }];
+            agent.sync_fresh_managed_mcp_to_sessions(&managed);
+            let first = tokio::time::timeout(std::time::Duration::from_secs(1), cmd_rx.recv())
+                .await
+                .expect("UpdateMcpServers should be sent")
+                .expect("channel should stay open");
+            let SessionCommand::UpdateMcpServers { mcp_servers, .. } = first else {
+                panic!("expected UpdateMcpServers as the first synced command");
+            };
+            let managed_name = crate::session::managed_mcp::to_managed_name("Linear");
+            let linear = mcp_servers
+                .iter()
+                .find_map(|s| match s {
+                    acp::McpServer::Http(http) if http.name == managed_name => Some(http),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("merged catalog must contain managed HTTP server {managed_name}")
+                });
             assert!(
-                agent
-                    .fetch_gateway_catalog_for_mcp_list(true)
-                    .await
-                    .is_none(),
-                "gateway off must return None"
-            );
-            let state = agent.managed_mcp_cache.lock().await;
-            assert!(
-                !state.gateway_tools_active,
-                "gateway off must disable the cache"
-            );
-            assert!(
-                matches!(
-                    state.gateway_tool_cache,
-                    GatewayToolCatalogCache::NotFetched
-                ),
-                "disable must clear a Ready catalog"
-            );
-            drop(state);
-            assert!(
-                cmd_rx.try_recv().is_err(),
-                "disable via mcp/list must not fan RefreshMcpSearchIndex"
+                linear
+                    .headers
+                    .iter()
+                    .any(|h| h.name == "Authorization" && h.value == "Bearer tok"),
+                "managed server must carry the injected Authorization header"
             );
         })
         .await;
 }
-/// Gateway tools live on the agent catalog, so sessions only rebuild
-/// `search_tool`.
+/// The gateway-catalog refresh broadcast pushes `RefreshMcpSearchIndex` to every
+/// live session (independent of the legacy managed-connector sync).
 #[tokio::test(flavor = "current_thread")]
 async fn refresh_mcp_search_index_broadcasts_to_sessions() {
     let agent = build_minimal_agent_for_tests();
@@ -2140,10 +1812,8 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
         "repeat call must keep the populated snapshot"
     );
 }
-mod list_running_heal_tests;
 #[cfg(unix)]
 mod process_scope_reclaim;
-mod session_rename_tests;
 mod session_resume_close_tests;
 mod subagent_spawn_context_tests;
 /// No load in flight and no session → the wait returns immediately
@@ -2546,7 +2216,6 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
         info: config::ModelInfo {
             user_selectable: true,
             id: None,
-            model_family: None,
             model: model.to_string(),
             base_url: String::new(),
             name: None,
@@ -2939,10 +2608,7 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     assert!(matches!(
         agent.prepare_video_gen_config(),
-        VideoGenConfig::Enabled {
-            zdr_restricted: true,
-            ..
-        }
+        VideoGenConfig::Disabled
     ));
     agent.cfg.borrow_mut().zdr_video_output_s3 = Some(zdr_s3());
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = false;
@@ -2960,14 +2626,12 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     let VideoGenConfig::Enabled {
         zdr_video_output_s3,
-        zdr_restricted,
         ..
     } = agent.prepare_video_gen_config()
     else {
         panic!("expected Enabled");
     };
     assert!(zdr_video_output_s3.as_ref().is_some_and(|c| c.is_valid()));
-    assert!(!zdr_restricted);
 }
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_video_gen_config_respects_feature_flag() {
@@ -3286,211 +2950,6 @@ async fn diagnostic_upload_skipped_after_mid_session_trace_upload_kill_switch() 
         0,
         "an already-wired diagnostics uploader must honor a mid-session \
          trace-upload kill switch"
-    );
-}
-use crate::session::storage::search::IndexDecision;
-/// A grok home of its own, with the switch left at its registered default.
-/// `decide_search_index` stops short of a session store, but do not reach
-/// `bootstrap_once`: it takes the process-cached `grok_home()`, which these
-/// guards cannot redirect, so it could index the developer's own store.
-fn search_index_env() -> (tempfile::TempDir, [xai_grok_test_support::EnvGuard; 2]) {
-    use xai_grok_test_support::EnvGuard;
-    let home = tempfile::tempdir().unwrap();
-    let guards = [
-        EnvGuard::set("GROK_HOME", home.path()),
-        EnvGuard::unset("GROK_SESSION_SEARCH"),
-    ];
-    (home, guards)
-}
-#[tokio::test]
-#[serial_test::serial]
-async fn search_index_honors_the_session_search_feature() {
-    let (_home, _env) = search_index_env();
-    {
-        let _off = xai_grok_test_support::EnvGuard::set("GROK_SESSION_SEARCH", "0");
-        let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-        agent.decide_search_index();
-        assert!(
-            matches!(agent.search_index(), IndexDecision::Off),
-            "the switch is off, so this process keeps no index"
-        );
-    }
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    agent.decide_search_index();
-    assert!(
-        matches!(agent.search_index(), IndexDecision::On(_)),
-        "the feature is on by default, so this process keeps an index"
-    );
-}
-/// Reclaiming is the one irreversible half of the deferred work, and the six hour
-/// throttle then hides the run that could have honored a remote veto.
-#[tokio::test]
-#[serial_test::serial]
-async fn auto_gc_declines_until_the_remote_answer_settles() {
-    let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    assert!(
-        !agent.remote_settings_settled(),
-        "precondition: remote fetch is on and no settings have arrived"
-    );
-    agent.spawn_auto_worktree_gc();
-    agent.decide_search_index();
-    assert_eq!(
-        agent.auto_gc_spawn_count.get(),
-        0,
-        "a host that never reaches the server must not reclaim under the default policy"
-    );
-    assert!(
-        matches!(agent.search_index(), IndexDecision::On(_)),
-        "the index still decides, since running without one is what cannot be undone; got {:?}",
-        agent.search_index(),
-    );
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings::default());
-    agent.spawn_auto_worktree_gc();
-    assert_eq!(
-        agent.auto_gc_spawn_count.get(),
-        1,
-        "once the server has answered it reclaims, or the guard would just never run"
-    );
-}
-#[tokio::test]
-#[serial_test::serial]
-async fn search_before_the_decision_asks_the_caller_to_retry() {
-    let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    assert!(
-        matches!(agent.search_index(), IndexDecision::Pending),
-        "precondition: nothing has decided yet"
-    );
-    let resp = crate::session::storage::search::execute_search(
-        agent.search_index(),
-        &crate::util::grok_home::grok_home(),
-        &crate::session::storage::search::SessionSearchRequest {
-            query: "zzqqpending".to_string(),
-            cwd: None,
-            limit: 10,
-            offset: 0,
-            include_content: false,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        resp.bootstrapping,
-        "an undecided process must not answer final"
-    );
-    assert!(resp.results.is_empty());
-}
-/// A leader boots with no remote settings, so if the first reader resolved the
-/// feature the registered default would latch before the server could answer.
-#[tokio::test]
-#[serial_test::serial]
-async fn read_before_the_remote_settings_land_does_not_decide() {
-    let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    assert!(
-        !agent.remote_settings_settled(),
-        "precondition: remote fetch is on and no settings have arrived"
-    );
-    assert!(
-        matches!(agent.search_index(), IndexDecision::Pending),
-        "reading must not settle the question; got {:?}",
-        agent.search_index(),
-    );
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-        session_search: Some(false),
-        ..Default::default()
-    });
-    assert!(agent.remote_settings_settled());
-    agent.decide_search_index();
-    assert!(
-        matches!(agent.search_index(), IndexDecision::Off),
-        "the remote kill switch decided, so this process keeps no index; got {:?}",
-        agent.search_index(),
-    );
-}
-/// A host with no identity to fetch with never receives remote settings, so
-/// waiting for them would cost it an index for the whole run.
-#[tokio::test]
-#[serial_test::serial]
-async fn exhausted_fetch_decides_on_the_local_layers() {
-    use crate::agent::config::Config as AgentConfig;
-    use crate::auth::{AuthManager, GrokComConfig};
-    use xai_grok_test_support::EnvGuard;
-    let (_home, _env) = search_index_env();
-    let _no_inline_auth = EnvGuard::unset("GROK_AUTH");
-    let _no_auth_path = EnvGuard::unset("GROK_AUTH_PATH");
-    let auth_dir = tempfile::tempdir().unwrap();
-    let auth_manager =
-        std::sync::Arc::new(AuthManager::new(auth_dir.path(), GrokComConfig::default()));
-    assert!(
-        auth_manager.current().is_none(),
-        "precondition: no identity to fetch with"
-    );
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let agent = MvpAgent::new(
-        GatewaySender::new(tx),
-        &AgentConfig::default(),
-        auth_manager,
-        None,
-    )
-    .expect("valid test config");
-    assert!(
-        !agent.remote_settings_settled(),
-        "precondition: remote fetch is on and no settings have arrived"
-    );
-    agent.maybe_fetch_post_auth_settings().await;
-    assert!(
-        matches!(agent.search_index(), IndexDecision::On(_)),
-        "a signed out host decides on its local layers rather than keeping no index"
-    );
-}
-/// Once decided, a later switch cannot take the index away: serving one that
-/// stopped absorbing writes is worse than keeping it until the next launch.
-#[tokio::test]
-#[serial_test::serial]
-async fn kill_switch_after_the_decision_leaves_the_index_up() {
-    let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-        session_search: Some(true),
-        ..Default::default()
-    });
-    agent.decide_search_index();
-    assert!(
-        matches!(agent.search_index(), IndexDecision::On(_)),
-        "precondition: indexing"
-    );
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-        session_search: Some(false),
-        ..Default::default()
-    });
-    agent.decide_search_index();
-    assert!(
-        matches!(agent.search_index(), IndexDecision::On(_)),
-        "a switch arriving after the decision must not tear down a live index"
-    );
-}
-/// Sessions hold the decision itself, not the answer as it stood when they
-/// opened, which would otherwise be `None` for the rest of their life.
-#[tokio::test]
-#[serial_test::serial]
-async fn session_opened_before_the_decision_sees_it_land() {
-    let (_home, _env) = search_index_env();
-    let agent = build_agent_with_auth(crate::auth::GrokAuth::test_default());
-    let held_by_a_session = agent.search_index_cell();
-    assert!(
-        matches!(held_by_a_session.decision(), IndexDecision::Pending),
-        "precondition: the session opened before anything decided"
-    );
-    agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-        session_search: Some(true),
-        ..Default::default()
-    });
-    agent.decide_search_index();
-    assert!(
-        matches!(held_by_a_session.decision(), IndexDecision::On(_)),
-        "the session indexes as soon as the decision lands"
     );
 }
 /// The live collection gate reads a `Send` mirror of the config-level
@@ -3954,6 +3413,7 @@ fn chat_session_spawn_options_matches_thin_profile() {
     assert!(!opts.client_fs_read);
     assert!(!opts.client_fs_write);
     assert!(opts.chat_history.is_empty());
+    assert!(opts.managed_mcp_expires_at.is_none());
     assert!(!opts.session_auto_mode);
     assert!(
         opts.persistence.is_noop(),
@@ -3991,14 +3451,7 @@ async fn remove_session_releases_workspace_binding_and_side_maps() {
     agent
         .session_registry
         .set_permission_receiver(&sid, permission_rx);
-    let _ = agent.session_registry.live_orphan_heal_lock(&sid);
-    assert_eq!(agent.session_registry.counts().live_orphan_heal_locks, 1);
     agent.remove_session(&sid);
-    assert_eq!(
-        agent.session_registry.counts().live_orphan_heal_locks,
-        0,
-        "remove_session must evict the live-orphan heal mutex"
-    );
     assert!(
         toolset_weak.upgrade().is_none(),
         "the workspace binding must release the toolset"
@@ -4191,256 +3644,6 @@ async fn drive_close(agent: &MvpAgent, session_id: &str) -> Result<acp::ExtRespo
             std::sync::Arc::from(raw),
         ))
         .await
-}
-/// Every method `parse_queue_edit_command` accepts must be forwarded from
-/// `ext_notification` to that session's mailbox. Parser-only coverage misses
-/// a dispatch drop.
-#[tokio::test(flavor = "current_thread")]
-async fn ext_notification_forwards_each_queue_method_to_session_actor() {
-    use acp::Agent as _;
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-queue-rt");
-    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-    agent.insert_resident(&sid, handle);
-    let session_id = sid.0.as_ref();
-    let cases: [(&str, serde_json::Value); 7] = [
-        (
-            "x.ai/queue/remove",
-            serde_json::json!({
-                "sessionId": session_id,
-                "id": "p-remove",
-                "expectedVersion": 3,
-                "owner": "grok-tui",
-            }),
-        ),
-        (
-            "x.ai/queue/reorder",
-            serde_json::json!({
-                "sessionId": session_id,
-                "orderedIds": ["a", "b"],
-            }),
-        ),
-        (
-            "x.ai/queue/clear",
-            serde_json::json!({
-                "sessionId": session_id,
-                "clientIdentifier": "grok-desktop",
-            }),
-        ),
-        (
-            "x.ai/queue/edit",
-            serde_json::json!({
-                "sessionId": session_id,
-                "id": "p-edit",
-                "newText": "rewritten",
-                "owner": "grok-vscode",
-            }),
-        ),
-        (
-            "x.ai/queue/interject",
-            serde_json::json!({
-                "sessionId": session_id,
-                "id": "p-interject",
-                "expectedVersion": 2,
-                "owner": "grok-tui",
-                "newText": "now",
-            }),
-        ),
-        (
-            "x.ai/queue/hold_edit",
-            serde_json::json!({
-                "sessionId": session_id,
-                "id": "p-hold",
-            }),
-        ),
-        (
-            "x.ai/queue/release_edit",
-            serde_json::json!({
-                "sessionId": session_id,
-                "id": "p-release",
-            }),
-        ),
-    ];
-    for (method, params) in cases {
-        let raw = serde_json::value::to_raw_value(&params).expect("serialize queue params");
-        agent
-            .ext_notification(acp::ExtNotification::new(method, raw.into()))
-            .await
-            .unwrap_or_else(|e| panic!("{method} ext_notification failed: {e}"));
-        let cmd = cmd_rx.try_recv().unwrap_or_else(|e| {
-            panic!("{method} must land a SessionCommand on the actor mailbox, try_recv={e}")
-        });
-        match (method, cmd) {
-            (
-                "x.ai/queue/remove",
-                SessionCommand::RemoveQueuedPrompt {
-                    id,
-                    expected_version,
-                    owner,
-                },
-            ) => {
-                assert_eq!(id, "p-remove");
-                assert_eq!(expected_version, 3);
-                assert_eq!(owner.as_deref(), Some("grok-tui"));
-            }
-            ("x.ai/queue/reorder", SessionCommand::ReorderQueue { ordered_ids }) => {
-                assert_eq!(ordered_ids, vec!["a", "b"]);
-            }
-            ("x.ai/queue/clear", SessionCommand::ClearQueue { owner }) => {
-                assert_eq!(owner.as_deref(), Some("grok-desktop"));
-            }
-            (
-                "x.ai/queue/edit",
-                SessionCommand::EditQueuedPrompt {
-                    id,
-                    new_text,
-                    editor,
-                },
-            ) => {
-                assert_eq!(id, "p-edit");
-                assert_eq!(new_text, "rewritten");
-                assert_eq!(editor.as_deref(), Some("grok-vscode"));
-            }
-            (
-                "x.ai/queue/interject",
-                SessionCommand::InterjectQueuedPrompt {
-                    id,
-                    expected_version,
-                    owner,
-                    new_text,
-                },
-            ) => {
-                assert_eq!(id, "p-interject");
-                assert_eq!(expected_version, 2);
-                assert_eq!(owner.as_deref(), Some("grok-tui"));
-                assert_eq!(new_text.as_deref(), Some("now"));
-            }
-            ("x.ai/queue/hold_edit", SessionCommand::HoldEdit { id }) => {
-                assert_eq!(id, "p-hold");
-            }
-            ("x.ai/queue/release_edit", SessionCommand::ReleaseEdit { id }) => {
-                assert_eq!(id, "p-release");
-            }
-            (method, _) => {
-                panic!("{method} dispatched a SessionCommand of the wrong variant")
-            }
-        }
-    }
-    assert!(
-        matches!(
-            cmd_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ),
-        "no extra SessionCommand may remain after the seven queue methods"
-    );
-}
-/// Methods the parser rejects (unknown, outbound `changed`, missing id /
-/// newText) and a missing session must not send a command or panic.
-#[tokio::test(flavor = "current_thread")]
-async fn ext_notification_queue_rejects_unknown_method_missing_id_and_unknown_session() {
-    use acp::Agent as _;
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-queue-neg");
-    let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
-    agent.insert_resident(&sid, handle);
-    let session_id = sid.0.as_ref();
-    let negatives: [(&str, serde_json::Value); 9] = [
-        (
-            "x.ai/queue/bogus",
-            serde_json::json!({ "sessionId": session_id, "id": "p1" }),
-        ),
-        (
-            "x.ai/queue/changed",
-            serde_json::json!({
-                "sessionId": session_id,
-                "entries": [{
-                    "id": "p1",
-                    "version": 0,
-                    "kind": "prompt",
-                    "text": "hello",
-                    "position": 0,
-                }],
-            }),
-        ),
-        (
-            "x.ai/queue/hold_edit",
-            serde_json::json!({ "sessionId": session_id }),
-        ),
-        (
-            "x.ai/queue/release_edit",
-            serde_json::json!({ "sessionId": session_id }),
-        ),
-        (
-            "x.ai/queue/remove",
-            serde_json::json!({ "sessionId": session_id }),
-        ),
-        (
-            "x.ai/queue/edit",
-            serde_json::json!({ "sessionId": session_id, "newText": "x" }),
-        ),
-        (
-            "x.ai/queue/edit",
-            serde_json::json!({ "sessionId": session_id, "id": "p-edit" }),
-        ),
-        (
-            "x.ai/queue/interject",
-            serde_json::json!({ "sessionId": session_id }),
-        ),
-        (
-            "x.ai/queue/hold_edit",
-            serde_json::json!({ "sessionId": "no-such-session", "id": "p1" }),
-        ),
-    ];
-    for (method, params) in negatives {
-        let raw = serde_json::value::to_raw_value(&params).expect("serialize queue params");
-        agent
-            .ext_notification(acp::ExtNotification::new(method, raw.into()))
-            .await
-            .unwrap_or_else(|e| panic!("{method} ext_notification must not fail: {e}"));
-        assert!(
-            matches!(
-                cmd_rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "{method} must not send a SessionCommand (params={params})"
-        );
-    }
-    let agent_empty = build_minimal_agent_for_tests();
-    let raw = serde_json::value::to_raw_value(&serde_json::json!({
-        "sessionId": "ghost",
-        "id": "p1",
-    }))
-    .expect("serialize");
-    agent_empty
-        .ext_notification(acp::ExtNotification::new(
-            "x.ai/queue/release_edit",
-            raw.into(),
-        ))
-        .await
-        .expect("queue edit for a missing session must not error");
-}
-/// Fire-and-forget: a gone session actor must not turn `ext_notification`
-/// into an error or panic.
-#[tokio::test(flavor = "current_thread")]
-async fn ext_notification_queue_edit_survives_dropped_actor_mailbox() {
-    use acp::Agent as _;
-    let agent = build_minimal_agent_for_tests();
-    let sid = acp::SessionId::new("sess-queue-dead");
-    let (handle, _tx, cmd_rx) = make_live_session_handle(&sid, None);
-    agent.insert_resident(&sid, handle);
-    drop(cmd_rx);
-    let params = serde_json::json!({
-        "sessionId": sid.0.as_ref(),
-        "id": "p-hold",
-    });
-    let raw = serde_json::value::to_raw_value(&params).expect("serialize queue params");
-    agent
-        .ext_notification(acp::ExtNotification::new(
-            "x.ai/queue/hold_edit",
-            raw.into(),
-        ))
-        .await
-        .expect("queue edit must not error when the session actor mailbox is gone");
 }
 /// No-evict keystone: a client disconnecting mid-turn must NOT destroy the
 /// session. The actor stays resident, no `Shutdown` is sent, the resident
@@ -4826,17 +4029,11 @@ fn explicit_close_finalizes_the_replica() {
             (
                 options.cancel_subagents,
                 options.kill_background_tasks,
-                options.history.clone(),
+                options.rewind_if_no_output,
                 options.trigger.as_ref().map(|t| t.as_str()),
                 options.user_initiated
             ),
-            (
-                true,
-                true,
-                crate::session::CancelHistoryDisposition::Keep,
-                Some("session_close"),
-                false
-            ),
+            (true, true, false, Some("session_close"), false),
         );
         assert!(
             matches!(
@@ -5014,202 +4211,6 @@ fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
             "post-auth must spawn on its own guard despite an in-flight reapply"
         );
         assert!(agent.post_auth_settings_in_flight.get());
-    });
-}
-/// The tier re-check work is single-flight across every caller: back-to-back
-/// gated initializes run at most one live check, and an awaited
-/// authenticate-path check skips — rather than doubles or waits out — a
-/// check already wedged on a stalled subscription endpoint. Drives the exact
-/// block `initialize` runs when `tier_allowed` is false (the full
-/// `initialize` fires once-per-process GROK_HOME cleanup work that a unit
-/// test must not run against the developer's real home).
-#[test]
-fn gated_reconnect_tier_recheck_is_single_flight() {
-    run_local_for_bridge_test(|| async {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking accept loop");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let accept_stop = stop.clone();
-        let accept_thread = std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while !accept_stop.load(std::sync::atomic::Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => held.push(stream),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        let agent = build_minimal_agent_for_tests();
-        agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url =
-            Some(format!("http://{addr}/v1"));
-        agent.cfg.borrow_mut().remote_settings = Some(crate::util::config::RemoteSettings {
-            allow_access: Some(false),
-            ..Default::default()
-        });
-        let auth = crate::auth::GrokAuth {
-            key: "gated-user-key".into(),
-            user_id: "user-gated".into(),
-            auth_mode: crate::auth::AuthMode::Oidc,
-            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
-        };
-        agent.auth_manager.hot_swap(auth.clone());
-        *agent.allow_access_resolved_for.borrow_mut() = Some(auth.user_id.clone());
-        agent.tier_allowed.set(false);
-        for _ in 0..2 {
-            if !agent.tier_allowed.get() {
-                agent.spawn_tier_recheck();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert_eq!(
-            agent.tier_recheck_run_count.get(),
-            1,
-            "the second spawned check must skip the claimed re-check"
-        );
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            agent.enforce_grok_code_access(&auth),
-        )
-        .await
-        .expect("an awaited check must skip, not wait out, the wedged re-check");
-        assert_eq!(
-            agent.tier_recheck_run_count.get(),
-            1,
-            "the awaited check must not run a second concurrent re-check"
-        );
-        assert!(
-            !agent.tier_allowed.get(),
-            "the gate stays until a re-check resolves"
-        );
-        stop.store(true, std::sync::atomic::Ordering::Release);
-        accept_thread.join().expect("accept loop joins");
-    });
-}
-/// The check's own mint spawns a `/user` enrichment that can rewrite the
-/// in-memory user_id to the proxy-canonical value mid-check; the identity
-/// guard must read that normalization as the same account (it is the id the
-/// check's own bearer resolved to), while a live id matching neither the
-/// started nor the canonical id is a real switch and still discards.
-#[test]
-fn tier_recheck_identity_guard_accepts_enrichment_canonical_user_id() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
-        let auth = crate::auth::GrokAuth {
-            key: "seeded-key".into(),
-            user_id: "canonical-user".into(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
-        };
-        agent.auth_manager.hot_swap(auth);
-        assert!(!agent.tier_recheck_identity_changed("seeded-user", Some("canonical-user")));
-        assert!(!agent.tier_recheck_identity_changed("canonical-user", None));
-        assert!(!agent.tier_recheck_identity_changed("canonical-user", Some("other-user")));
-        assert!(agent.tier_recheck_identity_changed("seeded-user", Some("other-user")));
-        assert!(agent.tier_recheck_identity_changed("seeded-user", None));
-        assert!(agent.tier_recheck_identity_changed("seeded-user", Some("")));
-    });
-}
-/// The other half of the reconnect paywall flash (the wedged test above
-/// locks the "gate holds while the check is in flight" half): a re-check
-/// that confirms a qualifying tier lifts `tier_allowed`, so the flash a
-/// subscribed user can see on a gated reconnect clears. Settings stay
-/// absent (the mock 404s `/settings`), modeling the remote-fetch-failed /
-/// disabled arm where the confirmed tier is the authority for the lift;
-/// the bearer's tier claim already matches the live tier, so the
-/// post-unblock mint is skipped and no refresher is needed.
-#[test]
-fn gated_reconnect_recheck_lifts_gate_clearing_paywall_flash() {
-    run_local_for_bridge_test(|| async {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking accept loop");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let accept_stop = stop.clone();
-        let accept_thread = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            while !accept_stop.load(std::sync::atomic::Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let mut head = Vec::new();
-                        let mut byte = [0u8; 1];
-                        while !head.ends_with(b"\r\n\r\n") {
-                            match stream.read(&mut byte) {
-                                Ok(1) => head.push(byte[0]),
-                                _ => break,
-                            }
-                        }
-                        let head = String::from_utf8_lossy(&head);
-                        let response = if head.contains("/user?include=subscription") {
-                            let body =
-                                r#"{"userId":"user-flash","subscriptionTier":"SuperGrokPro"}"#;
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            )
-                        } else {
-                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
-                             Connection: close\r\n\r\n"
-                                .to_owned()
-                        };
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        let temp_dir = tempfile::tempdir().unwrap();
-        let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new(
-            temp_dir.path(),
-            crate::auth::GrokComConfig::default(),
-        ));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let gateway = GatewaySender::new(tx);
-        let cfg = crate::agent::config::Config::default();
-        let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
-        agent.cfg.borrow_mut().endpoints.cli_chat_proxy_base_url =
-            Some(format!("http://{addr}/v1"));
-        let auth = crate::auth::GrokAuth {
-            key: jwt_with_tier(5),
-            user_id: "user-flash".into(),
-            auth_mode: crate::auth::AuthMode::Oidc,
-            oidc_issuer: Some(crate::auth::XAI_OAUTH2_ISSUER.to_owned()),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            ..crate::auth::GrokAuth::test_default()
-        };
-        agent.auth_manager.hot_swap(auth);
-        agent.tier_allowed.set(false);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            agent.retry_subscription_check(),
-        )
-        .await
-        .expect("re-check must finish well inside its bounded awaits");
-        assert!(
-            agent.tier_allowed.get(),
-            "a confirmed qualifying tier must lift the gate — the reconnect paywall flash clears"
-        );
-        assert_eq!(
-            agent.tier_recheck_run_count.get(),
-            1,
-            "the lift came from exactly one claimed re-check"
-        );
-        stop.store(true, std::sync::atomic::Ordering::Release);
-        accept_thread.join().expect("accept loop joins");
     });
 }
 /// Agent with pre-loaded auth, a gateway receiver (to assert emitted
@@ -6675,129 +5676,3 @@ mod soft_default_settings_emit {
 }
 #[cfg(feature = "dhat-heap")]
 mod dhat_soak;
-/// A leader multiplexes many clients behind one `initialize`, so the answer
-/// has to travel with the session: without the session-meta read, one terminal
-/// with the row off decides for every other terminal sharing the leader.
-/// Silence means off, since the payload costs a git discovery and three round
-/// trips.
-#[test]
-fn session_meta_outranks_the_client_that_started_the_process() {
-    let says_nothing = || {
-        acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
-            acp::ClientCapabilities::new()
-                .fs(acp::FileSystemCapabilities::new())
-                .terminal(false),
-        )
-    };
-    let wants_a_row = |meta: Option<acp::Meta>, init: acp::InitializeRequest| {
-        MvpAgent::resolve_status_line_capability(meta.as_ref(), &init)
-    };
-    let on = init_advertising_status_line(true);
-    let off = init_advertising_status_line(false);
-    assert!(
-        wants_a_row(Some(status_line_meta(true)), off),
-        "a leader that wants a row outranks the client that started the process"
-    );
-    assert!(
-        !wants_a_row(Some(status_line_meta(false)), on),
-        "a `/minimal` client attaching to a leader a full-screen pager started \
-         was charged for a row it cannot draw"
-    );
-    assert!(
-        wants_a_row(None, init_advertising_status_line(true)),
-        "with no leader the client that initialized is the client that asked"
-    );
-    assert!(!wants_a_row(None, init_advertising_status_line(false)));
-    assert!(
-        !wants_a_row(Some(acp::Meta::new()), says_nothing()),
-        "a leader that injected nothing leaves a silent client off"
-    );
-    assert!(!wants_a_row(None, says_nothing()));
-}
-#[tokio::test(flavor = "current_thread")]
-async fn an_attach_that_draws_a_row_switches_it_on_and_asks_for_a_fill() {
-    let agent = build_minimal_agent_for_tests();
-    let session_id = acp::SessionId::new("status-line-attach");
-    let (cmd_tx, mut commands) =
-        tokio::sync::mpsc::unbounded_channel::<crate::session::SessionCommand>();
-    let mut handle = make_test_handle("test-model", false, None);
-    handle.cmd_tx = cmd_tx;
-    let row = handle.status_line_enabled.clone();
-    agent.insert_resident(&session_id, handle);
-    let init = init_advertising_status_line(false);
-    agent.attach_status_line(&session_id, Some(&status_line_meta(false)), &init);
-    assert!(
-        !row.load(std::sync::atomic::Ordering::Relaxed),
-        "an attach that cannot draw a row switched it on"
-    );
-    assert!(
-        commands.try_recv().is_err(),
-        "an attach that cannot draw a row asked the actor to build one"
-    );
-    agent.attach_status_line(&session_id, Some(&status_line_meta(true)), &init);
-    assert!(
-        row.load(std::sync::atomic::Ordering::Relaxed),
-        "the attach left the row off, so the emitter wakes and builds nothing"
-    );
-    assert!(
-        matches!(
-            commands.try_recv(),
-            Ok(crate::session::SessionCommand::EmitStatusSnapshot)
-        ),
-        "the attach never asked for a snapshot, so the transient row never fills"
-    );
-}
-/// A resident session outlives the client that drew its row, and the emitter
-/// re-reads the flag on every wake, so a latch that only ever rose would keep
-/// building payloads for a row nobody paints. Driven through the real
-/// disconnect, not the setter, since the wiring is the part that can rot.
-#[test]
-fn a_disconnect_switches_the_row_off_and_the_next_attach_switches_it_on() {
-    run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
-        let sid = acp::SessionId::new("sess-status-line-busy");
-        let (handle, _tx, rx) = make_live_session_handle(&sid, None);
-        let row = handle.status_line_enabled.clone();
-        agent.insert_resident(&sid, handle);
-        let _actor = spawn_fake_actor(rx, true);
-        let init = init_advertising_status_line(true);
-        agent.attach_status_line(&sid, Some(&status_line_meta(true)), &init);
-        assert!(row.load(std::sync::atomic::Ordering::Relaxed));
-        drive_disconnect_many(&agent, &[&sid]).await;
-        assert!(
-            agent.is_resident(&sid),
-            "the busy session must stay resident"
-        );
-        assert!(
-            !row.load(std::sync::atomic::Ordering::Relaxed),
-            "the last client that could draw the row is gone, so the agent is \
-             still assembling payloads nobody paints"
-        );
-        agent.attach_status_line(&sid, Some(&status_line_meta(true)), &init);
-        assert!(
-            row.load(std::sync::atomic::Ordering::Relaxed),
-            "the row has to come back with the next client"
-        );
-    });
-}
-fn status_line_meta(enabled: bool) -> acp::Meta {
-    let mut meta = acp::Meta::new();
-    meta.insert(
-        xai_grok_status_line::CLIENT_STATUS_LINE_META.to_string(),
-        serde_json::json!(enabled),
-    );
-    meta
-}
-fn init_advertising_status_line(enabled: bool) -> acp::InitializeRequest {
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        xai_grok_status_line::STATUS_LINE_CAPABILITY.to_string(),
-        serde_json::json!(enabled),
-    );
-    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
-        acp::ClientCapabilities::new()
-            .fs(acp::FileSystemCapabilities::new())
-            .terminal(false)
-            .meta(meta),
-    )
-}

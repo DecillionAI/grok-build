@@ -41,15 +41,8 @@ fn running_driver(prompt_id: &str) -> AgentView {
 #[test]
 fn viewer_finalize_idles_and_pushes_completed_marker() {
     let mut agent = running_viewer("p1");
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let outcome =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     assert!(matches!(outcome, TerminalApply::ViewerFinalized));
     assert!(agent.session.state.is_idle());
     assert!(agent.session.current_prompt_id.is_none());
@@ -202,15 +195,7 @@ fn viewer_finalize_consumes_stop_hook_stash() {
         groups: one_stop_group(),
     });
 
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
 
     assert_eq!(last_marker_groups(&agent.scrollback), Some(1));
     assert!(agent.pending_stop_hooks.is_none());
@@ -219,27 +204,12 @@ fn viewer_finalize_consumes_stop_hook_stash() {
 #[test]
 fn viewer_finalize_duplicate_terminal_is_noop() {
     let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     let len_after_first = agent.scrollback.len();
 
     // A duplicate/stale terminal for the now-finished turn does nothing.
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let outcome =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     assert!(matches!(outcome, TerminalApply::Ignored));
     assert!(agent.session.state.is_idle());
     assert_eq!(
@@ -249,77 +219,12 @@ fn viewer_finalize_duplicate_terminal_is_noop() {
     );
 }
 
-/// A cancelled terminal stamped `cancellationCategory: "HookDenied"` renders
-/// the blocked-by-hook marker, never "cancelled by user" — a policy block is
-/// not a user action (wrong story for an audit trail). Unknown categories and
-/// absent meta (older shells) keep the user-cancel copy.
-#[test]
-fn viewer_finalize_hook_denied_renders_blocked_marker() {
-    let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            cancellation_category: Some(HOOK_DENIED_CATEGORY),
-            ..Default::default()
-        },
-    );
-    match last_session_event(&agent.scrollback) {
-        Some(SessionEvent::TurnBlockedByHook { .. }) => {}
-        other => panic!("expected TurnBlockedByHook, got {other:?}"),
-    }
-
-    // Unknown category → user-cancel copy (no false hook attribution).
-    let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            cancellation_category: Some("DoomLoop"),
-            ..Default::default()
-        },
-    );
-    assert!(matches!(
-        last_session_event(&agent.scrollback),
-        Some(SessionEvent::TurnCancelled { .. })
-    ));
-}
-
-/// One chooser for every rail: only the hook-denied category flips the copy.
-#[test]
-fn cancelled_turn_event_picks_marker_by_category() {
-    let d = std::time::Duration::from_millis(700);
-    assert!(matches!(
-        cancelled_turn_event(Some(HOOK_DENIED_CATEGORY), d),
-        SessionEvent::TurnBlockedByHook { .. }
-    ));
-    assert!(matches!(
-        cancelled_turn_event(None, d),
-        SessionEvent::TurnCancelled { .. }
-    ));
-    assert_eq!(
-        cancelled_turn_event(Some(HOOK_DENIED_CATEGORY), d).message(),
-        "Turn blocked by a hook in 0.7s."
-    );
-}
-
 #[test]
 fn viewer_finalize_stop_reason_to_marker_mapping() {
     // cancelled → Turn cancelled.
     let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            ..Default::default()
-        },
-    );
+    let _ =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("cancelled"), None, None);
     assert!(matches!(
         last_session_event(&agent.scrollback),
         Some(SessionEvent::TurnCancelled { .. })
@@ -330,12 +235,10 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
     let _ = finalize_turn_from_terminal(
         &mut agent,
         "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("error"),
-            agent_result: Some(r#"API error (status 500): {"error":"boom"}"#),
-            ..Default::default()
-        },
+        Some("p1"),
+        Some("error"),
+        Some(r#"API error (status 500): {"error":"boom"}"#),
+        None,
     );
     match last_session_event(&agent.scrollback) {
         Some(SessionEvent::TurnFailed { error, .. }) => {
@@ -357,15 +260,7 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
             headline: "Server error (500)".into(),
             detail: String::new(),
         }));
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("error"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("error"), None, None);
     assert!(
         !matches!(
             last_session_event(&agent.scrollback),
@@ -385,15 +280,7 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
             detail: String::new(),
         }));
     agent.scrollback.push_block(RenderBlock::user_prompt("hi"));
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("error"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("error"), None, None);
     assert!(
         matches!(
             last_session_event(&agent.scrollback),
@@ -404,15 +291,8 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
 
     // rate_limit → finished, but no marker (not actionable from a viewer).
     let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("rate_limit"),
-            ..Default::default()
-        },
-    );
+    let _ =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("rate_limit"), None, None);
     assert!(agent.session.state.is_idle());
     assert!(
         last_session_event(&agent.scrollback).is_none(),
@@ -421,15 +301,8 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
 
     // unknown/other reason → Turn completed (the catch-all).
     let mut agent = running_viewer("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("max_tokens"),
-            ..Default::default()
-        },
-    );
+    let _ =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("max_tokens"), None, None);
     assert!(matches!(
         last_session_event(&agent.scrollback),
         Some(SessionEvent::TurnCompleted { .. })
@@ -439,15 +312,8 @@ fn viewer_finalize_stop_reason_to_marker_mapping() {
 #[test]
 fn driver_arms_reconcile_and_does_not_finish() {
     let mut agent = running_driver("p1");
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            ..Default::default()
-        },
-    );
+    let outcome =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("cancelled"), None, None);
     assert!(matches!(outcome, TerminalApply::ReconcileArmed));
     assert!(
         matches!(agent.session.state, AgentState::TurnRunning),
@@ -468,11 +334,10 @@ fn driver_mismatched_prompt_id_does_not_arm() {
     let outcome = finalize_turn_from_terminal(
         &mut agent,
         "s1",
-        TerminalSignal {
-            prompt_id: Some("p-other"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
+        Some("p-other"),
+        Some("end_turn"),
+        None,
+        None,
     );
     assert!(matches!(outcome, TerminalApply::Ignored));
     assert!(agent.pending_turn_end_reconcile.is_none());
@@ -482,14 +347,7 @@ fn driver_mismatched_prompt_id_does_not_arm() {
 #[test]
 fn driver_missing_prompt_id_arms_against_current_when_idle_in_turn() {
     let mut agent = running_driver("p1");
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let outcome = finalize_turn_from_terminal(&mut agent, "s1", None, Some("end_turn"), None, None);
     assert!(matches!(outcome, TerminalApply::ReconcileArmed));
     assert_eq!(
         agent.pending_turn_end_reconcile.as_ref().unwrap().prompt_id,
@@ -516,14 +374,7 @@ fn stream_agent_text(agent: &mut AgentView, text: &str) {
 fn repro_terminal_without_prompt_id_arms_reconcile_for_lost_pr() {
     let mut agent = running_driver("p1");
     stream_agent_text(&mut agent, "done");
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let outcome = finalize_turn_from_terminal(&mut agent, "s1", None, Some("end_turn"), None, None);
     assert!(matches!(outcome, TerminalApply::ReconcileArmed));
     assert!(agent.pending_turn_end_reconcile.is_some());
     assert!(
@@ -536,79 +387,14 @@ fn repro_terminal_without_prompt_id_arms_reconcile_for_lost_pr() {
     );
 }
 
-/// Armed, the overdue reconcile would force-finish the live turn mid-write.
-#[test]
-fn driver_missing_prompt_id_ignored_during_tool_call_write() {
-    let mut agent = running_driver("p1");
-    assert!(
-        agent
-            .session
-            .tracker
-            .note_tool_call_arguments_delta(Some("spawn_subagent"), 0)
-    );
-    assert!(matches!(
-        agent.session.tracker.activity(),
-        Some(crate::acp::tracker::TurnActivity::WritingToolCall(_))
-    ));
-
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
-    assert!(matches!(outcome, TerminalApply::Ignored));
-    assert!(
-        agent.pending_turn_end_reconcile.is_none(),
-        "mid-write terminal must not arm the lost-PR reconcile"
-    );
-    assert!(matches!(agent.session.state, AgentState::TurnRunning));
-}
-
-/// A dead stream mid-write must not block lost-response recovery.
-#[test]
-fn driver_missing_prompt_id_arms_when_tool_call_write_is_stale() {
-    let mut agent = running_driver("p1");
-    agent
-        .session
-        .tracker
-        .note_tool_call_arguments_delta(Some("spawn_subagent"), 0);
-    agent.session.tracker.backdate_last_tool_call_delta(
-        crate::acp::tracker::WRITING_DELTA_STALE_AFTER + std::time::Duration::from_secs(1),
-    );
-
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
-    assert!(matches!(outcome, TerminalApply::ReconcileArmed));
-    assert_eq!(
-        agent.pending_turn_end_reconcile.as_ref().unwrap().prompt_id,
-        "p1"
-    );
-}
-
 /// Exact pid still arms (control).
 #[test]
 fn recovery_mode_matching_turn_completed_arms_reconcile_for_lost_pr() {
     let mut agent = running_driver("p1");
     stream_agent_text(&mut agent, "done");
 
-    let outcome = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let outcome =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     assert!(matches!(outcome, TerminalApply::ReconcileArmed));
     assert!(matches!(agent.session.state, AgentState::TurnRunning));
     assert!(agent.pending_turn_end_reconcile.is_some());
@@ -618,30 +404,14 @@ fn recovery_mode_matching_turn_completed_arms_reconcile_for_lost_pr() {
 #[test]
 fn driver_rearm_same_pid_preserves_received_at() {
     let mut agent = running_driver("p1");
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     let first = agent
         .pending_turn_end_reconcile
         .as_ref()
         .unwrap()
         .received_at;
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("end_turn"),
-            ..Default::default()
-        },
-    );
+    let _ = finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("end_turn"), None, None);
     let second = agent
         .pending_turn_end_reconcile
         .as_ref()
@@ -738,12 +508,10 @@ fn viewer_finalize_suppresses_send_now_cancel_marker() {
     let outcome = finalize_turn_from_terminal(
         &mut agent,
         "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            cancel_trigger: Some("send_now"),
-            ..Default::default()
-        },
+        Some("p1"),
+        Some("cancelled"),
+        None,
+        Some("send_now"),
     );
     assert!(matches!(outcome, TerminalApply::ViewerFinalized));
     assert!(agent.session.state.is_idle(), "the turn still finishes");
@@ -758,12 +526,10 @@ fn viewer_finalize_suppresses_send_now_cancel_marker() {
     let _ = finalize_turn_from_terminal(
         &mut agent,
         "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            cancel_trigger: Some("ctrl_c"),
-            ..Default::default()
-        },
+        Some("p1"),
+        Some("cancelled"),
+        None,
+        Some("ctrl_c"),
     );
     assert!(matches!(
         last_session_event(&agent.scrollback),
@@ -773,15 +539,8 @@ fn viewer_finalize_suppresses_send_now_cancel_marker() {
     // Older shell (no meta): the armed expectation is the fallback.
     let mut agent = running_viewer("p1");
     agent.expect_send_now_cancel = Some("p-mine".into());
-    let _ = finalize_turn_from_terminal(
-        &mut agent,
-        "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            ..Default::default()
-        },
-    );
+    let _ =
+        finalize_turn_from_terminal(&mut agent, "s1", Some("p1"), Some("cancelled"), None, None);
     assert!(
         last_session_event(&agent.scrollback).is_none(),
         "the armed expectation suppresses the marker without wire meta"
@@ -799,24 +558,18 @@ fn driver_arm_records_cancel_trigger_for_reconcile() {
     let outcome = finalize_turn_from_terminal(
         &mut agent,
         "s1",
-        TerminalSignal {
-            prompt_id: Some("p1"),
-            stop_reason: Some("cancelled"),
-            cancel_trigger: Some("send_now"),
-            cancellation_category: Some(HOOK_DENIED_CATEGORY),
-            ..Default::default()
-        },
+        Some("p1"),
+        Some("cancelled"),
+        None,
+        Some("send_now"),
     );
     assert!(matches!(outcome, TerminalApply::ReconcileArmed));
-    let pending = agent
-        .pending_turn_end_reconcile
-        .as_ref()
-        .expect("reconcile must be armed");
-    assert_eq!(pending.cancel_trigger.as_deref(), Some("send_now"));
     assert_eq!(
-        pending.cancellation_category.as_deref(),
-        Some(HOOK_DENIED_CATEGORY),
-        "the armed pending must park the category for the reconcile sweep"
+        agent
+            .pending_turn_end_reconcile
+            .as_ref()
+            .and_then(|p| p.cancel_trigger.as_deref()),
+        Some("send_now")
     );
 }
 

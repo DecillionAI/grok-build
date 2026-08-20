@@ -93,7 +93,8 @@ async fn run_rg_search(
     }
 
     command.arg("--").arg(search_path);
-    crate::util::detach_search_command(&mut command);
+    crate::util::detach_command(&mut command);
+    command.stdin(std::process::Stdio::null());
 
     let output = timeout(COMMAND_TIMEOUT, command.output())
         .await
@@ -267,8 +268,7 @@ mod tests {
         ctx
     }
     fn rg_available() -> bool {
-        // Probe the resolver the tool uses (hermetic under Bazel), not PATH.
-        StdCommand::new(rg_path())
+        StdCommand::new("rg")
             .arg("--version")
             .output()
             .map(|output| output.status.success())

@@ -85,29 +85,22 @@ fn version_candidates(
     key: &str,
     managed_only: bool,
 ) -> Vec<String> {
-    let crate::config::ConfigLayers {
-        system_managed,
-        managed,
-        user,
-        env_overlay: _,
-        user_requirements,
-        system_requirements,
-        mdm_requirements,
-        campaigns: _,
-    } = layers;
     [
-        cli_version_from_toml(system_managed, key),
-        cli_version_from_toml(managed, key),
+        cli_version_from_toml(&layers.system_managed, key),
+        cli_version_from_toml(&layers.managed, key),
         (!managed_only)
-            .then(|| cli_version_from_toml(user, key))
+            .then(|| cli_version_from_toml(&layers.user, key))
             .flatten(),
-        user_requirements
+        layers
+            .user_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
-        system_requirements
+        layers
+            .system_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
-        mdm_requirements
+        layers
+            .mdm_requirements
             .as_ref()
             .and_then(|l| cli_version_from_toml(l, key)),
     ]

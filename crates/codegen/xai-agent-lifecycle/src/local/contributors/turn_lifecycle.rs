@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 
 use crate::send::contributors::turn_lifecycle::{
-    InputPolicy, TurnAbortInput, TurnDoneInput, TurnErrorInput, TurnLifecycleContributor,
-    TurnStartInput,
+    TurnAbortInput, TurnDoneInput, TurnErrorInput, TurnLifecycleContributor, TurnStartInput,
 };
 
 /// `?Send` twin of [`TurnLifecycleContributor`] for single-threaded hosts like grok build's TUI
@@ -11,10 +10,6 @@ use crate::send::contributors::turn_lifecycle::{
 #[async_trait(?Send)]
 pub trait LocalTurnLifecycleContributor {
     async fn on_turn_start(&self, _input: &TurnStartInput) {}
-
-    async fn on_turn_start_with_policy(&self, input: &TurnStartInput, _policy: InputPolicy) {
-        self.on_turn_start(input).await;
-    }
 
     async fn on_turn_done(&self, _input: &TurnDoneInput) {}
 
@@ -29,10 +24,6 @@ pub trait LocalTurnLifecycleContributor {
 impl<T: TurnLifecycleContributor> LocalTurnLifecycleContributor for T {
     async fn on_turn_start(&self, input: &TurnStartInput) {
         TurnLifecycleContributor::on_turn_start(self, input).await;
-    }
-
-    async fn on_turn_start_with_policy(&self, input: &TurnStartInput, policy: InputPolicy) {
-        TurnLifecycleContributor::on_turn_start_with_policy(self, input, policy).await;
     }
 
     async fn on_turn_done(&self, input: &TurnDoneInput) {

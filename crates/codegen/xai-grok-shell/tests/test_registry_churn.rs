@@ -27,7 +27,6 @@ struct Counts {
     resident_resources: usize,
     retained_resources: usize,
     dispatch_locks: usize,
-    live_orphan_heal_locks: usize,
     session_turn_numbers: usize,
     permission_event_receivers: usize,
     model_unavailable_sessions: usize,
@@ -37,7 +36,6 @@ struct Counts {
     subagent_pending: usize,
     subagent_active: usize,
     subagent_completed: usize,
-    subagent_queued: usize,
     workspace_bindings: Option<usize>,
     workspace_activity_sessions: Option<usize>,
 }
@@ -114,10 +112,9 @@ fn session_churn_returns_registry_snapshot_to_baseline() {
             (
                 baseline.subagent_pending,
                 baseline.subagent_active,
-                baseline.subagent_completed,
-                baseline.subagent_queued
+                baseline.subagent_completed
             ),
-            (0, 0, 0, 0),
+            (0, 0, 0),
             "baseline must have no subagent entries"
         );
         for i in 1..=CHURN_SESSIONS {

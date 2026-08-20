@@ -666,7 +666,7 @@ These flags supplement the [Command-Line Options](#command-line-options) table a
 | `--system-prompt-override`    | Override the agent's system prompt                |
 | `--no-plan`                   | Disable plan mode                                 |
 | `--no-subagents`              | Disable subagent spawning                         |
-| `GROK_MEMORY=0`                | Disable cross-session memory for the process      |
+| `--no-memory`                 | Disable cross-session memory                      |
 | `--disable-web-search`        | Disable web search and fetch tools                |
 | `--no-alt-screen`             | Run inline (no alternate screen)                  |
 | `--worktree [NAME]`           | Start session in a new git worktree               |

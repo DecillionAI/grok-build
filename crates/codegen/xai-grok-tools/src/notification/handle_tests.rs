@@ -1,10 +1,8 @@
 use super::*;
-use crate::notification::ScheduledTaskRemovedReason;
 
 fn removed(task_id: &str) -> ScheduledTaskRemoved {
     ScheduledTaskRemoved {
         task_id: task_id.into(),
-        reason: ScheduledTaskRemovedReason::Deleted,
         generation: String::new(),
         revision: 0,
     }

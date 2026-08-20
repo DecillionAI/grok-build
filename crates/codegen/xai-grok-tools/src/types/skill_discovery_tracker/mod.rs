@@ -8,7 +8,6 @@
 
 mod conditional;
 mod listing;
-mod skill_path_suggestion;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -145,8 +144,7 @@ pub struct SkillManager {
 
     /// Every skill name from session-start discovery, set once by
     /// `ToolRegistryBuilder::finalize` from the unfiltered
-    /// `SessionContext.skills` and never rewritten by later seeds or
-    /// baseline reloads. The `paths:` gate never applies here.
+    /// `SessionContext.skills`. The `paths:` gate never applies here.
     discovery_snapshot_names: Vec<String>,
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager-bin"
-version = "1.0.6"
+version = "0.2.120"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -48,8 +48,6 @@ serde_json = { workspace = true }
 dunce = { workspace = true }
 semver = { workspace = true }
 xai-tty-utils = { workspace = true }
-# `collect_crashed()` for the startup crash notice.
-xai-grok-active-sessions = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 rustls = { version = "0.23", default-features = false, features = [
@@ -83,7 +81,6 @@ serial_test = { workspace = true }
 # `PagerArgs::try_parse_from` in the CLI-parsing unit tests (needs the
 # `clap::Parser` trait in scope).
 clap = { workspace = true, features = ["derive"] }
-tempfile = { workspace = true }
 
 [features]
 default = [
@@ -98,6 +95,4 @@ default-bazel = [
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc-ctl"]
 sandbox-enforce = ["xai-grok-pager/sandbox-enforce"]
 local-workspace = ["xai-grok-pager/local-workspace"]
-release-dist = [
-    "xai-grok-pager/release-dist",
-    ]
+release-dist = ["xai-grok-pager/release-dist"]

@@ -493,7 +493,7 @@ impl S3StorageClient {
             ProbeFailed,
         }
 
-        let outcomes: Vec<PathOutcome> = futures::stream::iter(owned_paths)
+        let outcomes: Vec<PathOutcome> = futures::stream::iter(owned_paths.into_iter())
             .map(|path| async move {
                 match client.head_object().bucket(bucket).key(&path).send().await {
                     Ok(_) => PathOutcome::Exists(path),

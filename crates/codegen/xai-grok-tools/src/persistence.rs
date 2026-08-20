@@ -22,10 +22,11 @@ use crate::types::resources::Resources;
 /// architecture. During migration both coexist; once all tools are migrated,
 /// `ToolStatePersistence` will be deleted.
 pub struct ResourcesPersistence {
-    /// `None` means this handle reads and writes nothing.
-    state_path: Option<PathBuf>,
+    /// Path to the JSON file where Resources state is persisted
+    state_path: PathBuf,
     /// Channel to send serialized state to the background writer
     tx: tokio::sync::mpsc::UnboundedSender<ResourcesPersistenceCommand>,
+    noop: bool,
 }
 
 #[cfg(test)]
@@ -46,13 +47,13 @@ enum ResourcesPersistenceCommand {
 }
 
 impl ResourcesPersistence {
-    /// A handle that reads and writes nothing.
-    /// For tests, and for sessions with no state directory, which keep their resources in memory for the life of the session.
+    /// Construct a noop persistence handle for tests. No background task.
     pub fn noop() -> Self {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            state_path: None,
+            state_path: PathBuf::from("/dev/null"),
             tx,
+            noop: true,
         }
     }
 
@@ -79,8 +80,9 @@ impl ResourcesPersistence {
         });
         (
             Self {
-                state_path: Some(PathBuf::from("/dev/null")),
+                state_path: PathBuf::from("/dev/null"),
                 tx,
+                noop: false,
             },
             observed_rx,
         )
@@ -96,8 +98,9 @@ impl ResourcesPersistence {
         });
 
         Self {
-            state_path: Some(state_path),
+            state_path,
             tx,
+            noop: false,
         }
     }
 
@@ -106,13 +109,9 @@ impl ResourcesPersistence {
     /// Reads the JSON, parses it into the nested `HashMap<String, HashMap<String, Value>>`
     /// shape that `Resources::load_from()` expects, and applies it to the given resources.
     ///
-    /// Returns `true` if state was loaded, `false` if there is no path, no file, or a parse error.
+    /// Returns `true` if state was loaded, `false` if no file or parse error.
     pub fn load(&self, resources: &mut Resources) -> bool {
-        let Some(state_path) = self.state_path.as_ref() else {
-            return false;
-        };
-
-        let json = match std::fs::read_to_string(state_path) {
+        let json = match std::fs::read_to_string(&self.state_path) {
             Ok(s) => s,
             Err(_) => return false,
         };
@@ -120,7 +119,11 @@ impl ResourcesPersistence {
         let top: serde_json::Value = match serde_json::from_str(&json) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to parse resources state from {state_path:?}: {e}");
+                tracing::warn!(
+                    "Failed to parse resources state from {:?}: {}",
+                    self.state_path,
+                    e
+                );
                 return false;
             }
         };
@@ -128,7 +131,10 @@ impl ResourcesPersistence {
         let data = match Self::value_to_nested_map(top) {
             Some(m) => m,
             None => {
-                tracing::warn!("Resources state file {state_path:?} has unexpected shape");
+                tracing::warn!(
+                    "Resources state file {:?} has unexpected shape",
+                    self.state_path
+                );
                 return false;
             }
         };
@@ -140,7 +146,7 @@ impl ResourcesPersistence {
     /// Save the current Resources state (non-blocking).
     /// Sends a serialized snapshot to the background writer.
     pub fn save(&self, resources: &Resources) {
-        if self.state_path.is_none() {
+        if self.noop {
             return;
         }
         let snapshot = resources.serialize();
@@ -152,7 +158,7 @@ impl ResourcesPersistence {
         &self,
         snapshot: serde_json::Value,
     ) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
-        if self.state_path.is_none() {
+        if self.noop {
             let (respond_to, response) = tokio::sync::oneshot::channel();
             let _ = respond_to.send(Ok(()));
             return Ok(response);
@@ -189,14 +195,14 @@ impl ResourcesPersistence {
         Self::await_save_and_flush(self.enqueue_save_and_flush(snapshot)?).await
     }
 
-    /// `None` when this handle writes nothing.
-    pub fn state_path(&self) -> Option<&std::path::Path> {
-        self.state_path.as_deref()
+    /// Path to the persisted state file.
+    pub fn state_path(&self) -> &std::path::Path {
+        &self.state_path
     }
 
     /// Flush pending writes. Call on graceful shutdown.
     pub async fn flush(&self) {
-        if self.state_path.is_none() {
+        if self.noop {
             return;
         }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -333,18 +339,10 @@ impl ResourcesPersistence {
 
     #[cfg(not(windows))]
     async fn publish_durable(path: &Path, tmp_path: &Path) -> io::Result<()> {
-        // A bare filename has an empty parent, so the write would land in the server's own directory, shared by every session.
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "resources state has no parent directory",
-                )
-            })?;
-
         Self::replace_state_path(path, tmp_path).await?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "resources state has no parent")
+        })?;
         tokio::fs::File::open(parent).await?.sync_all().await
     }
 
@@ -657,29 +655,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(target).unwrap(), "new");
     }
 
-    /// A bare filename would land in the server's own directory, shared by every session.
-    #[cfg(not(windows))]
     #[tokio::test]
-    async fn durable_write_refuses_a_path_with_no_directory() {
-        let error = ResourcesPersistence::publish_durable(
-            Path::new("resources_state.json"),
-            Path::new("resources_state.json.tmp"),
-        )
-        .await
-        .expect_err("a bare filename must not publish");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[tokio::test]
-    async fn noop_persistence_neither_reads_nor_writes() {
-        let noop = ResourcesPersistence::noop();
-
-        noop.save_and_flush(serde_json::json!({"state": {}}))
+    async fn noop_save_and_flush_acknowledges_without_writing() {
+        ResourcesPersistence::noop()
+            .save_and_flush(serde_json::json!({"state": {}}))
             .await
             .unwrap();
-
-        assert!(noop.state_path().is_none());
-        assert!(!noop.load(&mut Resources::new()));
     }
 }

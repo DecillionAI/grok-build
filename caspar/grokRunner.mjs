@@ -410,33 +410,68 @@ export const DEFAULT_BUILTIN_FS_TOOLS = [
 // on regardless of an allowlist, but a deny list would still strip them.
 
 /**
+ * The built-ins that read the CLI's OWN local container instead of routing
+ * through the sandbox backends, and so must stay denied even when the sandbox
+ * is active:
+ *
+ *   - `list_dir` walks the local disk with `ignore::WalkBuilder`.
+ *   - `glob` / `grep` (and the `grep_files` / `hashline_grep` variants) spawn a
+ *     LOCAL `rg` process.
+ *
+ * Unlike `bash` / `read_file` / `write` / `edit` / `apply_patch` and the task
+ * family — which the Rust `SandboxTerminalBackend` + `SandboxFileSystem` proxy
+ * to the space's shared VM — these never touch those traits. Left on, they would
+ * show the agent its private, empty workspace instead of the sandbox. Denying
+ * them forces every directory listing / search onto the sandbox too (the agent
+ * uses `bash` `ls` / `find` / `rg`, which route to the VM). This is a strict
+ * subset of `DEFAULT_BUILTIN_FS_TOOLS`, so it can never leave a grok tool
+ * requirement unsatisfiable, and it deliberately keeps the task family enabled.
+ */
+export const SANDBOX_LOCAL_FS_READERS = [
+  "list_dir",
+  "glob",
+  "grep",
+  "grep_files",
+  "hashline_grep",
+];
+
+/**
  * Which built-in tools to deny for this run.
  *
  * Two modes:
  *
  *   1. **Sandbox backend active** (`opts.sandboxActive === true`): grok's
- *      built-in `bash` / `read_file` / `edit` / `list_dir` / `glob` / `grep` /
- *      `task` / `get_task_output` / `kill_task` / … route to the space's
- *      shared sandbox through the Rust `SandboxTerminalBackend` +
- *      `SandboxFileSystem`. Nothing needs disabling — they are literally the
- *      way the agent reaches the sandbox now. Returning `[]` also unblocks
- *      the `task` tool's requirement on `get_task_output` + `kill_task`,
- *      which the old deny list stripped and which caused
+ *      `bash` / `read_file` / `write` / `edit` / `apply_patch` and the task
+ *      family (`task` / `get_task_output` / `kill_task` / …) route to the
+ *      space's shared sandbox through the Rust `SandboxTerminalBackend` +
+ *      `SandboxFileSystem`, so they stay ON — they ARE the sandbox now, and
+ *      keeping them enabled also satisfies the `task` tool's requirement on
+ *      `get_task_output` + `kill_task` (denying those caused
  *      "Requirements unsatisfied: [RequirementError { tool: GrokBuild:task }]"
- *      at session init.
+ *      at session init). But `list_dir` / `glob` / `grep` do NOT route through
+ *      those backends — they read the CLI's own local container — so they stay
+ *      denied (`SANDBOX_LOCAL_FS_READERS`) to keep the private workspace out of
+ *      the agent's view. Every listing/search then goes to the sandbox via
+ *      `bash`.
  *
  *   2. **No sandbox** (self-tests, local dev): keep the legacy behaviour —
  *      deny the whole shell + filesystem set so an agent never does throwaway
  *      work inside its private container that its teammates never see. This
  *      is the pre-sandbox-backend behaviour.
  *
- * `GROK_CREATURE_FORCE_SANDBOX_FS=0` turns the enforcement off entirely;
- * `GROK_CREATURE_DISALLOWED_TOOLS` overrides the exact list.
+ * `GROK_CREATURE_FORCE_SANDBOX_FS=0` turns the no-sandbox enforcement off
+ * entirely; `GROK_CREATURE_SANDBOX_DENY_LOCAL_SEARCH=0` reverts the sandbox
+ * path to enabling every built-in; `GROK_CREATURE_DISALLOWED_TOOLS` overrides
+ * the exact list in either mode.
  */
 export function disallowedBuiltinTools({ env = process.env, sandboxActive = false } = {}) {
-  if (sandboxActive) return [];
-  if (!creatureFlag("FORCE_SANDBOX_FS", true, env)) return [];
   const override = creatureList("DISALLOWED_TOOLS", env);
+  if (sandboxActive) {
+    if (!creatureFlag("SANDBOX_DENY_LOCAL_SEARCH", true, env)) return [];
+    if (override.length) return override;
+    return [...SANDBOX_LOCAL_FS_READERS];
+  }
+  if (!creatureFlag("FORCE_SANDBOX_FS", true, env)) return [];
   if (override.length) return override;
   return [...DEFAULT_BUILTIN_FS_TOOLS];
 }

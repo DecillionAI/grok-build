@@ -1,6 +1,5 @@
 //! Tests for session create, exit, trust, startup actions, worktree creation, and cloud lifecycle.
 use super::*;
-use crate::app::dispatch::session::lifecycle::dispatch_accept_consent;
 /// Simulate a release-stamped build so folder-trust is active (a local/dev
 /// build auto-trusts and persists nothing). Mirrors this module's raw env idiom.
 fn simulate_release_build() {
@@ -339,47 +338,6 @@ fn worktree_session_created_sets_session_and_cwd() {
     assert_eq!(app.agents[&id].session.cwd, session_cwd);
     assert_eq!(app.agents[&id].scrollback.len(), 1);
     assert!(app.agents[&id].session.state.is_idle());
-}
-#[test]
-fn worktree_session_created_clears_sticky_branch_from_main_repo() {
-    let mut app = test_app_git();
-    dispatch(
-        Action::NewWorktreeSession {
-            load_session_id: None,
-            label: None,
-            git_ref: None,
-        },
-        &mut app,
-    );
-    let id = AgentId(0);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.current_branch = Some("main-random".into());
-        agent.main_repo = Some("~/old-main".into());
-        agent.is_worktree = false;
-    }
-    let worktree_path = PathBuf::from("/tmp/grok-worktrees/pager-sticky");
-    let session_cwd = worktree_path.clone();
-    dispatch(
-        Action::TaskComplete(TaskResult::WorktreeSessionCreated {
-            agent_id: id,
-            session_id: acp::SessionId::new("wt-sticky-1"),
-            worktree_path,
-            session_cwd: session_cwd.clone(),
-            models: None,
-            scheduler_background_loops: None,
-        }),
-        &mut app,
-    );
-    let agent = &app.agents[&id];
-    assert!(
-        agent.current_branch.is_none(),
-        "sticky main-repo branch must not survive the worktree cwd switch"
-    );
-    assert!(agent.main_repo.is_none());
-    assert!(agent.is_worktree);
-    assert!(agent.session.is_worktree);
-    assert_eq!(agent.session.cwd, session_cwd);
 }
 #[test]
 fn worktree_session_preserves_subdirectory_offset() {
@@ -1160,170 +1118,6 @@ fn session_startup_allowed_requires_auth_and_trust() {
         "both pending must block session startup",
     );
 }
-fn painted_notice(id: &str, version: i32) -> crate::app::consent::ConsentState {
-    use crate::app::consent::{ConsentLegibility, ConsentNotice, ConsentSegment, ConsentState};
-    ConsentState::Pending {
-        notice: ConsentNotice {
-            id: id.to_string(),
-            version,
-            title: "Updated terms".to_string(),
-            segments: vec![ConsentSegment::Text("Review them.".to_string())],
-            links: Vec::new(),
-            accept_label: "Got it".to_string(),
-        },
-        legibility: ConsentLegibility::Painted,
-        painted_at: Some(std::time::Instant::now()),
-    }
-}
-/// An unanswered notice must not let a buffered `a` reach the composer.
-#[test]
-fn session_startup_and_typeahead_require_consent() {
-    let mut app = test_app();
-    assert!(app.session_startup_allowed());
-    assert!(app.ready_for_startup_typeahead());
-    app.consent_state = painted_notice("tos-2026", 1);
-    assert!(
-        !app.session_startup_allowed(),
-        "a pending notice must block session startup",
-    );
-    assert!(
-        !app.ready_for_startup_typeahead(),
-        "keys typed before the notice must not be replayed into it",
-    );
-}
-/// An acceptance must never cover text that did not reach the screen, so the renderer's verdict
-/// gates the dispatch, not just the key.
-#[test]
-fn accept_is_refused_until_the_notice_paints() {
-    use crate::app::consent::{ConsentLegibility, ConsentState};
-    let mut app = test_app();
-    app.consent_state = painted_notice("tos-2026", 1);
-    if let ConsentState::Pending { legibility, .. } = &mut app.consent_state {
-        *legibility = ConsentLegibility::Illegible;
-    }
-    let effects = dispatch_accept_consent(&mut app);
-    assert!(effects.is_empty());
-    assert!(
-        matches!(app.consent_state, ConsentState::Pending { .. }),
-        "an unread notice must stay pending",
-    );
-}
-#[test]
-fn accepting_records_the_answer_and_replays_deferred_startup() {
-    use crate::app::consent::ConsentState;
-    let mut app = test_app();
-    app.account_email = Some("user@example.com".to_string());
-    app.consent_state = painted_notice("tos-2026", 3);
-    app.deferred_startup.session =
-        Some(crate::app::session_startup::DeferredSessionStartup::Load {
-            session_id: "deferred-session".into(),
-            session_cwd: None,
-            chat_kind: false,
-        });
-    let effects = dispatch_accept_consent(&mut app);
-    assert!(matches!(app.consent_state, ConsentState::Done));
-    assert_eq!(
-        app.consent_answered,
-        Some(("tos-2026".to_string(), 3)),
-        "the answer must hold for this run even if the write is slow",
-    );
-    assert!(effects.iter().any(|e| matches!(
-        e,
-        Effect::PersistConsentAnswer { account, notice_id, version, acked }
-            if account.as_deref() == Some("user@example.com")
-                && notice_id == "tos-2026"
-                && *version == 3
-                && !acked
-    )));
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::RecordConsentUpstream { .. })),
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::LoadSession { .. })),
-        "deferred startup must replay once the notice is answered",
-    );
-    assert!(app.deferred_startup.session.is_none());
-}
-/// An api key carries no email, so an answer written under it would be filed against nobody and
-/// would overwrite the answer of whoever signed in on this machine. Both writes have to skip it.
-#[test]
-fn an_api_key_run_writes_no_answer_on_either_path() {
-    let mut app = test_app();
-    app.account_email = None;
-    app.consent_state = painted_notice("tos-2026", 3);
-    let accepted = dispatch_accept_consent(&mut app);
-    assert!(
-        !accepted
-            .iter()
-            .any(|e| matches!(e, Effect::PersistConsentAnswer { .. })),
-        "an answer under no account belongs to nobody",
-    );
-    assert!(
-        accepted
-            .iter()
-            .any(|e| matches!(e, Effect::RecordConsentUpstream { .. })),
-        "the acceptance still has to reach the server",
-    );
-    let acked = dispatch(
-        Action::TaskComplete(TaskResult::ConsentRecorded {
-            notice_id: "tos-2026".to_string(),
-            version: 3,
-        }),
-        &mut app,
-    );
-    assert!(
-        !acked
-            .iter()
-            .any(|e| matches!(e, Effect::PersistConsentAnswer { .. })),
-        "the server ack must not write the answer the accept path refused to",
-    );
-}
-/// The index a click or a number key carries is only worth anything if it reaches the right url.
-#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
-#[test]
-fn a_consent_link_opens_the_url_its_label_stands_for() {
-    use crate::app::consent::{ConsentSegment, ConsentState};
-    let url_file =
-        std::env::temp_dir().join(format!("grok-consent-open-{}.txt", std::process::id()));
-    let _ = std::fs::remove_file(&url_file);
-    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &url_file) };
-    let opened = || std::fs::read_to_string(&url_file).unwrap_or_default();
-    let mut app = test_app();
-    app.consent_state = painted_notice("tos-2026", 3);
-    if let ConsentState::Pending { notice, .. } = &mut app.consent_state {
-        notice.segments = vec![
-            ConsentSegment::Link {
-                index: 0,
-                label: "Terms".to_string(),
-            },
-            ConsentSegment::Link {
-                index: 1,
-                label: "Acceptable Use Policy".to_string(),
-            },
-        ];
-        notice.links = vec![
-            "https://x.ai/legal/tos".to_string(),
-            "https://x.ai/legal/aup".to_string(),
-        ];
-    }
-    dispatch(Action::OpenConsentLink(1), &mut app);
-    assert!(
-        opened().lines().any(|l| l == "https://x.ai/legal/aup"),
-        "the second link must open the second url; got {:?}",
-        opened(),
-    );
-    let _ = std::fs::write(&url_file, "");
-    dispatch(Action::OpenConsentLink(9), &mut app);
-    app.consent_state = ConsentState::Done;
-    dispatch(Action::OpenConsentLink(0), &mut app);
-    assert!(opened().trim().is_empty(), "got {:?}", opened());
-    unsafe { std::env::remove_var("GROK_TEST_OPEN_URL_FILE") };
-    let _ = std::fs::remove_file(&url_file);
-}
 /// Accepting the trust question (its `finish_trust` tail) resolves trust and
 /// replays the deferred startup when auth is already done. (Declining quits
 /// instead -- see `welcome_trust_decline_keys_quit` in `app_view`.)
@@ -1523,11 +1317,6 @@ fn chat_mode_new_session_creates_with_chat_kind() {
             }
         )),
         "expected chat CreateSession under --chat, got {effects:?}"
-    );
-    let agent = app.agents.values().next().expect("agent");
-    assert!(
-        agent.conversation_entry,
-        "sticky --chat NewSession must stamp conversation_entry for rename kind"
     );
 }
 /// Atomicity: when several startup intents coexist (e.g. CLI
@@ -2265,46 +2054,6 @@ fn delete_current_session_confirm_emits_effect() {
             }) if session_id == "sess-current"
         ),
         "got {effects:?}"
-    );
-}
-/// Reverting session-delete kills to the wire default (`ClientUi`) would auto-wake.
-#[test]
-fn delete_current_session_kills_bg_tasks_as_teardown() {
-    use xai_grok_shell::extensions::task::TaskKillSource;
-    let mut app = test_app_with_agent();
-    {
-        let a = app.agents.get_mut(&AgentId(0)).unwrap();
-        a.session.session_id = Some(acp::SessionId::new("sess-del"));
-        a.session.cwd = std::path::PathBuf::from("/repo");
-        a.session
-            .bg_tasks
-            .insert("bg-del".into(), super::super::make_bg_task("bg-del"));
-    }
-    assert!(dispatch(Action::DeleteCurrentSession, &mut app).is_empty());
-    let effects = dispatch(
-        Action::DeleteCurrentSessionAnswered { confirmed: true },
-        &mut app,
-    );
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::KillBgTask {
-                task_id,
-                source: TaskKillSource::Teardown,
-                ..
-            } if task_id == "bg-del"
-        )),
-        "session delete must emit Teardown, got {effects:?}"
-    );
-    assert!(
-        !effects.iter().any(|e| matches!(
-            e,
-            Effect::KillBgTask {
-                source: TaskKillSource::ClientUi,
-                ..
-            }
-        )),
-        "session delete must not emit ClientUi, got {effects:?}"
     );
 }
 #[test]
@@ -3272,8 +3021,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3319,8 +3066,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3380,8 +3125,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let _ = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3419,8 +3162,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3465,8 +3206,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3510,8 +3249,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3558,8 +3295,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3633,8 +3368,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3708,8 +3441,6 @@ mod welcome_workspace_mode {
             branch: None,
             repo_name: String::new(),
             worktree_label: None,
-            last_turn_summary: None,
-            last_recap: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);

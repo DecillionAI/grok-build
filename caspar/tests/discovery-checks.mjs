@@ -20,8 +20,9 @@
 import assert from "node:assert/strict";
 
 import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
-import { DEFAULT_BUILTIN_FS_TOOLS, disallowedBuiltinTools } from "../grokRunner.mjs";
+import { DEFAULT_BUILTIN_FS_TOOLS, SANDBOX_LOCAL_FS_READERS, disallowedBuiltinTools } from "../grokRunner.mjs";
 import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
+import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
 import { FakeGateway } from "./fakeGateway.mjs";
@@ -202,6 +203,81 @@ async function main() {
     const noSb = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: [], disabledBuiltins: denied });
     assert.ok(/NO LOCAL SHELL OR FILESYSTEM/i.test(noSb));
     assert.ok(/DISABLED/i.test(noSb));
+  });
+
+  await check("with the sandbox backend active, only the local-disk search tools are denied", () => {
+    const denied = disallowedBuiltinTools({ env: {}, sandboxActive: true });
+    // Exactly the tools that read the CLI's own container (never the backends).
+    assert.deepEqual(denied, SANDBOX_LOCAL_FS_READERS);
+    for (const off of ["list_dir", "glob", "grep", "grep_files", "hashline_grep"]) {
+      assert.ok(denied.includes(off), `${off} must stay denied under the sandbox — it reads local disk`);
+    }
+    // Everything that DOES route through SandboxTerminalBackend / SandboxFileSystem
+    // stays enabled — those built-ins ARE the sandbox now.
+    for (const keep of ["bash", "run_terminal_cmd", "read_file", "read", "write", "edit", "search_replace", "apply_patch"]) {
+      assert.ok(!denied.includes(keep), `${keep} must stay enabled under the sandbox (routes to the VM)`);
+    }
+    // The background-task family stays ON so grok's `task` requirement on
+    // get_task_output + kill_task is satisfied (denying them broke session init).
+    for (const fam of ["task", "get_task_output", "kill_task", "wait_tasks", "monitor"]) {
+      assert.ok(!denied.includes(fam), `${fam} must stay enabled under the sandbox (task requirement)`);
+    }
+    // The denied set is a strict subset of the no-sandbox deny list, so it can
+    // never make a grok tool requirement newly unsatisfiable.
+    for (const t of denied) {
+      assert.ok(DEFAULT_BUILTIN_FS_TOOLS.includes(t), `${t} is a subset of the no-sandbox deny list`);
+    }
+    // Operator escapes: fully re-enable, or override the exact list.
+    assert.deepEqual(disallowedBuiltinTools({ env: { GROK_CREATURE_SANDBOX_DENY_LOCAL_SEARCH: "0" }, sandboxActive: true }), []);
+    assert.deepEqual(
+      disallowedBuiltinTools({ env: { GROK_CREATURE_DISALLOWED_TOOLS: "glob, foo" }, sandboxActive: true }),
+      ["glob", "foo"],
+    );
+  });
+
+  await check("prewarm spawns each tool/agent container once, sandbox via start, no prompts", () => {
+    const calls = [];
+    const invoker = { invoke: (name, args) => { calls.push({ name, args }); return Promise.resolve({ ok: true }); } };
+    const toolDefs = [
+      { name: "sandbox" },
+      { name: "web_search" },
+      { name: "researcher" },   // an agent
+      { name: "dashboard" },    // a frontend — skipped
+      { name: "generate_media" }, // in-process, no machine — skipped
+      { name: "sandbox_dup" },  // shares the sandbox's target — deduped
+    ];
+    const byName = new Map([
+      ["sandbox", { name: "sandbox", kind: "tool", program_id: "px-sandbox", defaults: { space_id: "s1" } }],
+      ["web_search", { name: "web_search", kind: "tool", program_id: "px-web" }],
+      ["researcher", { name: "researcher", kind: "agent", program_id: "px-research" }],
+      ["dashboard", { name: "dashboard", kind: "frontend", program_id: "px-front" }],
+      ["generate_media", { name: "generate_media", kind: "media" }],
+      ["sandbox_dup", { name: "sandbox_dup", kind: "tool", program_id: "px-sandbox" }],
+    ]);
+    const fired = prewarmToolContainers(invoker, toolDefs, byName, { sandboxToolName: "sandbox" });
+
+    // One warm per distinct target: sandbox, web_search, researcher. Frontend,
+    // media (no machine), and the duplicate sandbox target are all skipped.
+    assert.deepEqual(fired.map((f) => f.tool).sort(), ["researcher", "sandbox", "web_search"]);
+    assert.equal(calls.length, 3);
+    const bySandbox = calls.find((c) => c.name === "sandbox");
+    assert.equal(bySandbox.args.function, "start", "sandbox is warmed with start (boots the VM too)");
+    for (const other of ["web_search", "researcher"]) {
+      const c = calls.find((x) => x.name === other);
+      assert.equal(c.args.function, WARM_FUNCTION, `${other} warmed with the reserved no-op function`);
+    }
+    // Critically: no warm carries an objective/prompt/skill, so an agent proxy's
+    // decodeTaskSignal drops it (no LLM run).
+    for (const c of calls) {
+      for (const k of ["objective", "prompt", "skill"]) {
+        assert.ok(!(k in c.args), `warm args must not carry ${k}`);
+      }
+    }
+    // Master switch off → nothing fired.
+    const noneFired = prewarmToolContainers(invoker, toolDefs, byName, { sandboxToolName: "sandbox", env: { GROK_CREATURE_PREWARM_TOOLS: "0" } });
+    assert.deepEqual(noneFired, []);
+    // A null invoker (no bridge) is a safe no-op.
+    assert.deepEqual(prewarmToolContainers(null, toolDefs, byName, {}), []);
   });
 
   // ── live fetch over the real gateway wire ──────────────────────────────────

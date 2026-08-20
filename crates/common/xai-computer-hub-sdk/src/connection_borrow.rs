@@ -13,7 +13,6 @@ use xai_tool_protocol::ConnectionKind;
 use crate::auth::AuthProvider;
 use crate::connection::{
     ConnectCallback, ConnectionTuning, DisconnectCallback, HubConnection, ReconnectCallback,
-    TerminalCloseCallback,
 };
 use crate::error::ClientError;
 use crate::pool::HubConnectionPool;
@@ -53,7 +52,6 @@ impl ConnectionBorrow {
         on_reconnect: Option<Arc<ReconnectCallback>>,
         on_disconnect: Option<Arc<DisconnectCallback>>,
         on_connect: Option<Arc<ConnectCallback>>,
-        on_terminal_close: Option<Arc<TerminalCloseCallback>>,
         server_id: Option<xai_tool_protocol::ServerId>,
         server_description: Option<String>,
         server_metadata: Option<serde_json::Value>,
@@ -69,7 +67,6 @@ impl ConnectionBorrow {
                 on_reconnect,
                 on_disconnect,
                 on_connect,
-                on_terminal_close,
                 server_id,
                 server_description,
                 server_metadata,
@@ -170,7 +167,6 @@ mod tests {
             None, // on_reconnect
             None, // on_disconnect
             None, // on_connect
-            None, // on_terminal_close
             None, // server_id
             None, // server_description
             None, // server_metadata

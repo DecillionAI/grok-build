@@ -362,9 +362,7 @@ impl AgentBuilder {
     /// Mark this session as non-interactive (headless / SDK / stdio /
     /// generic-ACP). Suppresses prompt sections that only make sense when
     /// a human is typing into the TUI prompt input (e.g. the `! <command>`
-    /// shell-prefix tip and the `<user_guide>` TUI pointer), and stamps
-    /// `non_interactive` into the ask_user_question params so an unanswered
-    /// questionnaire returns no-operator text instead of "user declined".
+    /// shell-prefix tip and the `<user_guide>` TUI pointer).
     pub fn with_is_non_interactive(mut self, value: bool) -> Self {
         self.is_non_interactive = value;
         self
@@ -561,15 +559,14 @@ impl AgentBuilder {
         self.task_model_slugs = slugs;
         self
     }
-    /// Enable or disable the `ask_user_question` tool for a primary agent.
+    /// Enable or disable the `ask_user_question` tool.
     ///
-    /// Subagents never receive this tool. Otherwise, when disabled,
-    /// `GrokBuild:ask_user_question` is stripped from the agent's tool config
-    /// after `ensure_plan_mode_tools` injection, so the model cannot ask the
-    /// user structured questions regardless of which built-in profile is in
-    /// use. Driven by the shell's resolved gate (the `ask_user_question`
-    /// feature, default ON: remote settings/config/env act as a kill-switch)
-    /// and/or the pager's `--no-ask-user` (`_meta.askUserQuestion`).
+    /// When disabled, `GrokBuild:ask_user_question` is stripped from the
+    /// agent's tool config after `ensure_plan_mode_tools` injection, so
+    /// the model cannot ask the user structured questions regardless of
+    /// which built-in profile is in use. Driven by the shell's resolved gate
+    /// (`resolve_ask_user_question`, default ON — remote settings/config/env act as
+    /// a kill-switch) and/or the pager's `--no-ask-user` (`_meta.askUserQuestion`).
     pub fn with_ask_user_question_enabled(mut self, enabled: bool) -> Self {
         self.ask_user_question_enabled = enabled;
         self
@@ -782,16 +779,12 @@ impl AgentBuilder {
                 .tools
                 .retain(|tc| tc.id != mem_search_id && tc.id != mem_get_id);
         }
-        if self.prompt_audience == crate::prompt::context::PromptAudience::Subagent {
-            tool_config
-                .tools
-                .retain(|tool| tool.kind != Some(xai_grok_tools::types::tool::ToolKind::AskUser));
-        } else if !self.ask_user_question_enabled {
+        if !self.ask_user_question_enabled {
             let ask_user_id = format!(
                 "{}:ask_user_question",
                 xai_grok_tools::types::tool::ToolNamespace::GrokBuild,
             );
-            tool_config.tools.retain(|tool| tool.id != ask_user_id);
+            tool_config.tools.retain(|tc| tc.id != ask_user_id);
         }
         apply_workflow_tool_gates(&mut tool_config, self.background_workflows_enabled);
         let task_tool_id = format!(
@@ -878,11 +871,6 @@ impl AgentBuilder {
                 &["GrokBuild:ask_user_question"],
                 ask_params,
             );
-        }
-        if self.is_non_interactive {
-            let mut ni = serde_json::Map::new();
-            ni.insert("non_interactive".into(), serde_json::Value::Bool(true));
-            merge_tool_params(&mut tool_config, &["GrokBuild:ask_user_question"], &ni);
         }
         if !definition.disallowed_tools.is_empty() {
             let before: std::collections::HashSet<String> =
@@ -1170,7 +1158,6 @@ impl AgentBuilder {
             prompt_mode: definition.prompt_mode.clone(),
             audience: self.prompt_audience,
             prompt_body: definition.prompt_body.clone(),
-            include_browser_verification: definition.include_browser_verification(),
             system_prompt: definition.system_prompt.clone(),
             agents_md_files,
             persona_summaries: self.persona_summaries,
@@ -1770,32 +1757,6 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn subagent_audience_never_receives_ask_user_question() {
-        use xai_grok_tools::computer::local::LocalTerminalBackend;
-        use xai_grok_tools::notification::ToolNotificationHandle;
-        let agent = AgentBuilder::new(
-            std::env::temp_dir(),
-            Arc::new(LocalTerminalBackend::new()),
-            ToolNotificationHandle::noop(),
-        )
-        .from_definition(crate::config::AgentDefinition::grok_build_ask_user())
-        .with_ask_user_question_enabled(true)
-        .with_prompt_audience(crate::prompt::context::PromptAudience::Subagent)
-        .build()
-        .await
-        .expect("subagent should build");
-        let names: Vec<String> = agent
-            .tool_definitions()
-            .await
-            .into_iter()
-            .map(|definition| definition.function.name)
-            .collect();
-        assert!(
-            !names.iter().any(|name| name == "ask_user_question"),
-            "subagents must not receive ask_user_question even when their profile and parent gate enable it: {names:?}"
-        );
-    }
-    #[tokio::test]
     async fn curated_empty_toolset_fails_agent_build() {
         use xai_grok_tools::computer::local::LocalTerminalBackend;
         use xai_grok_tools::notification::ToolNotificationHandle;
@@ -1859,33 +1820,6 @@ mod tests {
             .expect("finalize must insert Params for the injected ask_user_question");
         assert_eq!(applied.0.timeout_enabled, Some(false));
         assert_eq!(applied.0.timeout_secs, Some(5));
-        assert_eq!(applied.0.non_interactive, None);
-    }
-    /// A non-interactive build stamps `non_interactive: true` into the AUQ
-    /// params (session state, not user config) so cancel/timeout return the
-    /// no-operator text.
-    #[tokio::test]
-    async fn non_interactive_build_stamps_ask_user_question_params() {
-        use xai_grok_tools::computer::local::LocalTerminalBackend;
-        use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionParams;
-        use xai_grok_tools::notification::ToolNotificationHandle;
-        use xai_grok_tools::types::resources::Params;
-        let agent = AgentBuilder::new(
-            std::env::temp_dir(),
-            Arc::new(LocalTerminalBackend::new()),
-            ToolNotificationHandle::noop(),
-        )
-        .from_definition(crate::config::AgentDefinition::default_grok_build())
-        .with_is_non_interactive(true)
-        .build()
-        .await
-        .expect("agent should build");
-        let applied = agent
-            .tool_bridge()
-            .read_resource::<Params<AskUserQuestionParams>>()
-            .await
-            .expect("finalize must insert Params for the injected ask_user_question");
-        assert_eq!(applied.0.non_interactive, Some(true));
     }
     async fn build_with_tools(tools: Vec<String>, disallowed: Vec<String>) -> crate::agent::Agent {
         use xai_grok_tools::computer::local::LocalTerminalBackend;
@@ -2319,8 +2253,6 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
-            allowed_domains: None,
-            excluded_domains: None,
         })
         .with_web_fetch_config(WebFetchConfig::Enabled {
             params: Default::default(),
@@ -2448,8 +2380,6 @@ mod tests {
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
                 alpha_test_key: None,
-                allowed_domains: None,
-                excluded_domains: None,
             }
         } else {
             WebSearchConfig::Disabled

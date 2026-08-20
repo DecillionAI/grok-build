@@ -53,6 +53,7 @@ import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
+import { prewarmToolContainers } from "./prewarm.mjs";
 import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask } from "./spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
@@ -306,8 +307,14 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
         args: [path.join(HERE, "mcpStdioServer.mjs")],
         env: { CASPAR_TOOL_SOCKET: socketPath },
         startupTimeoutSec: creatureNumber("MCP_STARTUP_TIMEOUT", 60),
+        // grok's per-call MCP ceiling MUST exceed the invoker's own waiter
+        // (`toolInvoker.mjs` DEFAULT_TIMEOUT_SECONDS, same `TOOL_TIMEOUT` var,
+        // default 420) plus margin — otherwise a slow cold spawn (routinely
+        // >1 min, up to the invoker's budget) trips this outer timeout first and
+        // the model is told the tool failed while it is still coming up. Keep the
+        // default aligned at 420 so outer (>=480) always wins over inner (420).
         toolTimeoutSec: Math.max(
-          creatureNumber("TOOL_TIMEOUT", 240) + 60,
+          creatureNumber("TOOL_TIMEOUT", 420) + 60,
           creatureNumber("MEDIA_VIDEO_WAIT_SECONDS", 240) + 60,
         ),
       },
@@ -325,11 +332,32 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     try {
       await sandboxBridge.start();
       extraEnv.GROK_SANDBOX_SOCKET = sandboxSocketPath;
+      // Grok joins model file paths and the default shell cwd onto its LOCAL
+      // session workspace; those paths don't exist in the sandbox VM. Hand the
+      // backends that local root so they rewrite paths under it to
+      // sandbox-relative (served from the sandbox home). Canonicalize to match
+      // the cwd grok itself resolves `--cwd` to.
+      try {
+        extraEnv.GROK_SANDBOX_LOCAL_ROOT = fs.realpathSync(workspace);
+      } catch {
+        extraEnv.GROK_SANDBOX_LOCAL_ROOT = workspace;
+      }
     } catch (err) {
       log("GROK_BOOT", { sandbox_bridge_error: String(err?.message || err) });
       sandboxBridge = null;
     }
   }
+
+  // Cold-spawn latency hiding: every tool/agent runs in its own container the
+  // node spawns on first use (>1 min under gVisor; the sandbox also creates its
+  // VM lazily), which is why a run visibly stalls the first time it reaches for
+  // a tool. Kick those spawns off now, in the background, so they warm while the
+  // model reads history and plans. Best-effort and non-blocking — never awaited,
+  // never fatal. See prewarm.mjs.
+  prewarmToolContainers(invoker, lastToolDefs, byName, {
+    sandboxToolName,
+    log: (info) => log("GROK_PREWARM", info),
+  });
 
   // Tell the model, in its system prompt, about the space's callable tools and
   // sub-agents (by their exact MCP tool names) so it plans with them. Built from
@@ -367,11 +395,13 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   });
   const sharedEnv = sharedEnvDef ? { name: qualify(sharedEnvDef.name), description: sharedEnvDef.description } : undefined;
   // Force shell + filesystem work onto the shared sandbox. Two paths:
-  //  • Sandbox backend active (`sandboxBridge` up): the CLI's built-ins
-  //    `bash`, `read_file`, `edit`, `list_dir`, `glob`, `grep`, `task`,
-  //    `get_task_output`, `kill_task` all route through
-  //    `SandboxTerminalBackend` + `SandboxFileSystem` to the space's shared
-  //    VM. Nothing to disable — the built-ins ARE the sandbox now.
+  //  • Sandbox backend active (`sandboxBridge` up): `bash`, `read_file`,
+  //    `write`, `edit`, `apply_patch` and the task family route through
+  //    `SandboxTerminalBackend` + `SandboxFileSystem` to the space's shared VM
+  //    — the built-ins ARE the sandbox now. The exception is `list_dir` /
+  //    `glob` / `grep`: those read the CLI's own local container (WalkBuilder /
+  //    a locally-spawned rg), never the backends, so they stay denied and the
+  //    agent lists/searches via `bash` (which does route to the VM).
   //  • No sandbox: keep the legacy deny list so the agent can't do throwaway
   //    work inside its private container.
   const sandboxActive = Boolean(sandboxBridge);

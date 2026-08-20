@@ -229,8 +229,7 @@ pub async fn run_startup_recovery(workspace_home: &Path, queue: &UploadQueue) ->
         match outcome {
             EnqueueOutcome::Enqueued
             | EnqueueOutcome::FellBackToInline
-            | EnqueueOutcome::Deduplicated
-            | EnqueueOutcome::Skipped { .. } => {
+            | EnqueueOutcome::Deduplicated => {
                 // The worker owns the original pair from here: it deletes both
                 // files on every terminal outcome, same as a normal enqueue.
                 report.recovered += 1;

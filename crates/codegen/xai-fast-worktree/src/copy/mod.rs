@@ -5,7 +5,6 @@ pub(crate) mod engine;
 pub(crate) mod gitdir;
 pub(crate) mod shard;
 pub(crate) mod skip;
-pub(crate) mod standalone;
 pub(crate) mod types;
 pub(crate) mod worker;
 

@@ -447,9 +447,11 @@ grok [OPTIONS]
 | `--sandbox <PROFILE>`      | OS-level filesystem/network guardrails (see [Sandbox](#sandbox))       |
 | `--light`                  | Use light theme (macOS Basic) instead of dark                          |
 | `--single-turn`            | Exit after first response (requires `--prompt`)                        |
+| `--no-memory`              | Force-disable cross-session memory (overrides all other settings)      |
 | `--subagents`              | Enable subagent/task tool support (see [Subagents](#subagents))        |
 | `--disable-web-search`     | Remove web search tool from the agent toolset                          |
 | `--agent-profile <PATH>`   | Load a custom agent definition file (see [Agent Profiles](#agent-profiles)) |
+| `--experimental-memory`    | Enable cross-session memory persistence (see [Memory](#memory))        |
 | `--allow <RULE>`           | Permission allow rule with glob patterns (repeatable). See [Permission Rules](#permission-rules-allow--deny). |
 | `--deny <RULE>`            | Permission deny rule with glob patterns (repeatable). See [Permission Rules](#permission-rules-allow--deny). |
 
@@ -499,7 +501,7 @@ Type `/` in the input to access commands:
 | `/compact [context]`               |           | Compact conversation history                             |
 | `/always-approve [on\|off]`        | `/yolo`   | Toggle auto-approve mode                                 |
 | `/multiline`                       | `/ml`     | Toggle multiline input mode                              |
-| `/memory [workspace\|global] <text>` |         | Append text to a memory file (requires memory enabled) |
+| `/memory [workspace\|global] <text>` |         | Append text to a memory file (requires `--experimental-memory`) |
 | `/flush`                           |           | Save current session knowledge to memory now             |
 | `/skills [name]`                   |           | List skills or inject a skill into context               |
 | `/plugins [list\|reload\|trust]`   | `/plugin` | Manage plugins (list, reload, trust)                     |
@@ -1336,8 +1338,8 @@ Each feature section below documents its own config. This section covers the gen
 auto_update = true                     # check for updates on launch
 
 [models]
-default = "grok-4.6"                   # model used for new sessions
-web_search = "grok-4.6"                # model used by the web_search tool
+default = "grok-4.5"                   # model used for new sessions
+web_search = "grok-4.5"                # model used by the web_search tool
 
 [ui]
 max_thoughts_width = 120               # max column width for reasoning display
@@ -2084,7 +2086,7 @@ See the [MCP Server Registry](https://github.com/modelcontextprotocol/servers) f
 
 ## Memory
 
-> **Experimental:** enable with `GROK_MEMORY=1`, `[memory] enabled = true`, or managed remote settings.
+> **Experimental:** requires `--experimental-memory` (or `GROK_MEMORY=1` / `[memory] enabled = true` in config).
 
 Cross-session memory lets Grok remember facts, decisions, code patterns, and debugging workflows across separate sessions in the same project.
 
@@ -2102,6 +2104,9 @@ An SQLite index enables fast hybrid search (FTS5 keyword + optional vector KNN) 
 ### Enabling memory
 
 ```bash
+# Per-session flag
+grok --experimental-memory
+
 # Environment variable (persists for the shell session)
 export GROK_MEMORY=1
 grok
@@ -2242,8 +2247,7 @@ restrict_network = true
 # Paths the agent can read but NOT write/delete
 read_only = ["/data"]
 
-# Additional writable paths (literal directory grants — no globs;
-# trailing /** is treated as the parent directory)
+# Additional writable paths
 read_write = ["/tmp/scratch"]
 
 # Paths denied entirely
@@ -2353,7 +2357,7 @@ Grok includes these tools by default:
 | `task`           | Launch subagent sessions (requires `--subagents`)              |
 | `kill_task`      | Terminate a running background task or subagent                |
 | `get_task_output` | Get output and status from a background task or subagent      |
-| `memory_search`  | Search cross-session memory (requires memory enabled) |
+| `memory_search`  | Search cross-session memory (requires `--experimental-memory`) |
 | `memory_get`     | Read a memory file by path                                     |
 | `search_tool`    | Discover available integration tools (MCP)                     |
 | `use_tool`       | Call an integration tool discovered via `search_tool`           |

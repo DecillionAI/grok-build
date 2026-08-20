@@ -34,17 +34,10 @@ fn eligible_or_record_skip(
     crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value)
 }
 
-/// A tool-input rewrite tagged with the hook that produced it.
-pub struct InputRewrite {
-    pub hook_name: String,
-    pub input: serde_json::Value,
-}
-
 /// Result of a `pre_tool_use` dispatch: the final decision plus per-hook
 /// execution details (for scrollback enrichment).
 pub struct PreToolUseResult {
     pub decision: HookDecision,
-    pub updated_input: Option<InputRewrite>,
     pub results: Vec<HookRunResult>,
 }
 
@@ -73,7 +66,6 @@ pub async fn dispatch_pre_tool_use(
     if hooks.is_empty() {
         return PreToolUseResult {
             decision: HookDecision::Allow,
-            updated_input: None,
             results: Vec::new(),
         };
     }
@@ -83,7 +75,6 @@ pub async fn dispatch_pre_tool_use(
 
     let match_value = envelope.payload.match_value().map(str::to_string);
     let mut run_results = Vec::new();
-    let mut updated_input: Option<InputRewrite> = None;
 
     for spec in hooks {
         if !eligible_or_record_skip(spec, match_value.as_deref(), &mut run_results) {
@@ -101,7 +92,7 @@ pub async fn dispatch_pre_tool_use(
             runner::run_hook(spec, envelope, ctx, GateKind::Tool).await;
 
         match result {
-            HookRunnerResult::Deny { reason, .. } => {
+            HookRunnerResult::Decision(HookDecision::Deny { reason, .. }) => {
                 tracing::info!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
@@ -120,25 +111,15 @@ pub async fn dispatch_pre_tool_use(
                         reason,
                         hook_name: spec.name.clone(),
                     },
-                    updated_input: None,
                     results: run_results,
                 };
             }
-            HookRunnerResult::Allow {
-                updated_input: hook_updated_input,
-            } => {
+            HookRunnerResult::Decision(HookDecision::Allow) => {
                 tracing::info!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    updated_input = hook_updated_input.is_some(),
                     "hook allowed"
                 );
-                if let Some(input) = hook_updated_input {
-                    updated_input = Some(InputRewrite {
-                        hook_name: spec.name.clone(),
-                        input,
-                    });
-                }
                 run_results.push(HookRunResult::Success {
                     hook_name: spec.name.clone(),
                     elapsed,
@@ -146,14 +127,10 @@ pub async fn dispatch_pre_tool_use(
                 });
             }
             HookRunnerResult::Failed(err) => {
-                // `hook_failure` (not `error`) on purpose: failure detail can
-                // carry hook-authored stderr text, and `error` is on the OTEL
-                // export allowlist. Remote traces keep their failure signal
-                // via the text-free HookExecuted telemetry event.
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    hook_failure = %err,
+                    error = %err,
                     "hook failed; ignoring (fail-open)"
                 );
                 run_results.push(HookRunResult::Failed {
@@ -181,7 +158,6 @@ pub async fn dispatch_pre_tool_use(
     record_dispatch_counts(&span, &run_results);
     PreToolUseResult {
         decision: HookDecision::Allow,
-        updated_input,
         results: run_results,
     }
 }
@@ -350,12 +326,10 @@ pub async fn dispatch_stop(
                 );
             }
             HookRunnerResult::Failed(err) => {
-                // `hook_failure`, not the exported `error` key (see the
-                // pre_tool_use arm).
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    hook_failure = %err,
+                    error = %err,
                     "stop hook failed; ignoring (fail-open)"
                 );
                 out.results.push(HookRunResult::Failed {
@@ -365,9 +339,7 @@ pub async fn dispatch_stop(
                     http_info,
                 });
             }
-            HookRunnerResult::Success
-            | HookRunnerResult::Allow { .. }
-            | HookRunnerResult::Deny { .. } => {
+            HookRunnerResult::Success | HookRunnerResult::Decision(_) => {
                 out.results.push(HookRunResult::Success {
                     hook_name: spec.name.clone(),
                     elapsed,
@@ -432,12 +404,10 @@ pub async fn dispatch_non_blocking(
                 });
             }
             HookRunnerResult::Failed(err) => {
-                // `hook_failure`, not the exported `error` key (see the
-                // pre_tool_use arm).
                 tracing::warn!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
-                    hook_failure = %err,
+                    error = %err,
                     "hook failed"
                 );
                 results.push(HookRunResult::Failed {
@@ -447,9 +417,7 @@ pub async fn dispatch_non_blocking(
                     http_info,
                 });
             }
-            HookRunnerResult::Allow { .. }
-            | HookRunnerResult::Deny { .. }
-            | HookRunnerResult::Stop(_) => {
+            HookRunnerResult::Decision(_) | HookRunnerResult::Stop(_) => {
                 tracing::info!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
@@ -638,33 +606,6 @@ mod tests {
         let envelope = pre_tool_use_envelope("run_terminal_cmd");
         let result = dispatch_pre_tool_use(&registry, &envelope, &run_ctx()).await;
         assert_eq!(result.decision, HookDecision::Allow);
-    }
-
-    #[tokio::test]
-    async fn pre_tool_use_carries_last_updated_input() {
-        let first = make_command_spec(
-            "first",
-            Some("run_terminal_cmd"),
-            true,
-            "echo '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"one\"}}}'",
-        );
-        let second = make_command_spec(
-            "second",
-            Some("run_terminal_cmd"),
-            true,
-            "echo '{\"hookSpecificOutput\":{\"updatedInput\":{\"command\":\"two\"}}}'",
-        );
-        let registry = registry_from_specs(vec![first, second]);
-        let result = dispatch_pre_tool_use(
-            &registry,
-            &pre_tool_use_envelope("run_terminal_cmd"),
-            &run_ctx(),
-        )
-        .await;
-        assert_eq!(result.decision, HookDecision::Allow);
-        let rewrite = result.updated_input.expect("updatedInput carried");
-        assert_eq!(rewrite.input["command"], "two");
-        assert_eq!(rewrite.hook_name, "second");
     }
 
     #[tokio::test]
@@ -1168,7 +1109,6 @@ mod tests {
             (HookEventName::SessionEnd, "hook.session_end"),
             (HookEventName::Stop, "hook.stop"),
             (HookEventName::StopFailure, "hook.stop_failure"),
-            (HookEventName::StopCancelled, "hook.stop_cancelled"),
             (HookEventName::PostToolUse, "hook.post_tool_use"),
             (
                 HookEventName::PostToolUseFailure,
@@ -1192,7 +1132,6 @@ mod tests {
                 | HookEventName::SessionEnd
                 | HookEventName::Stop
                 | HookEventName::StopFailure
-                | HookEventName::StopCancelled
                 | HookEventName::PreToolUse
                 | HookEventName::PostToolUse
                 | HookEventName::PostToolUseFailure
@@ -1203,7 +1142,7 @@ mod tests {
                 | HookEventName::SubagentStop
                 | HookEventName::SubagentEnd
                 | HookEventName::PreCompact
-                | HookEventName::PostCompact => 16,
+                | HookEventName::PostCompact => 15,
             }
         };
         assert_eq!(

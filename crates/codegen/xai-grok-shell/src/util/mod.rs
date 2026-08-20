@@ -16,7 +16,7 @@ pub(crate) fn is_user_instruction_path(
     path: &std::path::Path,
     grok_home: &std::path::Path,
     vendor_homes: &[(std::path::PathBuf, bool)],
-    workspace_roots: &[&std::path::Path],
+    workspace_root: Option<&std::path::Path>,
 ) -> bool {
     let parent = path.parent();
     let grok_rules = grok_home.join("rules");
@@ -30,8 +30,7 @@ pub(crate) fn is_user_instruction_path(
     if is_exact_home_surface {
         return true;
     }
-    // Both prefixes are workspace because forks mix display-rewritten and on-disk paths.
-    if workspace_roots.iter().any(|root| path.starts_with(root)) {
+    if workspace_root.is_some_and(|root| path.starts_with(root)) {
         return false;
     }
     path.starts_with(grok_home)
@@ -122,13 +121,13 @@ mod is_user_instruction_path_tests {
             Path::new("/repo/config/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
-            &[Path::new("/repo")],
+            Some(Path::new("/repo")),
         ));
         assert!(!is_user_instruction_path(
             Path::new("/repo/config/src/AGENTS.md"),
             Path::new("/repo/config"),
             &[],
-            &[Path::new("/repo")],
+            Some(Path::new("/repo")),
         ));
     }
 
@@ -138,7 +137,7 @@ mod is_user_instruction_path_tests {
             Path::new("/custom/grok/worktrees/repo/src/AGENTS.md"),
             Path::new("/custom/grok"),
             &[],
-            &[Path::new("/custom/grok/worktrees/repo")],
+            Some(Path::new("/custom/grok/worktrees/repo")),
         ));
     }
 }
