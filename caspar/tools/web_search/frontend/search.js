@@ -420,8 +420,115 @@ function isWidgetMode() {
   return ctx().mode === 'widget';
 }
 
+// A message-reply widget instance is seeded with __CTX.data (the tool's JSON
+// answer for a chat command). We render that data as a compact card — an answer
+// with its sources, a results list, or a readable fallback — so a chat command
+// reply is a real widget, never raw JSON text. With no data we fall back to the
+// "tap to search" preview card shown for a bare @tool mention.
+function widgetHead(root, icon, title, sub) {
+  var top = RN.row({ style: { alignItems: 'center', marginBottom: 8 } });
+  top.add(RN.text(icon, { fontSize: 18, style: { marginRight: 8 } }));
+  var col = RN.column({ style: { flex: 1 } });
+  col.add(RN.text(title, { color: T.text, fontSize: 14, fontWeight: '700' }));
+  if (sub != null && sub !== '') {
+    col.add(RN.text(sub, { color: T.muted, fontSize: 11 }));
+  }
+  top.add(col);
+  root.add(top);
+}
+
+function widgetSourceRow(s) {
+  var url = (s != null && s.url != null) ? '' + s.url : '';
+  var title = (s != null && s.title != null && s.title !== '') ? '' + s.title : url;
+  var row = RN.pressable({
+    onPress: linkHandler(url),
+    style: { paddingVertical: 6, borderTopWidth: 1, borderTopColor: T.line }
+  });
+  row.add(RN.text(title, { color: T.link, fontSize: 12, fontWeight: '600' }));
+  if (url !== '') row.add(RN.text(hostOfUrl(url), { color: T.muted, fontSize: 10 }));
+  return row;
+}
+
+function widgetResultRow(r) {
+  var url = (r != null && r.url != null) ? '' + r.url : '';
+  var title = (r != null && r.title != null && r.title !== '') ? '' + r.title : url;
+  var snip = '';
+  if (r != null) {
+    if (r.snippet != null && r.snippet !== '') snip = '' + r.snippet;
+    else if (r.description != null && r.description !== '') snip = '' + r.description;
+  }
+  var row = RN.pressable({
+    onPress: linkHandler(url),
+    style: { paddingVertical: 8, borderTopWidth: 1, borderTopColor: T.line }
+  });
+  row.add(RN.text(title, { color: T.text, fontSize: 13, fontWeight: '600' }));
+  if (url !== '') row.add(RN.text(hostOfUrl(url), { color: T.link, fontSize: 10 }));
+  if (snip !== '') row.add(RN.text(snip, { color: T.muted, fontSize: 11, style: { marginTop: 2 } }));
+  return row;
+}
+
+function buildDataWidget(data, command) {
+  T = theme();
+  var root = RN.column({ style: { flex: 1, backgroundColor: T.bg, padding: 12 } });
+  var answer = (data != null && data.answer != null) ? '' + data.answer : '';
+  var results = (data != null && data.results != null) ? data.results : null;
+  var sources = (data != null && data.sources != null) ? data.sources : null;
+  var query = (data != null && data.query != null) ? '' + data.query : '';
+
+  if (answer !== '') {
+    widgetHead(root, '💡', 'Answer', query);
+    var ab = RN.scroll({ style: { flex: 1 } });
+    ab.add(RN.text(answer, { color: T.text, fontSize: 13 }));
+    if (sources != null && sources.length > 0) {
+      ab.add(RN.text('Sources', {
+        color: T.muted, fontSize: 11, fontWeight: '700', style: { marginTop: 10 }
+      }));
+      var i = 0;
+      while (i < sources.length && i < 6) {
+        ab.add(widgetSourceRow(sources[i]));
+        i = i + 1;
+      }
+    }
+    root.add(ab);
+    RN.mount(root);
+    return;
+  }
+
+  if (results != null && results.length > 0) {
+    widgetHead(root, '🔎', 'Results', query);
+    var rb = RN.scroll({ style: { flex: 1 } });
+    var j = 0;
+    while (j < results.length && j < 12) {
+      rb.add(widgetResultRow(results[j]));
+      j = j + 1;
+    }
+    root.add(rb);
+    RN.mount(root);
+    return;
+  }
+
+  // Readable fallback — a text field or a short note, never a raw JSON dump.
+  var text = '';
+  if (data != null) {
+    if (data.text != null && data.text !== '') text = '' + data.text;
+    else if (data.message != null && data.message !== '') text = '' + data.message;
+  }
+  widgetHead(root, '🧩', (command != null && command !== '') ? ('' + command) : 'Result', '');
+  var gb = RN.scroll({ style: { flex: 1 } });
+  gb.add(RN.text(text !== '' ? text : 'The tool returned data with no preview.', {
+    color: text !== '' ? T.text : T.muted, fontSize: 12
+  }));
+  root.add(gb);
+  RN.mount(root);
+}
+
 function buildWidget() {
   T = theme();
+  var data = ctx().data;
+  if (data != null) {
+    buildDataWidget(data, ctx().command);
+    return;
+  }
   var root = RN.column({
     style: { flex: 1, backgroundColor: T.bg, padding: 12, justifyContent: 'space-between' }
   });
