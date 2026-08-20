@@ -559,8 +559,76 @@ function widgetRefresh() {
 // Boot                                                                         //
 // --------------------------------------------------------------------------- //
 
+// --------------------------------------------------------------------------- //
+// Chat command reply widget                                                    //
+// --------------------------------------------------------------------------- //
+// A chat command reply reaches this front-end as __CTX.data._view — a
+// render-ready view (heading / sub / text / rows / note) the client computed
+// from this tool's JSON reply. We draw it so a command ALWAYS answers with a
+// real widget, never raw JSON text. Self-contained: only hostCall + RN + theme().
+
+function replyOpenUrl(url) {
+  if (url == null || url === '') return;
+  hostCall('host:openUrl', { url: '' + url }, function () {});
+}
+
+function replyHostOfUrl(url) {
+  var s = '' + (url || '');
+  var i = s.indexOf('://');
+  if (i >= 0) s = s.substring(i + 3);
+  var sl = s.indexOf('/');
+  if (sl >= 0) s = s.substring(0, sl);
+  return s;
+}
+
+function replyRow(TT, row) {
+  var url = (row != null && row.url != null) ? '' + row.url : '';
+  var title = (row != null && row.title != null && row.title !== '') ? '' + row.title : (url !== '' ? url : 'item');
+  var sub = (row != null && row.subtitle != null) ? '' + row.subtitle : '';
+  var el;
+  if (url !== '') {
+    el = RN.pressable({ onPress: function () { replyOpenUrl(url); }, style: { paddingVertical: 8, borderTopWidth: 1, borderTopColor: TT.line } });
+  } else {
+    el = RN.column({ style: { paddingVertical: 8, borderTopWidth: 1, borderTopColor: TT.line } });
+  }
+  el.add(RN.text(title, { color: (url !== '' ? TT.accent : TT.text), fontSize: 13, fontWeight: '600' }));
+  if (url !== '') el.add(RN.text(replyHostOfUrl(url), { color: TT.muted, fontSize: 10 }));
+  if (sub !== '') el.add(RN.text(sub, { color: TT.muted, fontSize: 11, style: { marginTop: 2 } }));
+  return el;
+}
+
+function buildReplyWidget(view) {
+  var TT = theme();
+  var root = RN.column({ style: { flex: 1, backgroundColor: TT.bg, padding: 12 } });
+  var heading = (view != null && view.heading != null && view.heading !== '') ? '' + view.heading : 'Result';
+  var sub = (view != null && view.sub != null) ? '' + view.sub : '';
+  var top = RN.row({ style: { alignItems: 'center', marginBottom: 8 } });
+  top.add(RN.text('🧩', { fontSize: 16, style: { marginRight: 8 } }));
+  var col = RN.column({ style: { flex: 1 } });
+  col.add(RN.text(heading, { color: TT.text, fontSize: 14, fontWeight: '700' }));
+  if (sub !== '') col.add(RN.text(sub, { color: TT.muted, fontSize: 11 }));
+  top.add(col);
+  root.add(top);
+  var body = RN.scroll({ style: { flex: 1 } });
+  var text = (view != null && view.text != null) ? '' + view.text : '';
+  if (text !== '') body.add(RN.text(text, { color: TT.text, fontSize: 13 }));
+  var rows = (view != null && view.rows != null) ? view.rows : null;
+  if (rows != null) {
+    var n = 0;
+    while (n < rows.length && n < 20) { body.add(replyRow(TT, rows[n])); n = n + 1; }
+  }
+  if (text === '' && (rows == null || rows.length === 0)) {
+    var note = (view != null && view.note != null && view.note !== '') ? '' + view.note : 'The tool returned no preview.';
+    body.add(RN.text(note, { color: TT.muted, fontSize: 12 }));
+  }
+  root.add(body);
+  RN.mount(root);
+}
+
 function main() {
   if (isWidgetMode()) {
+    var __reply = ctx().data;
+    if (__reply != null && __reply._view != null) { buildReplyWidget(__reply._view); return; }
     buildWidget();
     return;
   }
