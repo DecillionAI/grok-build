@@ -543,6 +543,7 @@ def _a_answer(payload: Dict[str, Any]) -> Dict[str, Any]:
             "summary": answer if len(answer) <= 400 else answer[:400] + "…",
             "status": out["provider"],
             "data": {
+                "query": out["query"],
                 "answer": answer,
                 "sources": [{"title": s.get("title"), "url": s.get("url")} for s in sources],
             },
