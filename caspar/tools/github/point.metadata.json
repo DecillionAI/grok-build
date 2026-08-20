@@ -26,176 +26,653 @@
   "bindSpace": true,
   "autoAttach": false,
   "function": "status",
-  "requiredArgs": ["function"],
-  "categories": ["development", "execution"],
-  "routes": { "development": "status" },
+  "requiredArgs": [
+    "function"
+  ],
+  "categories": [
+    "development",
+    "execution"
+  ],
+  "routes": {
+    "development": "status"
+  },
   "argSchema": {
-    "function": { "type": "string", "description": "operation: status (default) | orgs | repos | repo | branches | commits | pulls | get_pull | issues | clone | pull | push | stage | unstage | commit | checkout | merge | git_status | git_log | list_cloned | read_file | write_file | delete_file | list_dir | create_pull | merge_pull | update_pull | create_issue | disconnect | set_shared" },
-    "repo": { "type": "string", "description": "target repository as \"owner/name\" (e.g. \"acme/website\")" },
-    "org": { "type": "string", "description": "for repos: limit to one organization's repositories" },
-    "branch": { "type": "string", "description": "a branch name, for checkout/push/pull/merge/commits" },
-    "create": { "type": "bool", "description": "for checkout: create the branch" },
-    "message": { "type": "string", "description": "for commit: the commit message" },
-    "files": { "type": "array", "description": "for stage/unstage/commit: the paths to act on (default: all changes)" },
-    "staged_only": { "type": "bool", "description": "for commit: commit only what is already staged, without staging first" },
-    "path": { "type": "string", "description": "for read_file/write_file/list_dir: a path inside the cloned repo" },
-    "content": { "type": "string", "description": "for write_file: the file content" },
-    "title": { "type": "string", "description": "for create_pull/create_issue: the title" },
-    "head": { "type": "string", "description": "for create_pull: the source branch" },
-    "base": { "type": "string", "description": "for create_pull: the target branch" },
-    "number": { "type": "number", "description": "for get_pull/merge_pull/update_pull: the pull request number" },
-    "merge_method": { "type": "string", "description": "for merge_pull: merge | squash | rebase" }
+    "function": {
+      "type": "string",
+      "description": "operation: status (default) | orgs | repos | repo | branches | commits | pulls | get_pull | issues | clone | pull | push | stage | unstage | commit | checkout | merge | git_status | git_log | list_cloned | read_file | write_file | delete_file | list_dir | create_pull | merge_pull | update_pull | create_issue | disconnect | set_shared"
+    },
+    "repo": {
+      "type": "string",
+      "description": "target repository as \"owner/name\" (e.g. \"acme/website\")"
+    },
+    "org": {
+      "type": "string",
+      "description": "for repos: limit to one organization's repositories"
+    },
+    "branch": {
+      "type": "string",
+      "description": "a branch name, for checkout/push/pull/merge/commits"
+    },
+    "create": {
+      "type": "bool",
+      "description": "for checkout: create the branch"
+    },
+    "message": {
+      "type": "string",
+      "description": "for commit: the commit message"
+    },
+    "files": {
+      "type": "array",
+      "description": "for stage/unstage/commit: the paths to act on (default: all changes)"
+    },
+    "staged_only": {
+      "type": "bool",
+      "description": "for commit: commit only what is already staged, without staging first"
+    },
+    "path": {
+      "type": "string",
+      "description": "for read_file/write_file/list_dir: a path inside the cloned repo"
+    },
+    "content": {
+      "type": "string",
+      "description": "for write_file: the file content"
+    },
+    "title": {
+      "type": "string",
+      "description": "for create_pull/create_issue: the title"
+    },
+    "head": {
+      "type": "string",
+      "description": "for create_pull: the source branch"
+    },
+    "base": {
+      "type": "string",
+      "description": "for create_pull: the target branch"
+    },
+    "number": {
+      "type": "number",
+      "description": "for get_pull/merge_pull/update_pull: the pull request number"
+    },
+    "merge_method": {
+      "type": "string",
+      "description": "for merge_pull: merge | squash | rebase"
+    }
   },
   "tools": [
     {
       "name": "status",
       "desc": "report whether the space is connected to GitHub, as which account, whether the connection is shared, and whether the caller may use/manage it",
-      "args": {}
+      "args": {},
+      "widget": {
+        "heading": "GitHub",
+        "details": [
+          "login",
+          "name",
+          "connected",
+          "shared",
+          "scopes"
+        ]
+      }
     },
     {
       "name": "orgs",
       "desc": "list the connected user and the organizations they granted access to",
-      "args": {}
+      "args": {},
+      "widget": {
+        "heading": "Organizations",
+        "list": "orgs",
+        "row": {
+          "title": [
+            "login"
+          ],
+          "subtitle": [
+            "description"
+          ],
+          "url": [
+            "html_url",
+            "url"
+          ]
+        }
+      }
     },
     {
       "name": "repos",
       "desc": "list repositories the connection can see; pass `org` to scope to one organization",
-      "args": { "org": { "type": "STRING", "desc": "optional organization login to scope to" } }
+      "args": {
+        "org": {
+          "type": "STRING",
+          "desc": "optional organization login to scope to"
+        }
+      },
+      "widget": {
+        "heading": "Repositories",
+        "list": "repos",
+        "row": {
+          "title": [
+            "full_name",
+            "name"
+          ],
+          "subtitle": [
+            "description",
+            "language"
+          ],
+          "url": [
+            "html_url",
+            "clone_url"
+          ]
+        }
+      }
     },
     {
       "name": "repo",
       "desc": "details for one repository (default branch, permissions, description, counts)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        }
+      },
+      "widget": {
+        "heading": "Repository",
+        "details": [
+          "full_name",
+          "description",
+          "default_branch",
+          "language",
+          "stars",
+          "open_issues"
+        ]
+      }
     },
     {
       "name": "branches",
       "desc": "list a repository's branches with their head SHA and protection",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        }
+      },
+      "widget": {
+        "heading": "Branches",
+        "list": "branches",
+        "row": {
+          "title": [
+            "name"
+          ],
+          "subtitle": [
+            "sha"
+          ]
+        }
+      }
     },
     {
       "name": "commits",
       "desc": "recent commits on a repository (optionally a `branch` or `path`)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "optional branch" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "optional branch"
+        }
+      },
+      "widget": {
+        "heading": "Commits",
+        "list": "commits",
+        "row": {
+          "title": [
+            "message"
+          ],
+          "subtitle": [
+            "author",
+            "login",
+            "sha"
+          ]
+        }
+      }
     },
     {
       "name": "pulls",
       "desc": "list pull requests (default state open)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "state": { "type": "STRING", "desc": "open | closed | all" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "state": {
+          "type": "STRING",
+          "desc": "open | closed | all"
+        }
+      },
+      "widget": {
+        "heading": "Pull requests",
+        "list": "pulls",
+        "row": {
+          "title": [
+            "title"
+          ],
+          "subtitle": [
+            "state",
+            "user"
+          ],
+          "url": [
+            "html_url"
+          ]
+        }
+      }
     },
     {
       "name": "get_pull",
       "desc": "one pull request with its mergeability",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "number": { "type": "NUMBER", "desc": "PR number" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "number": {
+          "type": "NUMBER",
+          "desc": "PR number"
+        }
+      },
+      "widget": {
+        "heading": "Pull request",
+        "details": [
+          "number",
+          "title",
+          "state",
+          "user",
+          "head",
+          "base",
+          "mergeable_state"
+        ]
+      }
     },
     {
       "name": "create_pull",
       "desc": "open a pull request",
       "args": {
-        "repo": { "type": "STRING", "desc": "owner/name" },
-        "title": { "type": "STRING", "desc": "PR title" },
-        "head": { "type": "STRING", "desc": "source branch" },
-        "base": { "type": "STRING", "desc": "target branch" },
-        "body": { "type": "STRING", "desc": "optional description" }
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "title": {
+          "type": "STRING",
+          "desc": "PR title"
+        },
+        "head": {
+          "type": "STRING",
+          "desc": "source branch"
+        },
+        "base": {
+          "type": "STRING",
+          "desc": "target branch"
+        },
+        "body": {
+          "type": "STRING",
+          "desc": "optional description"
+        }
       }
     },
     {
       "name": "merge_pull",
       "desc": "merge a pull request",
       "args": {
-        "repo": { "type": "STRING", "desc": "owner/name" },
-        "number": { "type": "NUMBER", "desc": "PR number" },
-        "merge_method": { "type": "STRING", "desc": "merge (default) | squash | rebase" }
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "number": {
+          "type": "NUMBER",
+          "desc": "PR number"
+        },
+        "merge_method": {
+          "type": "STRING",
+          "desc": "merge (default) | squash | rebase"
+        }
       }
     },
     {
       "name": "update_pull",
       "desc": "edit a pull request (title/body/state); set state to closed to close it",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "number": { "type": "NUMBER", "desc": "PR number" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "number": {
+          "type": "NUMBER",
+          "desc": "PR number"
+        }
+      }
     },
     {
       "name": "issues",
       "desc": "list issues (default state open)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "state": { "type": "STRING", "desc": "open | closed | all" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "state": {
+          "type": "STRING",
+          "desc": "open | closed | all"
+        }
+      },
+      "widget": {
+        "heading": "Issues",
+        "list": "issues",
+        "row": {
+          "title": [
+            "title"
+          ],
+          "subtitle": [
+            "state",
+            "user"
+          ],
+          "url": [
+            "html_url"
+          ]
+        }
+      }
     },
     {
       "name": "create_issue",
       "desc": "open an issue",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "title": { "type": "STRING", "desc": "issue title" }, "body": { "type": "STRING", "desc": "optional body" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "title": {
+          "type": "STRING",
+          "desc": "issue title"
+        },
+        "body": {
+          "type": "STRING",
+          "desc": "optional body"
+        }
+      }
     },
     {
       "name": "clone",
       "desc": "clone a repository into the space (idempotent — fetches when already cloned)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "optional branch to check out" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "optional branch to check out"
+        }
+      }
     },
     {
       "name": "pull",
       "desc": "git pull the cloned repository from origin",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "optional branch" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "optional branch"
+        }
+      }
     },
     {
       "name": "stage",
       "desc": "stage changes into the index without committing (git add); returns the resulting staged/unstaged breakdown",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "files": { "type": "ARRAY", "desc": "optional file list (default: stage all changes)" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "files": {
+          "type": "ARRAY",
+          "desc": "optional file list (default: stage all changes)"
+        }
+      }
     },
     {
       "name": "unstage",
       "desc": "remove changes from the index without discarding your edits (git reset); returns the resulting staged/unstaged breakdown",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "files": { "type": "ARRAY", "desc": "optional file list (default: unstage all)" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "files": {
+          "type": "ARRAY",
+          "desc": "optional file list (default: unstage all)"
+        }
+      }
     },
     {
       "name": "commit",
       "desc": "commit changes in the cloned repository; stages everything first by default, or pass staged_only=true to commit only what is already staged",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "message": { "type": "STRING", "desc": "commit message" }, "files": { "type": "ARRAY", "desc": "optional file list to stage (default: all changes)" }, "staged_only": { "type": "BOOL", "desc": "commit only what is already staged, staging nothing" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "message": {
+          "type": "STRING",
+          "desc": "commit message"
+        },
+        "files": {
+          "type": "ARRAY",
+          "desc": "optional file list to stage (default: all changes)"
+        },
+        "staged_only": {
+          "type": "BOOL",
+          "desc": "commit only what is already staged, staging nothing"
+        }
+      }
     },
     {
       "name": "push",
       "desc": "git push the cloned repository to origin",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "optional branch (default HEAD)" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "optional branch (default HEAD)"
+        }
+      }
     },
     {
       "name": "checkout",
       "desc": "switch branches (or create one with `create`)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "branch name" }, "create": { "type": "BOOL", "desc": "create the branch" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "branch name"
+        },
+        "create": {
+          "type": "BOOL",
+          "desc": "create the branch"
+        }
+      }
     },
     {
       "name": "merge",
       "desc": "git merge a branch into the current one in the clone",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "branch": { "type": "STRING", "desc": "branch to merge in" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "branch": {
+          "type": "STRING",
+          "desc": "branch to merge in"
+        }
+      }
     },
     {
       "name": "git_status",
       "desc": "porcelain status + current branch of the cloned repository",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        }
+      },
+      "widget": {
+        "heading": "git status",
+        "details": [
+          "branch",
+          "ahead",
+          "behind",
+          "clean"
+        ]
+      }
     },
     {
       "name": "git_log",
       "desc": "recent local commits of the cloned repository",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "limit": { "type": "NUMBER", "desc": "how many (default 20)" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "limit": {
+          "type": "NUMBER",
+          "desc": "how many (default 20)"
+        }
+      },
+      "widget": {
+        "heading": "Commits",
+        "list": [
+          "commits",
+          "log"
+        ],
+        "row": {
+          "title": [
+            "message"
+          ],
+          "subtitle": [
+            "author",
+            "sha"
+          ]
+        }
+      }
     },
     {
       "name": "read_file",
       "desc": "read a file out of a cloned repository",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "path": { "type": "STRING", "desc": "path inside the repo" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "path": {
+          "type": "STRING",
+          "desc": "path inside the repo"
+        }
+      },
+      "widget": {
+        "text": [
+          "content",
+          "text"
+        ],
+        "sub": [
+          "path"
+        ]
+      }
     },
     {
       "name": "write_file",
       "desc": "create or overwrite a file in a cloned repository (on the space's sandbox)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "path": { "type": "STRING", "desc": "path inside the repo" }, "content": { "type": "STRING", "desc": "file content" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "path": {
+          "type": "STRING",
+          "desc": "path inside the repo"
+        },
+        "content": {
+          "type": "STRING",
+          "desc": "file content"
+        }
+      }
     },
     {
       "name": "delete_file",
       "desc": "delete a file or directory in a cloned repository (on the space's sandbox)",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "path": { "type": "STRING", "desc": "path inside the repo" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "path": {
+          "type": "STRING",
+          "desc": "path inside the repo"
+        }
+      }
     },
     {
       "name": "list_dir",
       "desc": "list a directory inside a cloned repository as structured {name,type,size} rows",
-      "args": { "repo": { "type": "STRING", "desc": "owner/name" }, "path": { "type": "STRING", "desc": "directory (default repo root)" } }
+      "args": {
+        "repo": {
+          "type": "STRING",
+          "desc": "owner/name"
+        },
+        "path": {
+          "type": "STRING",
+          "desc": "directory (default repo root)"
+        }
+      },
+      "widget": {
+        "list": [
+          "entries",
+          "files",
+          "items"
+        ],
+        "row": {
+          "title": [
+            "name",
+            "path"
+          ],
+          "subtitle": [
+            "type"
+          ]
+        }
+      }
     },
     {
       "name": "list_cloned",
       "desc": "list the repositories cloned into this space",
-      "args": {}
+      "args": {},
+      "widget": {
+        "heading": "Cloned repos",
+        "list": [
+          "repos",
+          "cloned",
+          "items"
+        ],
+        "row": {
+          "title": [
+            "repo",
+            "name",
+            "path"
+          ]
+        }
+      }
     },
     {
       "name": "oauth_start",
@@ -210,7 +687,12 @@
     {
       "name": "set_shared",
       "desc": "owner-only: toggle whether the rest of the space (people and agents) may use the connection",
-      "args": { "shared": { "type": "BOOL", "desc": "true to share with the space, false to keep private to the connecting member" } }
+      "args": {
+        "shared": {
+          "type": "BOOL",
+          "desc": "true to share with the space, false to keep private to the connecting member"
+        }
+      }
     },
     {
       "name": "disconnect",

@@ -24,7 +24,9 @@
   "requiresNetwork": true,
   "autoAttach": true,
   "function": "exec",
-  "requiredArgs": ["function"],
+  "requiredArgs": [
+    "function"
+  ],
   "maxExecSeconds": 600,
   "categories": [
     "execution"
@@ -33,72 +35,203 @@
     "execution": "exec"
   },
   "argSchema": {
-    "function": { "type": "string", "description": "operation: exec (default) | write | read | mkdir | list_dir | info | start | stop" },
-    "command": { "type": "string", "description": "for exec: the shell command line, e.g. \"npm install && npm test\"" },
-    "cwd": { "type": "string", "description": "optional working directory" },
-    "env": { "type": "object", "description": "optional extra environment variables for this command" },
-    "timeout_ms": { "type": "number", "description": "optional per-command timeout in milliseconds" },
-    "path": { "type": "string", "description": "for write/read/mkdir/list_dir: the file or directory path" },
-    "content": { "type": "string", "description": "for write: the file content" }
+    "function": {
+      "type": "string",
+      "description": "operation: exec (default) | write | read | mkdir | list_dir | info | start | stop"
+    },
+    "command": {
+      "type": "string",
+      "description": "for exec: the shell command line, e.g. \"npm install && npm test\""
+    },
+    "cwd": {
+      "type": "string",
+      "description": "optional working directory"
+    },
+    "env": {
+      "type": "object",
+      "description": "optional extra environment variables for this command"
+    },
+    "timeout_ms": {
+      "type": "number",
+      "description": "optional per-command timeout in milliseconds"
+    },
+    "path": {
+      "type": "string",
+      "description": "for write/read/mkdir/list_dir: the file or directory path"
+    },
+    "content": {
+      "type": "string",
+      "description": "for write: the file content"
+    }
   },
   "tools": [
     {
       "name": "exec",
       "desc": "run a shell command in the space's sandbox and return stdout, stderr and the exit code; the whole line is run through `sh -c`, so pipes, redirects and && work",
       "args": {
-        "function": {"type": "STRING", "desc": "the operation to run: exec | write | read | mkdir | info | start | stop (default exec)"},
-        "command": {"type": "STRING", "desc": "the shell command line to run, e.g. 'npm install && npm test'"},
-        "cwd": {"type": "STRING", "desc": "optional working directory (defaults to the sandbox home directory)"},
-        "env": {"type": "OBJECT", "desc": "optional extra environment variables for this command"},
-        "timeout_ms": {"type": "NUMBER", "desc": "optional per-command timeout in milliseconds (default 300000)"},
-        "path": {"type": "STRING", "desc": "for write/read/mkdir: the file or directory path"},
-        "content": {"type": "STRING", "desc": "for write: the file content"}
+        "function": {
+          "type": "STRING",
+          "desc": "the operation to run: exec | write | read | mkdir | info | start | stop (default exec)"
+        },
+        "command": {
+          "type": "STRING",
+          "desc": "the shell command line to run, e.g. 'npm install && npm test'"
+        },
+        "cwd": {
+          "type": "STRING",
+          "desc": "optional working directory (defaults to the sandbox home directory)"
+        },
+        "env": {
+          "type": "OBJECT",
+          "desc": "optional extra environment variables for this command"
+        },
+        "timeout_ms": {
+          "type": "NUMBER",
+          "desc": "optional per-command timeout in milliseconds (default 300000)"
+        },
+        "path": {
+          "type": "STRING",
+          "desc": "for write/read/mkdir: the file or directory path"
+        },
+        "content": {
+          "type": "STRING",
+          "desc": "for write: the file content"
+        }
+      },
+      "widget": {
+        "text": [
+          "stdout",
+          "output",
+          "text"
+        ],
+        "details": [
+          "exit_code",
+          "cwd"
+        ]
       }
     },
     {
       "name": "write",
       "desc": "create or overwrite a file in the space's sandbox",
       "args": {
-        "path": {"type": "STRING", "desc": "file path, absolute or relative to the home directory"},
-        "content": {"type": "STRING", "desc": "file content"},
-        "encoding": {"type": "STRING", "desc": "'text' (default) or 'base64' for binary content"},
-        "cwd": {"type": "STRING", "desc": "optional base directory for relative paths"}
+        "path": {
+          "type": "STRING",
+          "desc": "file path, absolute or relative to the home directory"
+        },
+        "content": {
+          "type": "STRING",
+          "desc": "file content"
+        },
+        "encoding": {
+          "type": "STRING",
+          "desc": "'text' (default) or 'base64' for binary content"
+        },
+        "cwd": {
+          "type": "STRING",
+          "desc": "optional base directory for relative paths"
+        }
+      },
+      "widget": {
+        "details": [
+          "path",
+          "ok",
+          "bytes"
+        ]
       }
     },
     {
       "name": "read",
       "desc": "read a file back out of the space's sandbox",
       "args": {
-        "path": {"type": "STRING", "desc": "file path to read"},
-        "cwd": {"type": "STRING", "desc": "optional base directory for relative paths"}
+        "path": {
+          "type": "STRING",
+          "desc": "file path to read"
+        },
+        "cwd": {
+          "type": "STRING",
+          "desc": "optional base directory for relative paths"
+        }
+      },
+      "widget": {
+        "text": [
+          "content",
+          "text"
+        ],
+        "sub": [
+          "path"
+        ]
       }
     },
     {
       "name": "mkdir",
       "desc": "create a directory in the space's sandbox",
       "args": {
-        "path": {"type": "STRING", "desc": "directory path to create"}
+        "path": {
+          "type": "STRING",
+          "desc": "directory path to create"
+        }
+      },
+      "widget": {
+        "details": [
+          "path",
+          "ok"
+        ]
       }
     },
     {
       "name": "list_dir",
       "desc": "list the entries of a directory as structured {name, type, size} rows (directories first); read-only, powers the file-explorer front-end",
       "args": {
-        "path": {"type": "STRING", "desc": "directory to list (default the sandbox home directory)"}
+        "path": {
+          "type": "STRING",
+          "desc": "directory to list (default the sandbox home directory)"
+        }
+      },
+      "widget": {
+        "heading": "Files",
+        "list": [
+          "entries",
+          "items",
+          "files"
+        ],
+        "row": {
+          "title": [
+            "name",
+            "path"
+          ],
+          "subtitle": [
+            "type"
+          ]
+        }
       }
     },
     {
       "name": "info",
       "desc": "report the space's sandbox status, runtime, working directory and the public URLs of any exposed ports",
       "args": {
-        "resume": {"type": "BOOL", "desc": "resume the sandbox if it is stopped (default false)"}
+        "resume": {
+          "type": "BOOL",
+          "desc": "resume the sandbox if it is stopped (default false)"
+        }
+      },
+      "widget": {
+        "heading": "Sandbox",
+        "details": [
+          "status",
+          "runtime",
+          "ports",
+          "space_id"
+        ]
       }
     },
     {
       "name": "start",
       "desc": "boot or resume the space's sandbox from its snapshot before a burst of work",
       "args": {
-        "ports": {"type": "ARRAY", "desc": "optional ports to expose publicly when it has to be created"}
+        "ports": {
+          "type": "ARRAY",
+          "desc": "optional ports to expose publicly when it has to be created"
+        }
       }
     },
     {
@@ -110,17 +243,32 @@
       "name": "create",
       "desc": "provision the sandbox bound to a space (called by the platform when a space is created; agents should use start instead)",
       "args": {
-        "space_id": {"type": "STRING", "desc": "the Decillion space id the sandbox is bound to"},
-        "runtime": {"type": "STRING", "desc": "Vercel runtime (node22 | node24 | node26 | python3.13, default node24) or a container image for Modal"},
-        "ports": {"type": "ARRAY", "desc": "ports to expose publicly"},
-        "timeout_ms": {"type": "NUMBER", "desc": "maximum session lifetime in milliseconds"}
+        "space_id": {
+          "type": "STRING",
+          "desc": "the Decillion space id the sandbox is bound to"
+        },
+        "runtime": {
+          "type": "STRING",
+          "desc": "Vercel runtime (node22 | node24 | node26 | python3.13, default node24) or a container image for Modal"
+        },
+        "ports": {
+          "type": "ARRAY",
+          "desc": "ports to expose publicly"
+        },
+        "timeout_ms": {
+          "type": "NUMBER",
+          "desc": "maximum session lifetime in milliseconds"
+        }
       }
     },
     {
       "name": "delete",
       "desc": "destroy the sandbox bound to a space and all of its snapshots (called by the platform when a space is deleted)",
       "args": {
-        "space_id": {"type": "STRING", "desc": "the Decillion space id whose sandbox is being destroyed"}
+        "space_id": {
+          "type": "STRING",
+          "desc": "the Decillion space id whose sandbox is being destroyed"
+        }
       }
     }
   ]
