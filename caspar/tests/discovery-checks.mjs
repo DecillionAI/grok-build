@@ -335,6 +335,36 @@ async function main() {
     });
   });
 
+  await check("an agent attached with a top-level kind (thin/no descriptor) is NOT a callable tool", async () => {
+    // The team-recommend flow attaches teammates with only a thin descriptor
+    // ({name, category, avatar} — no kind) or none, recording the classification
+    // as a top-level metadata.kind. Discovery must read that kind so the teammate
+    // stays an @mention participant instead of leaking into the callable tools.
+    const programIndex = {
+      "px-thin": {
+        programId: "px-thin", creatureId: "cx-thin", entityId: "agent",
+        metadata: { kind: "agent", name: "Planner", descriptor: { name: "Planner", category: "planner", avatar: "av-1" } },
+      },
+      "px-bare": {
+        programId: "px-bare", creatureId: "cx-bare", entityId: "agent",
+        metadata: { kind: "agent", name: "Writer" }, // no descriptor at all
+      },
+      "px-sandbox": {
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "sandbox",
+        metadata: { name: "sandbox", descriptor: SANDBOX_META.public.decillion },
+      },
+    };
+    await withBridge(nodeBehaviour({ members: [], metaById: {}, programIndex }), async (bridge) => {
+      const entries = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
+      const kindByName = Object.fromEntries(entries.map((e) => [e.name, e.kind]));
+      assert.equal(kindByName.Planner, "agent", "thin-descriptor agent classified from top-level kind");
+      assert.equal(kindByName.Writer, "agent", "descriptor-less agent classified from top-level kind");
+      const { tools, byName } = buildToolDefinitions(entries);
+      assert.deepEqual(tools.map((t) => t.name), ["sandbox"], "only the sandbox is callable");
+      assert.ok(![...byName.values()].some((v) => v.kind === "agent"), "neither teammate leaks in as a callable tool");
+    });
+  });
+
   await check("discoverSpaceCatalog excludes the calling agent's own proxy (no self-invocation)", async () => {
     // The caller's own proxy shows up in the program index like any other program;
     // handing it back would make the model call itself and hang. It must be dropped
