@@ -127,6 +127,62 @@ export async function fetchSpaceHistoryRecords(
   }
 }
 
+/**
+ * The `spaces/signal` endpoint address the client put on the task (mirrors
+ * `historyEndpointFromTask`). Used to durably persist the agent's own final
+ * answer creature→creature, so completion survives even if the app's socket
+ * dropped before it could store the turn.
+ */
+export function signalEndpointFromTask(task) {
+  const raw = task && typeof task === "object" ? task.signalEndpoint || task.signal_endpoint : null;
+  if (!raw || typeof raw !== "object") return null;
+  const programId = String(raw.programId || raw.program_id || "").trim();
+  if (!programId) return null;
+  const entityId = String(raw.entityId || raw.entity_id || "main").trim() || "main";
+  return {
+    programId,
+    creatureId: String(raw.creatureId || raw.creature_id || "").trim(),
+    entityId,
+  };
+}
+
+/**
+ * Persist one chat message to the space, creature→creature, exactly the way the
+ * app persists a user message: signal `spaces/signal` with `persist:true` and the
+ * message `data`. Best-effort and non-throwing. When `data.msgId` is set (the
+ * run's correlationId), the store upserts by it, so this write and the app's own
+ * write of the same turn converge on ONE record instead of duplicating it.
+ */
+export async function persistSpaceMessage(
+  bridge,
+  { endpoint, spaceId, selfId, data, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
+) {
+  if (!bridge || !endpoint || !spaceId || !data || typeof data !== "object") return false;
+  const correlationId = crypto.randomBytes(16).toString("hex");
+  const inner = JSON.stringify({
+    action: "signal",
+    correlationId,
+    payload: { storeId: spaceId, type: "message", persist: true, data },
+  });
+  const packet = {
+    action: "single",
+    user: { id: String(selfId || "") },
+    store: { id: spaceId },
+    data: JSON.stringify({ programId: endpoint.programId, entity: endpoint.entityId, payload: inner }),
+    entityId: endpoint.entityId,
+    correlationId,
+  };
+  try {
+    await Promise.race([
+      bridge.signalUser("creatures/signal", endpoint.programId, packet),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function firstString(...vals) {
   for (const v of vals) {
     if (typeof v === "string" && v.trim()) return v.trim();
