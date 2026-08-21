@@ -54,7 +54,7 @@ import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask } from "./spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -566,6 +566,66 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   return result;
 }
 
+/** The teammates this answer @mentions, resolved against the space roster. */
+function scanMentions(answer, roster) {
+  const out = [];
+  if (!answer || !Array.isArray(roster)) return out;
+  for (const r of roster) {
+    const handle = r && typeof r.handle === "string" ? r.handle.trim() : "";
+    if (!handle) continue;
+    const esc = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(^|[^a-z0-9-])@${esc}(?![a-z0-9-])`, "i").test(answer)) {
+      out.push({
+        ...(typeof r.id === "string" ? { id: r.id } : {}),
+        ...(typeof r.name === "string" ? { name: r.name } : {}),
+        handle: r.handle,
+        ...(r.kind ? { kind: r.kind } : {}),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Durably store the agent's final answer as a space chat message, the same way
+ * the app stores a user message (`spaces/signal` with `persist:true`). Tagged
+ * with the run's correlationId as `msgId`, so it converges with the app's own
+ * write of the same turn instead of duplicating it — and is stored even when the
+ * app's socket dropped before it could persist. Best-effort; never blocks/breaks
+ * the run.
+ */
+async function persistAnswer(bridge, task, result) {
+  try {
+    if (!bridge || !task || !result || result.success === false) return;
+    const answer = typeof result.answer === "string" ? result.answer.trim() : "";
+    if (!answer) return;
+    const endpoint = signalEndpointFromTask(task);
+    const spaceId = task.spaceId || task.storeId || task.space_id;
+    const correlationId = task.correlationId || task.correlation_id;
+    if (!endpoint || !spaceId || !correlationId) return;
+    const self = task.self && typeof task.self === "object" ? task.self : {};
+    const agentName = typeof self.name === "string" && self.name.trim() ? self.name.trim() : undefined;
+    const threadId = typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : undefined;
+    const agentProgramId = typeof task.agentProgramId === "string" && task.agentProgramId.trim() ? task.agentProgramId.trim() : undefined;
+    const mentions = scanMentions(answer, task.roster);
+    const data = {
+      text: answer,
+      from: "agent",
+      msgId: String(correlationId),
+      at: new Date().toISOString(),
+      ...(agentName ? { agentName } : {}),
+      ...(agentProgramId ? { agentProgramId } : {}),
+      ...(threadId ? { threadId } : {}),
+      ...(mentions.length ? { mentions } : {}),
+    };
+    const selfId = bridge.machineId || bridge.programId || "";
+    await persistSpaceMessage(bridge, { endpoint, spaceId, selfId, data });
+    log("GROK_PERSIST", { spaceId, threadId: threadId || "main", chars: answer.length, mentions: mentions.length });
+  } catch (err) {
+    log("GROK_PERSIST", { error: String(err?.message || err).slice(0, 200) });
+  }
+}
+
 /**
  * Answer one delivery and signal the terminal result back through `replyTo` (the
  * proxy entity), which is what closes the correlation the requester is waiting
@@ -602,6 +662,10 @@ export async function serveOnce(bridge, delivery) {
       log("GROK_BOOT", { reply_error: String(err?.message || err).slice(0, 200) });
     }
   }
+  // Durably store the answer ourselves, so it survives even if the app never
+  // received the terminal result above. Carries the run's correlationId so it
+  // merges with the app's own persist of this turn rather than duplicating it.
+  await persistAnswer(bridge, delivery.task || {}, result);
   return result;
 }
 

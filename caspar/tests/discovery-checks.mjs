@@ -25,6 +25,7 @@ import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSp
 import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
+import { persistSpaceMessage, signalEndpointFromTask } from "../spaceHistory.mjs";
 import { FakeGateway } from "./fakeGateway.mjs";
 
 const GREEN = "\x1b[0;32m";
@@ -382,6 +383,52 @@ async function main() {
       assert.ok(!/delegate to/i.test(preamble), "no synchronous sub-agent delegation is offered");
       assert.ok(!caps.some((c) => c.kind === "agent"), "no agent is offered as a callable capability");
     });
+  });
+
+  await check("signalEndpointFromTask reads the spaces/signal address, null when absent", () => {
+    assert.equal(signalEndpointFromTask({}), null);
+    assert.equal(signalEndpointFromTask({ signalEndpoint: {} }), null); // no programId
+    const ep = signalEndpointFromTask({ signalEndpoint: { programId: "p-sig", entityId: "main", creatureId: "c-sig" } });
+    assert.deepEqual(ep, { programId: "p-sig", entityId: "main", creatureId: "c-sig" });
+    // snake_case + default entity
+    const ep2 = signalEndpointFromTask({ signal_endpoint: { program_id: "p2" } });
+    assert.equal(ep2.programId, "p2");
+    assert.equal(ep2.entityId, "main");
+  });
+
+  await check("persistSpaceMessage signals spaces/signal with persist:true and the message data", async () => {
+    const calls = [];
+    const bridge = {
+      machineId: "self-1",
+      signalUser: async (key, target, packet) => {
+        calls.push({ key, target, packet });
+        return { ok: true };
+      },
+    };
+    const data = { text: "done", from: "agent", msgId: "cid-1", threadId: "main" };
+    const ok = await persistSpaceMessage(bridge, {
+      endpoint: { programId: "p-sig", entityId: "main" },
+      spaceId: "space-1",
+      selfId: "self-1",
+      data,
+    });
+    assert.equal(ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].key, "creatures/signal");
+    assert.equal(calls[0].target, "p-sig");
+    // The outer StoresSend carries the store + a JSON `data` envelope whose inner
+    // payload is the persist:true spaces/signal call with our message data.
+    assert.equal(calls[0].packet.store.id, "space-1");
+    const env = JSON.parse(calls[0].packet.data);
+    assert.equal(env.programId, "p-sig");
+    const inner = JSON.parse(env.payload);
+    assert.equal(inner.action, "signal");
+    assert.equal(inner.payload.persist, true);
+    assert.equal(inner.payload.storeId, "space-1");
+    assert.deepEqual(inner.payload.data, data);
+    // Missing endpoint / space / bridge is a no-op, never a throw.
+    assert.equal(await persistSpaceMessage(null, { endpoint: {}, spaceId: "s", data }), false);
+    assert.equal(await persistSpaceMessage(bridge, { endpoint: null, spaceId: "s", data }), false);
   });
 
   console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
