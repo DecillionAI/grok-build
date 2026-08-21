@@ -119,10 +119,11 @@ async function main() {
     const a = entryFromDescriptor(RESEARCHER_META.decillion, { creatureId: "c2", programId: "p2", entityId: "" });
     assert.equal(a.kind, "agent");
     assert.equal(a.entity_id, "agent"); // agents default to the proxy's agent entity
-    assert.ok(a.arg_schema.prompt, "an agent entry exposes a prose prompt argument");
+    // Agents are participants, not tools: buildToolDefinitions filters them out so
+    // an agent can only ever be reached by @mention, never a synchronous tool call.
     const { tools, byName } = buildToolDefinitions([e, a]);
-    assert.equal(tools.length, 2);
-    assert.ok([...byName.values()].some((v) => v.kind === "agent"));
+    assert.equal(tools.length, 1, "only the tool is callable — the agent is dropped");
+    assert.ok(![...byName.values()].some((v) => v.kind === "agent"), "no agent is exposed as a callable tool");
   });
 
   await check("mergeCatalogs keeps backend entries and only adds new ones", () => {
@@ -139,16 +140,21 @@ async function main() {
     assert.ok(merged.find((e) => e.program_id === "p2"));
   });
 
-  await check("capabilitiesPreamble enumerates tools and sub-agents, empty when none", () => {
+  await check("capabilitiesPreamble enumerates tools only — agents are @mention participants, not tools", () => {
     assert.equal(capabilitiesPreamble([]), "");
+    // A caps list of only agents yields nothing: agents are never a callable tool.
+    assert.equal(capabilitiesPreamble([{ name: "Researcher", description: "deep research", kind: "agent" }]), "");
     const text = capabilitiesPreamble([
       { name: "sandbox", description: "run code", kind: "tool" },
       { name: "Researcher", description: "deep research", kind: "agent" },
     ]);
     assert.ok(text.includes("WHAT YOU CAN DO IN THIS SPACE"));
     assert.ok(text.includes("sandbox"));
-    assert.ok(/delegate/i.test(text));
-    assert.ok(text.includes("Researcher"));
+    // No synchronous "delegate to a sub-agent" surface, and the agent is not listed.
+    assert.ok(!/delegate to/i.test(text), "no synchronous sub-agent delegation is offered");
+    assert.ok(!text.includes("Researcher"), "another agent is never listed as a callable capability");
+    // it steers cross-agent work to @mention instead
+    assert.ok(/@mention/i.test(text), "it points cross-agent work to @mention");
     // it tells the model to answer capability questions with THESE, not built-ins
     assert.ok(/not the generic editor\/shell built-ins/i.test(text));
     // it is included in the full system prompt
@@ -359,19 +365,22 @@ async function main() {
     assert.deepEqual(await discoverSpaceCatalog(null, { spaceId: "space-1" }), []); // no bridge
   });
 
-  await check("discovered catalog merges with config.tools into callable MCP tools", async () => {
+  await check("discovered catalog merges with config.tools, but discovered agents are not callable tools", async () => {
     const members = [{ creatureId: "cx-researcher", programId: "px-researcher" }];
     const metaById = { "cx-researcher": RESEARCHER_META };
     await withBridge(nodeBehaviour({ members, metaById }), async (bridge) => {
       const configTools = [{ name: "sandbox", program_id: "px-sandbox", kind: "tool", defaults: { space_id: "space-1" } }];
       const discovered = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
       const merged = mergeCatalogs(configTools, discovered);
+      // Discovery still surfaces the researcher agent in the merged catalog (for
+      // awareness), but buildToolDefinitions drops it — only the sandbox is callable.
+      assert.ok(merged.some((e) => e.kind === "agent"), "the merged catalog still knows about the agent");
       const { tools, byName } = buildToolDefinitions(merged);
-      assert.equal(tools.length, 2, "sandbox (config) + researcher (discovered)");
+      assert.equal(tools.length, 1, "only the sandbox is a callable tool — the agent is dropped");
       const caps = tools.map((t) => ({ name: t.name, description: t.description, kind: byName.get(t.name)?.kind || "tool" }));
       const preamble = capabilitiesPreamble(caps);
-      assert.ok(/delegate to/i.test(preamble) || /delegate/i.test(preamble));
-      assert.ok(caps.some((c) => c.kind === "agent"), "the discovered sub-agent is offered for delegation");
+      assert.ok(!/delegate to/i.test(preamble), "no synchronous sub-agent delegation is offered");
+      assert.ok(!caps.some((c) => c.kind === "agent"), "no agent is offered as a callable capability");
     });
   });
 

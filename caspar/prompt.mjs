@@ -92,10 +92,24 @@ export function groupChatPreamble(task) {
     "is addressed to you, others you are only overhearing.\n" +
     "  • You were triggered because the latest turn is directed at you. Respond " +
     "to it in your own voice.\n" +
-    "  • To hand work to, ask something of, or bring in another agent or person, " +
-    "@mention their handle (e.g. @some-agent) in your reply — that is what " +
-    "notifies and triggers them. Only @mention someone when you actually need " +
-    "something from them.\n" +
+    "  • @mention is the ONLY way to reach another agent or person, and it is the " +
+    "way you are expected to collaborate. To hand work to, ask something of, or " +
+    "bring in a teammate, @mention their handle (e.g. @some-agent) in your reply " +
+    "— that is what notifies and triggers them. There is no separate tool for " +
+    "calling another agent; do NOT try to invoke a teammate as a tool or wait on " +
+    "them inside this turn.\n" +
+    "  • Talking to a teammate is ASYNCHRONOUS. When you @mention someone, they " +
+    "reply LATER as their own new message in this chat — you will NOT receive " +
+    "their answer inside your current turn, and you must not stall waiting for " +
+    "it. So finish your turn by clearly stating what you need and @mentioning " +
+    "whoever should act next, then stop; you (or they) can build on their reply " +
+    "when it arrives as a following turn.\n" +
+    "  • Only @mention someone when you actually need something from them, and " +
+    "prefer to @mention one teammate at a time so the thread does not fan out " +
+    "into chaos.\n" +
+    "  • Your tool calls are shown to everyone in this chat as they happen (a " +
+    "structured entry per call), so the team can already see the work — do not " +
+    "narrate every tool call in your prose.\n" +
     "  • If a message is merely acknowledging or thanking you and you have " +
     "nothing further to add, do NOT keep the loop going: reply briefly WITHOUT " +
     "@mentioning the sender (an @mention would re-trigger them and bounce the " +
@@ -107,13 +121,15 @@ export function groupChatPreamble(task) {
 }
 
 /**
- * The "what you can do in this space" section: the tools, apps, creatures and
- * sub-agents the space contains, so the model plans WITH them instead of only
- * answering from its own knowledge or its harness's generic built-ins. Each is a
- * real, callable tool (surfaced under the `caspar` MCP server, invoked through
- * Grok's `use_tool` meta-tool); sub-agents are
- * creatures it can delegate whole sub-tasks to. Empty when the space has no
- * employable creatures, so a bare one-shot prompt is unaffected.
+ * The "what you can do in this space" section: the tools, apps and creatures the
+ * space contains, so the model plans WITH them instead of only answering from its
+ * own knowledge or its harness's generic built-ins. Each is a real, callable tool
+ * (surfaced under the `caspar` MCP server, invoked through Grok's `use_tool`
+ * meta-tool). Other AGENTS are deliberately NOT listed here: a teammate is not a
+ * tool you call, it is a participant you @mention (see the group-chat section) —
+ * that hand-off is asynchronous, so it never belongs on this synchronous
+ * tool-calling surface. Empty when the space has no employable creatures, so a
+ * bare one-shot prompt is unaffected.
  *
  * `capabilities` is `[{ name, description, kind }]` — `name` is the exact
  * qualified MCP tool name (`caspar__<tool>`) the model passes to `use_tool`, so
@@ -125,9 +141,11 @@ export function groupChatPreamble(task) {
  */
 export function capabilitiesPreamble(capabilities, opts = {}) {
   const list = Array.isArray(capabilities) ? capabilities.filter((c) => c && typeof c === "object" && c.name) : [];
-  if (!list.length) return "";
-  const agents = list.filter((c) => c.kind === "agent");
+  // Agents are never a callable capability — they are @mention participants, not
+  // tools (see the module comment and the group-chat preamble). Drop any that
+  // leak in so this section only ever lists real, synchronously-callable tools.
   const tools = list.filter((c) => c.kind !== "agent");
+  if (!tools.length) return "";
 
   /**
    * Render one capability with its inline schema so the model can call it
@@ -179,9 +197,7 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     return `${head}\n    tool_input:\n${argLines.join("\n")}`;
   };
 
-  const renderAgent = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
-
-  const render = (c) => (c.kind === "agent" ? renderAgent(c) : renderTool(c));
+  const render = (c) => renderTool(c);
 
   const sharedEnv = opts.sharedEnv && opts.sharedEnv.name ? opts.sharedEnv : null;
   const disabledBuiltins = Array.isArray(opts.disabledBuiltins) ? opts.disabledBuiltins.filter(Boolean) : [];
@@ -210,7 +226,6 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
 
   const sections = [];
   if (tools.length) sections.push(`Tools & creatures you can call:\n${tools.map(render).join("\n")}`);
-  if (agents.length) sections.push(`Other agents you can delegate to (call them like a tool, with a prose \`prompt\`):\n${agents.map(render).join("\n")}`);
 
   return (
     "=== WHAT YOU CAN DO IN THIS SPACE ===\n" +
@@ -234,11 +249,11 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     sharedBlock +
     sections.join("\n") +
     "\n" +
-    "Plan with them: prefer a listed tool or delegating to a listed sub-agent over " +
-    "guessing or doing by hand what one of them is built for. When a sub-agent is " +
-    "better suited to part of the request, delegate that part to it (call it with a " +
-    "clear `prompt`) and fold its result into your answer. Only call a capability " +
-    "when it actually helps the current request.\n" +
+    "Plan with them: prefer a listed tool over guessing or doing by hand what one " +
+    "of them is built for. Only call a capability when it actually helps the " +
+    "current request. To bring in another agent for part of the work, do NOT look " +
+    "for it here — @mention them in your reply (see the group chat section); that " +
+    "hand-off happens asynchronously as its own chat turn, it is not a tool call.\n" +
     "=== END WHAT YOU CAN DO ===\n"
   );
 }
