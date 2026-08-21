@@ -143,6 +143,14 @@ function describe(entry) {
  * Build the MCP tool definitions for a catalog, plus the name → entry map the
  * invoker needs. Entries with no routable target are dropped: handing a live
  * agent a tool that cannot be reached only produces confident failures.
+ *
+ * Other AGENTS are never exposed as callable tools. An agent reaches a teammate
+ * only by @mentioning them in its chat reply — an asynchronous hand-off the
+ * Decillion app turns into a fresh run for that teammate (see the group-chat
+ * preamble in `prompt.mjs`). Offering a synchronous "call another agent like a
+ * tool" is what made an agent block on a nested run and hang mid-flow, so agent
+ * entries are filtered out here at the one point every caller (MCP tools, the
+ * invoker's `byName` router, and the capabilities preamble) reads from.
  */
 export function buildToolDefinitions(catalog) {
   const tools = [];
@@ -150,6 +158,10 @@ export function buildToolDefinitions(catalog) {
   const taken = new Set();
   for (const entry of Array.isArray(catalog) ? catalog : []) {
     if (!entry || typeof entry !== "object") continue;
+    // Agents are participants, not tools: they collaborate over @mention in the
+    // chat, never through a synchronous tool call. Keep them out of the callable
+    // surface entirely.
+    if (entry.kind === "agent") continue;
     const target = entry.program_id || entry.programId || entry.machine_id || entry.tool_id || entry.creature_id || "";
     if (!target) continue;
     const name = mcpToolName(entry, taken);

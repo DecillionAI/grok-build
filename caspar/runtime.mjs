@@ -425,8 +425,21 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
           spaceId,
           selfId: bridge.machineId || bridge.programId || "",
         });
-        task.history = buildHistoryTurns(records, task.self, { excludeText: objective });
-        log("GROK_HISTORY", { spaceId, fetched: records.length, turns: task.history.length });
+        // A space chat is split into threads (tabs), each its own conversation.
+        // When the run belongs to a thread, scope the transcript to it so the
+        // agent reasons only over that thread's history, not the whole space.
+        // Records carry `threadId` in their stored data (default "main"); legacy
+        // turns without one are treated as the main thread.
+        const threadId = typeof task.threadId === "string" && task.threadId.trim()
+          ? task.threadId.trim()
+          : typeof task.thread_id === "string" && task.thread_id.trim()
+            ? task.thread_id.trim()
+            : "";
+        const scoped = threadId
+          ? records.filter((r) => String((r && r.threadId) || "main") === threadId)
+          : records;
+        task.history = buildHistoryTurns(scoped, task.self, { excludeText: objective });
+        log("GROK_HISTORY", { spaceId, fetched: records.length, threadId: threadId || "all", scoped: scoped.length, turns: task.history.length });
       } catch (err) {
         log("GROK_HISTORY", { error: String(err?.message || err) });
       }
