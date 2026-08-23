@@ -225,12 +225,25 @@ async function readProgramIndex(bridge, spaceId, timeoutMs) {
 }
 
 /** The decillion descriptor of a program-index record: inline under
- * `metadata.descriptor`, or a nested public.decillion block. */
+ * `metadata.descriptor`, or a nested public.decillion block. A descriptor that
+ * carries no `kind` of its own (e.g. the thin `{name, category, avatar}` the app
+ * writes when attaching a recommended team) is still returned — the caller
+ * classifies it from the record's top-level `kind`. */
 function descriptorFromProgram(rec) {
   const meta = rec && typeof rec.metadata === "object" && rec.metadata ? rec.metadata : {};
   const d = meta.descriptor && typeof meta.descriptor === "object" ? meta.descriptor : undefined;
-  if (d && d.kind) return d;
+  if (d) return d;
   return extractDescriptor(rec) || extractDescriptor(meta);
+}
+
+/** The record's classification, from wherever it was written: the descriptor's
+ * own `kind`, or the program-index record's top-level `metadata.kind` / `kind`.
+ * Only the on-chain kinds count — anything else is treated as absent. */
+function programKind(rec, descriptor) {
+  const raw = String(
+    (descriptor && descriptor.kind) || pick(rec?.metadata, ["kind"]) || pick(rec, ["kind"]) || "",
+  ).toLowerCase();
+  return raw === "agent" || raw === "frontend" || raw === "tool" ? raw : "";
 }
 
 /**
@@ -250,16 +263,26 @@ export function entryFromProgram(rec, spaceId) {
   if (!routing.entityId) routing.entityId = pick(meta, ["entityId", "entity_id"]);
   const resourceId = pick(rec, ["resourceId", "resource_id"]) || pick(meta, ["resourceId", "resource_id"]);
   const d = descriptorFromProgram(rec);
+  // The record's classification. An agent proxy is attached to a space with its
+  // kind recorded on the index record — sometimes on the descriptor, sometimes
+  // only as a top-level `metadata.kind` (the app's `assignAgent` writes it there,
+  // as the tool-attach path does), and the team-recommend flow historically wrote
+  // a thin descriptor with no kind at all. Read every spelling: a teammate agent
+  // that classifies as a `tool` here leaks straight into the callable-tool
+  // surface (`catalog.buildToolDefinitions` only drops `kind:"agent"`), so other
+  // agents call it as a tool instead of @mentioning it. Descriptor kind wins;
+  // the record's top-level kind is the fallback; "tool" only when neither says so.
+  const recordKind = programKind(rec, d);
   let entry;
-  if (d && d.kind) {
-    entry = entryFromDescriptor(d, routing);
+  if (d) {
+    entry = entryFromDescriptor(d.kind ? d : { ...d, kind: recordKind || "tool" }, routing);
   } else {
     const name = pick(meta, ["name"]) || pick(rec, ["name"]);
     if (!name) return null; // nothing describable — don't list a bare routing id
     entry = {
       name,
-      kind: "tool",
-      category: "general",
+      kind: recordKind || "tool",
+      category: recordKind === "agent" ? "agent" : "general",
       description: String(pick(meta, ["description"]) || ""),
       arg_schema: {},
       requires_network: false,
