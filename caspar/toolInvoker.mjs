@@ -56,12 +56,20 @@ export class ToolInvoker {
    * @param byName   MCP tool name → catalog entry (from `buildToolDefinitions`)
    * @param selfId   this creature's node-assigned id, used as `reply_to`
    */
-  constructor(bridge, byName, selfId) {
+  constructor(bridge, byName, selfId, options = {}) {
     this.bridge = bridge;
     this.byName = byName;
     this.selfId = selfId;
     this.waiters = new Map(); // correlationId -> resolve
+    this.usage = [];
+    this.authorizedToolIds = options.authorizedToolIds
+      ? new Set(options.authorizedToolIds.map(String))
+      : null;
     this.unsubscribe = bridge.onSignal((key, data) => this._onSignal(key, data));
+  }
+
+  usageSnapshot() {
+    return this.usage.map((row) => ({ ...row }));
   }
 
   _onSignal(key, data) {
@@ -95,11 +103,14 @@ export class ToolInvoker {
    * returned as `{ ok: false, error }` so the model sees the failure and can
    * react, exactly as it would for any tool error.
    */
-  async invoke(name, args) {
+  async invoke(name, args, options = {}) {
     const entry = this.byName.get(name);
     if (!entry) return { ok: false, error: `unknown tool creature ${name}` };
     const target = entry.program_id || entry.programId || entry.machine_id || entry.tool_id || entry.creature_id || "";
     if (!target) return { ok: false, error: `no target machine for tool ${name}` };
+    if (this.authorizedToolIds && !this.authorizedToolIds.has(String(target))) {
+      return { ok: false, error: `tool ${name} is not authorized by this billing quote` };
+    }
 
     const payload = mergeArgs(entry, args);
     const entityId = entry.entity_id || entry.entityId || entry.tool_id || name;
@@ -146,9 +157,25 @@ export class ToolInvoker {
     try {
       const result = await Promise.race([settled, timedOut]);
       if (result === TIMED_OUT) {
+        if (options.billable !== false) {
+          this.usage.push({
+            resourceId: String(target),
+            calls: 1,
+            runtimeMs: Date.now() - startedAt,
+            outcome: "timeout",
+          });
+        }
         this.waiters.delete(correlationId);
         traceToolCall({ phase: "timeout", tool: name, function: String(fn), correlationId, ms: Date.now() - startedAt });
         return { ok: false, error: `tool creature ${name} did not reply within ${timeoutMs / 1000}s` };
+      }
+      if (options.billable !== false) {
+        this.usage.push({
+          resourceId: String(target),
+          calls: 1,
+          runtimeMs: Date.now() - startedAt,
+          outcome: result && typeof result === "object" && result.ok === false ? "error" : "ok",
+        });
       }
       traceToolCall({ phase: "done", tool: name, function: String(fn), correlationId, ms: Date.now() - startedAt });
       return { ok: true, tool: name, function: String(fn), response: result };

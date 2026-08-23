@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+process.env.NODE_ENV = "test";
+process.env.GROK_CREATURE_TEST_UNBILLED = "1";
+
 /**
  * Checks for the Caspar signaling bridge.
  *
@@ -165,6 +168,30 @@ await check("a payload-string envelope (the CLI convention) unwraps, keeping pro
   assert.equal(taskObjective(decoded.task), "ship it");
   assert.equal(decoded.task.skill, "persona");
   assert.equal(decoded.correlationId, "c9");
+});
+
+await check("a direct tool delivery preserves arguments and trusts the envelope space", () => {
+  const packet = {
+    kind: "direct_tool",
+    toolProgramId: "tool-1",
+    function: "list",
+    payload: { path: "/client-value", space_id: "forged-space" },
+    billingAuthorization: { holdId: "h", payerUserId: "u", quoteId: "q" },
+    correlationId: "tool-correlation",
+    reply_to: "user-1",
+    spaceId: "forged-space",
+  };
+  const decoded = decodeTaskSignal("creatures/signal", {
+    data: JSON.stringify(packet),
+    correlationId: "tool-correlation",
+    store: { id: "real-space" },
+  });
+  assert.ok(decoded);
+  assert.equal(decoded.task.kind, "direct_tool");
+  assert.deepEqual(decoded.task.payload, packet.payload, "tool arguments are not unwrapped as a task");
+  assert.equal(decoded.task.spaceId, "real-space", "the node envelope overrides the client space");
+  assert.equal(decoded.correlationId, "tool-correlation");
+  assert.equal(decoded.replyTo, "user-1");
 });
 
 await check("the agent's injected config.llm (proxy inject) survives the payload-string unwrap", () => {

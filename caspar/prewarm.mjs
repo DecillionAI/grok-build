@@ -76,7 +76,7 @@ export function prewarmToolContainers(invoker, toolDefs, byName, opts = {}) {
     // Fire-and-forget: `invoke` never throws (it returns `{ok:false,…}`), so a
     // swallowed settle is enough. We do not await — the whole point is to let
     // the spawn happen alongside the model's first turn.
-    Promise.resolve(invoker.invoke(def.name, { function: fn })).then(
+    Promise.resolve(invoker.invoke(def.name, { function: fn }, { billable: false })).then(
       (res) => log({ tool: def.name, function: fn, ok: res?.ok !== false }),
       () => {},
     );

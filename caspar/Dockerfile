@@ -85,6 +85,7 @@ ENV HOME=/home/grok \
     GROK_CREATURE_INPUT_DIR=/app/input \
     GROK_CREATURE_WORKSPACE_ROOT=/data/workspaces \
     GROK_CREATURE_CONFIG_DIR=/data/grok-config \
+    GROK_CREATURE_BILLING_REQUIRED=1 \
     GROK_CREATURE_PERMISSION_MODE=bypassPermissions
 
 # Serve prompts over the signaling API (the gateway path). With no gateway env

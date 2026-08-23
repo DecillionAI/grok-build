@@ -55,6 +55,14 @@ import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
 import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+import {
+  authorizeBillingRun,
+  authorizeDirectToolRun,
+  releaseBillingRun,
+  settleBillingRun,
+  settleDirectToolRun,
+} from "./finance.mjs";
+import { runDirectTool } from "./directTool.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -63,6 +71,7 @@ const HERE = path.dirname(new URL(import.meta.url).pathname);
 const VERSION = "1.0.0";
 /** The MCP server name the space's creatures are exposed under. */
 const MCP_SERVER_NAME = "caspar";
+const BILLING_OBSERVED = Symbol("billingObserved");
 
 function log(sentinel, payload) {
   process.stdout.write(`${sentinel} ${JSON.stringify(payload)}\n`);
@@ -104,7 +113,7 @@ function catalogFromTask(task) {
  * still a reply, and a creature that dies on a bad prompt stops serving the
  * space.
  */
-async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
+async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, billingSession = null) {
   const started = Date.now();
   const objective = taskObjective(task);
   const sessionId = threadSessionId(task, bridge ? `grok-${bridge.sessionId ?? "vm"}` : "grok-offline");
@@ -265,7 +274,15 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     return lastToolDefs;
   };
 
-  let invoker = bridge ? new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "") : null;
+  const authorizedToolIds = billingSession
+    ? (Array.isArray(billingSession.quote?.priceSnapshot?.tools)
+        ? billingSession.quote.priceSnapshot.tools.map((row) => String(row?.resourceId || "")).filter(Boolean)
+        : [])
+    : undefined;
+  let invoker = bridge
+    ? new ToolInvoker(bridge, byName, bridge.machineId || bridge.programId || "", { authorizedToolIds })
+    : null;
+  let toolUsage = [];
   let socketServer = null;
   let sandboxBridge = null;
   let mcpServers;
@@ -517,6 +534,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (sandboxBridge) await sandboxBridge.stop();
     if (socketServer) await socketServer.stop();
+    if (invoker) toolUsage = invoker.usageSnapshot();
     if (invoker) invoker.dispose();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -560,6 +578,19 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     initMessage,
     warnings: run.warnings,
     attachments: outboundAttachments,
+  });
+  // Keep charge-driving observations private. In particular, result.durationMs
+  // may reflect a child-runner field; billing uses only this host-measured wall
+  // time and the platform meter's own sandbox-active decision.
+  Object.defineProperty(result, BILLING_OBSERVED, {
+    value: {
+      promptTokens: result.usage?.promptTokens || 0,
+      completionTokens: result.usage?.completionTokens || 0,
+      durationMs: Date.now() - started,
+      sandboxActive,
+      tools: toolUsage,
+    },
+    enumerable: false,
   });
   if (run.stderr?.trim()) log("GROK_STDERR", { tail: run.stderr.trim().split("\n").slice(-6) });
   process.stdout.write(`DAVINCI_RESULT ${JSON.stringify(result)}\n`);
@@ -632,40 +663,154 @@ async function persistAnswer(bridge, task, result) {
  * on. A run that throws still produces a reply — silence would leave the user's
  * client spinning until the backend's timeout.
  */
-export async function serveOnce(bridge, delivery) {
-  let result;
+async function retrySettlement(settle) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await settle();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("billing settlement failed");
+}
+
+async function serveDirectTool(bridge, delivery) {
+  let session;
   try {
-    result = await handleTask(bridge, delivery);
+    session = await authorizeDirectToolRun(bridge, delivery);
+  } catch (err) {
+    return {
+      result: { ok: false, error: String(err?.message || err).slice(0, 400) },
+      billing: { status: "rejected" },
+    };
+  }
+
+  let execution;
+  try {
+    execution = await runDirectTool(bridge, delivery, session);
+  } catch (err) {
+    try {
+      await releaseBillingRun(bridge, session, "direct tool execution failed before a completion receipt");
+      return {
+        result: { ok: false, error: String(err?.message || err).slice(0, 400) },
+        billing: { status: "released", chargedMinor: 0 },
+      };
+    } catch (releaseError) {
+      return {
+        result: {
+          ok: false,
+          error: `billing release pending reconciliation: ${String(releaseError?.message || releaseError)}`.slice(0, 400),
+        },
+        billing: { status: "pending_reconciliation" },
+      };
+    }
+  }
+
+  if (!execution.settled) {
+    return {
+      result: execution.result,
+      billing: { status: "released", chargedMinor: 0 },
+    };
+  }
+
+  try {
+    const settlement = await retrySettlement(
+      () => settleDirectToolRun(bridge, session, execution.observed),
+    );
+    return {
+      result: execution.result,
+      billing: {
+        status: "settled",
+        chargedMinor: settlement.chargedMinor,
+        usageHash: settlement.usageHash,
+      },
+    };
+  } catch (err) {
+    return {
+      result: {
+        ok: false,
+        error: `billing settlement pending reconciliation: ${String(err?.message || err)}`.slice(0, 400),
+      },
+      billing: { status: "pending_reconciliation" },
+    };
+  }
+}
+
+export async function serveOnce(bridge, delivery) {
+  const directTool = delivery?.task?.kind === "direct_tool";
+  let result;
+  let directBilling = null;
+  let billingSession = null;
+  try {
+    if (directTool) {
+      if (!bridge) throw new Error("direct tool execution requires a connected meter");
+      const completed = await serveDirectTool(bridge, delivery);
+      result = completed.result;
+      directBilling = completed.billing;
+    } else {
+      // Every production platform run is billable and fails closed. The only
+      // bypass is an explicit test flag while NODE_ENV is exactly "test".
+      const unbilledTest = process.env.NODE_ENV === "test"
+        && creatureFlag("TEST_UNBILLED", false);
+      if (bridge && !unbilledTest) {
+        billingSession = await authorizeBillingRun(bridge, delivery);
+      }
+      result = await handleTask(bridge, delivery, billingSession);
+      if (billingSession) {
+        const observed = result[BILLING_OBSERVED] || {
+          promptTokens: 0,
+          completionTokens: 0,
+          durationMs: 0,
+          sandboxActive: false,
+        };
+        let settlement;
+        try {
+          settlement = await retrySettlement(
+            () => settleBillingRun(bridge, billingSession, observed),
+          );
+        } catch (err) {
+          throw new Error(
+            `billing settlement pending reconciliation: ${String(err?.message || err || "unknown error")}`,
+          );
+        }
+        result.chargedMinor = settlement.chargedMinor;
+        result.billingUsageHash = settlement.usageHash;
+      }
+    }
   } catch (err) {
     log("GROK_BOOT", { run_error: String(err?.stack || err).slice(0, 400) });
-    result = {
-      objective: taskObjective(delivery.task || {}),
-      engine: "grok-build",
-      success: false,
-      answer: "I could not complete this request.",
-      error: String(err?.message || err).slice(0, 400),
-    };
+    result = directTool
+      ? { ok: false, error: String(err?.message || err).slice(0, 400) }
+      : {
+          objective: taskObjective(delivery.task || {}),
+          engine: "grok-build",
+          success: false,
+          answer: "I could not complete this request.",
+          error: String(err?.message || err).slice(0, 400),
+        };
+    if (directTool && !directBilling) directBilling = { status: "rejected" };
     process.stdout.write(`DAVINCI_RESULT ${JSON.stringify(result)}\n`);
   }
   if (bridge && delivery.replyTo) {
     try {
       await bridge.signalUser("creatures/signal", String(delivery.replyTo), {
-        kind: "davinci/result",
+        kind: directTool ? "tools/direct_result" : "davinci/result",
         correlationId: delivery.correlationId,
         // Terminal message: closes the proxy correlation the streamed steps
         // (when routed through the proxy) kept open.
         final: true,
         stream: false,
         result,
+        ...(directTool ? { billing: directBilling } : {}),
       });
     } catch (err) {
       log("GROK_BOOT", { reply_error: String(err?.message || err).slice(0, 200) });
     }
   }
-  // Durably store the answer ourselves, so it survives even if the app never
-  // received the terminal result above. Carries the run's correlationId so it
-  // merges with the app's own persist of this turn rather than duplicating it.
-  await persistAnswer(bridge, delivery.task || {}, result);
+  // Direct tool executions have no chat answer to persist. Agent answers remain
+  // durable and merge with the app's own write by correlation id.
+  if (!directTool) await persistAnswer(bridge, delivery.task || {}, result);
   return result;
 }
 

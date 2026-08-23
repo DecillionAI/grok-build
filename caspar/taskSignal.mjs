@@ -90,15 +90,18 @@ export function decodeTaskSignal(key, data) {
   if (inner === undefined && typeof data.data === "string") return null; // unparseable
   if (!inner || typeof inner !== "object") inner = data;
 
-  // The requester's real payload may travel as a JSON string (or object) under
-  // `payload`. Unwrap it into the task, keeping the proxy envelope keys.
-  const wrapped = inner.payload;
-  if (typeof wrapped === "string" && wrapped.trim()) {
-    const parsed = parseMaybeJson(wrapped);
-    const payload = parsed && typeof parsed === "object" ? parsed : { objective: wrapped };
-    inner = mergeEnvelope(payload, inner);
-  } else if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) {
-    inner = mergeEnvelope(wrapped, inner);
+  // A direct_tool packet deliberately owns a `payload` field containing the
+  // tool arguments, so it must not be mistaken for the transport wrapper used
+  // by normal prompt signals.
+  if (inner.kind !== "direct_tool") {
+    const wrapped = inner.payload;
+    if (typeof wrapped === "string" && wrapped.trim()) {
+      const parsed = parseMaybeJson(wrapped);
+      const payload = parsed && typeof parsed === "object" ? parsed : { objective: wrapped };
+      inner = mergeEnvelope(payload, inner);
+    } else if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) {
+      inner = mergeEnvelope(wrapped, inner);
+    }
   }
 
   // Only act on a task delivery. A packet relayed by a proxy "agent" entity
@@ -106,6 +109,7 @@ export function decodeTaskSignal(key, data) {
   // requester only sent a bare prompt/data string.
   const isTask =
     inner.kind === "task" ||
+    inner.kind === "direct_tool" ||
     typeof inner.objective === "string" ||
     typeof inner.prompt === "string" ||
     typeof inner.skill === "string";
