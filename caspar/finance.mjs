@@ -150,8 +150,14 @@ function toolSettlement(quote, observed, sourceRef) {
   let total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
   const minimum = integer(price.minChargeMinor, "minChargeMinor");
   if (total < minimum) {
-    addLine(lines, caps, payer, String(price.platformAccountId), "platform", minimum - total, sourceRef);
-    total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
+    const topUp = Math.min(
+      minimum - total,
+      platformFloorRoom(lines, caps, payer, String(price.platformAccountId)),
+    );
+    if (topUp > 0) {
+      addLine(lines, caps, payer, String(price.platformAccountId), "platform", topUp, sourceRef);
+      total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
+    }
   }
   if (total > integer(quote.maxAmount, "quote.maxAmount")) {
     throw new Error("actual cost exceeds authorized hold");
@@ -172,6 +178,27 @@ function addLine(lines, caps, payerUserId, userId, role, amount, sourceRef) {
     throw new Error(`actual ${role} cost exceeds authorized cap`);
   }
   lines.push({ userId, role, amount, sourceRef });
+}
+
+/**
+ * How much of the minimum-charge floor may still be routed to the platform
+ * account without exceeding what the quote authorized for it. The floor is a
+ * top-up, not a metered cost, so it must never fail a settlement: if the quote
+ * under-reserved the platform cap (e.g. a zero-margin agent/tool whose
+ * commission rounded to zero, so no platform beneficiary was quoted), collect
+ * as much of the minimum as was authorized and settle — rather than throwing
+ * "quote does not authorize platform" and discarding an answer the agent
+ * already produced. Returns 0 when the payer is the platform account or the
+ * quote reserved no platform cap.
+ */
+function platformFloorRoom(lines, caps, payerUserId, platformAccountId) {
+  if (!platformAccountId || platformAccountId === payerUserId) return 0;
+  const cap = caps.get(`${platformAccountId}|platform`);
+  if (cap === undefined) return 0;
+  const already = lines
+    .filter((line) => line.userId === platformAccountId && line.role === "platform")
+    .reduce((sum, line) => add(sum, line.amount, "platform.floor.total"), 0);
+  return Math.max(0, cap - already);
 }
 
 function agentSettlement(quote, observed, sourceRef) {
@@ -281,8 +308,14 @@ function agentSettlement(quote, observed, sourceRef) {
   let total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
   const minimum = integer(price.minChargeMinor, "minChargeMinor");
   if (total < minimum) {
-    addLine(lines, caps, payer, String(price.platformAccountId), "platform", minimum - total, sourceRef);
-    total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
+    const topUp = Math.min(
+      minimum - total,
+      platformFloorRoom(lines, caps, payer, String(price.platformAccountId)),
+    );
+    if (topUp > 0) {
+      addLine(lines, caps, payer, String(price.platformAccountId), "platform", topUp, sourceRef);
+      total = lines.reduce((sum, line) => add(sum, line.amount, "settlementTotal"), 0);
+    }
   }
   if (total > integer(quote.maxAmount, "quote.maxAmount")) {
     throw new Error("actual cost exceeds authorized hold");

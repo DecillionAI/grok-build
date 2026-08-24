@@ -383,6 +383,42 @@ const directToolTask = {
   );
 }
 
+// ── minimum-charge floor never fails a settlement ───────────────────────────
+// A zero-margin run whose actual cost lands below the catalog minimum must
+// still settle. The minimum-charge floor is a top-up routed to the platform
+// account; it is clamped to whatever platform cap the quote reserved (here none)
+// instead of throwing "quote does not authorize platform" and discarding the
+// agent's answer.
+{
+  const zeroMarginQuote = {
+    quoteId: "quote-z", requestId: "run-z", payerUserId: "payer",
+    kind: "agent", resourceId: "agent-program", projectId: "project-1",
+    maxAmount: 100_000,
+    beneficiaries: [{ userId: "node", role: "node_owner", maxAmount: 100_000 }],
+    priceSnapshot: {
+      kind: "agent",
+      inputPerMillionMinor: 1_000_000, outputPerMillionMinor: 1_000_000,
+      // gross == provider → zero margin → zero commission → no platform beneficiary quoted
+      providerInputPerMillionMinor: 1_000_000, providerOutputPerMillionMinor: 1_000_000,
+      sandboxPerMinuteMinor: 600, minChargeMinor: 10_000, platformCommissionBps: 2_000,
+      platformAccountId: "platform", providerClearingAccountId: "provider",
+      nodeOwnerAccountId: "node", creatorAccountId: "creator", tools: [],
+    },
+  };
+  const bridge = new Bridge();
+  const session = { runId: "run-z", quoteId: "quote-z", payerUserId: "payer", holdId: "hold-z", quote: zeroMarginQuote };
+  const receipt = await settleBillingRun(bridge, session, {
+    promptTokens: 0, completionTokens: 0, sandboxActive: true, durationMs: 1_000, tools: [],
+  });
+  const settle = bridge.calls.find((c) => c.op === "settleHold");
+  assert.ok(settle, "a sub-minimum zero-margin run still settles instead of throwing");
+  assert.ok(
+    !settle.input.lines.some((l) => l.role === "platform"),
+    "no platform floor line is charged when the quote reserved no platform cap",
+  );
+  assert.ok(receipt.chargedMinor < 10_000, "the run settles below the minimum rather than failing");
+}
+
 // ── agent run billing lifecycle (serveAgent) ────────────────────────────────
 // authorizeBillingRun moves the hold open→running (startHold). From that point
 // only this meter can free the hold before its TTL; the app cannot release a
