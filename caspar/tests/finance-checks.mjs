@@ -98,25 +98,46 @@ class Bridge {
     programId = "trusted-meter",
     quoteValue = quote,
     holdValue = hold,
+    poolValue = null,
   } = {}) {
     this.programId = programId;
     this.calls = [];
     this.settlementOk = settlementOk;
     this.quoteValue = quoteValue;
     this.holdValue = holdValue;
+    this.poolValue = poolValue;
   }
 
   async call(op, input) {
     this.calls.push({ op, input });
     if (op === "getJson" && input.key === `Json::FinanceHold::${this.holdValue.holdId || "hold-1"}`) return { data: this.holdValue };
+    if (op === "getJson" && this.poolValue && input.key === `Json::FinancePool::${this.poolValue.poolId}`) return { data: this.poolValue };
     if (op === "getJson" && input.key === `Json::BillingQuote::${this.quoteValue.quoteId}`) return { data: this.quoteValue };
-    if (op === "startHold") return { ok: true };
-    if (op === "settleHold") return this.settlementOk ? { ok: true } : { ok: false, error: "rejected" };
-    if (op === "releaseHold") return { ok: true };
+    if (op === "startHold" || op === "reservePool") return { ok: true };
+    if (op === "settleHold" || op === "settlePool") return this.settlementOk ? { ok: true } : { ok: false, error: "rejected" };
+    if (op === "releaseHold" || op === "releasePool") return { ok: true };
     if (op === "putJson") return { ok: true };
     throw new Error(`unexpected bridge call ${op}`);
   }
 }
+
+const pool = {
+  poolId: "pool-1",
+  payerUserId: "payer",
+  status: "open",
+  meterProgramId: "trusted-meter",
+  settlementAuthority: "node",
+  remaining: 1_000_000,
+  reserved: 0,
+  spent: 0,
+  expiresAt: Date.now() + 3_600_000,
+};
+
+const poolTask = {
+  proxyProgramId: "agent-program",
+  spaceId: "project-1",
+  billingAuthorization: { poolId: "pool-1", payerUserId: "payer", quoteId: "quote-1" },
+};
 
 const task = {
   proxyProgramId: "agent-program",
@@ -476,6 +497,59 @@ const agentDelivery = { task, correlationId: "run-1" };
   assert.ok(
     bridge.calls.some((c) => c.op === "releaseHold"),
     "a failed settlement releases the running hold so funds are not stranded",
+  );
+}
+
+// ── shared-pool run path (reserve / settle / release against the pool) ───────
+// A run whose authorization carries a poolId draws down the user's shared pool
+// instead of taking its own hold: authorize -> reservePool, settle -> settlePool,
+// failure -> releasePool. Lines and caps are identical to the hold path.
+{
+  const bridge = new Bridge({ poolValue: pool });
+  const session = await authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" });
+  assert.equal(session.poolId, "pool-1", "a pool-backed run carries the pool id");
+  assert.ok(!session.holdId, "a pool-backed run has no per-run hold");
+  const reserve = bridge.calls.find((c) => c.op === "reservePool");
+  assert.ok(reserve, "authorization reserves a slice from the pool");
+  assert.equal(reserve.input.runId, "run-1");
+  assert.equal(reserve.input.maxAmount, quote.maxAmount, "reserves the quote's authorized ceiling");
+  assert.ok(!bridge.calls.some((c) => c.op === "startHold"), "pool runs do not start a hold");
+
+  const receipt = await settleBillingRun(bridge, session, {
+    promptTokens: 1_000, completionTokens: 500, sandboxActive: false, durationMs: 1_000, tools: [],
+  });
+  const settle = bridge.calls.find((c) => c.op === "settlePool");
+  assert.ok(settle, "settlement goes to the pool");
+  assert.equal(settle.input.poolId, "pool-1");
+  assert.equal(settle.input.runId, "run-1");
+  assert.equal(settle.input.settlementId, "run-1");
+  assert.equal(
+    settle.input.lines.reduce((sum, line) => sum + line.amount, 0),
+    receipt.chargedMinor,
+    "pool settlement charges exactly the computed lines",
+  );
+  assert.ok(!bridge.calls.some((c) => c.op === "settleHold"), "pool runs do not settle a hold");
+}
+
+// A pool-backed run that fails before a receipt releases its whole slice back.
+{
+  const bridge = new Bridge({ poolValue: pool });
+  const session = await authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" });
+  await releaseBillingRun(bridge, session, "run failed before settlement");
+  const release = bridge.calls.find((c) => c.op === "releasePool");
+  assert.ok(release, "a failed pool run releases its reservation");
+  assert.equal(release.input.poolId, "pool-1");
+  assert.equal(release.input.runId, "run-1");
+  assert.ok(!bridge.calls.some((c) => c.op === "releaseHold"), "pool runs do not release a hold");
+}
+
+// A closed/expired pool refuses new runs (fail closed).
+{
+  const bridge = new Bridge({ poolValue: { ...pool, status: "closed" } });
+  await expectReject(
+    "a run cannot authorize against a closed pool",
+    () => authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" }),
+    /pool is not open/,
   );
 }
 
