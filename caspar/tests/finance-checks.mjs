@@ -8,6 +8,7 @@ import {
   settleBillingRun,
   settleDirectToolRun,
 } from "../finance.mjs";
+import { serveAgent } from "../runtime.mjs";
 
 const quote = {
   quoteId: "quote-1",
@@ -379,6 +380,66 @@ const directToolTask = {
       outcome: "ok",
     }),
     /exceeds authorized quote ceiling/,
+  );
+}
+
+// ── agent run billing lifecycle (serveAgent) ────────────────────────────────
+// authorizeBillingRun moves the hold open→running (startHold). From that point
+// only this meter can free the hold before its TTL; the app cannot release a
+// running hold. So a run that fails after start MUST release, or the payer's
+// authorization stays "held for active runs" for the full hold TTL — the wallet
+// drain these checks guard against.
+
+const agentDelivery = { task, correlationId: "run-1" };
+
+// A completed run settles and never releases.
+{
+  const bridge = new Bridge();
+  const result = await serveAgent(bridge, agentDelivery, async () => ({
+    answer: "done",
+    success: true,
+  }));
+  assert.ok(bridge.calls.some((c) => c.op === "startHold"), "a billed run starts the hold");
+  assert.ok(bridge.calls.some((c) => c.op === "settleHold"), "a completed run settles the hold");
+  assert.ok(
+    !bridge.calls.some((c) => c.op === "releaseHold"),
+    "a completed run does not release the hold",
+  );
+  assert.equal(typeof result.chargedMinor, "number", "a settled run reports its charge");
+}
+
+// A run that throws after the hold started releases the running hold so the
+// authorization is not stranded, then re-surfaces the original error.
+{
+  const bridge = new Bridge();
+  await expectReject(
+    "an agent run that throws after start propagates its error",
+    () => serveAgent(bridge, agentDelivery, async () => {
+      throw new Error("attachment materialization failed");
+    }),
+    /attachment materialization failed/,
+  );
+  const release = bridge.calls.find((c) => c.op === "releaseHold");
+  assert.ok(release, "a failed agent run releases the running hold");
+  assert.equal(release.input.holdId, "hold-1", "the leaked authorization is released");
+  assert.ok(
+    !bridge.calls.some((c) => c.op === "settleHold"),
+    "a run that never produced usage is not settled",
+  );
+}
+
+// A run whose atomic settlement keeps failing releases the running hold rather
+// than leaving the payer's funds held, and surfaces a reconciliation error.
+{
+  const bridge = new Bridge({ settlementOk: false });
+  await expectReject(
+    "an unsettleable agent run surfaces a reconciliation error",
+    () => serveAgent(bridge, agentDelivery, async () => ({ answer: "partial", success: false })),
+    /pending reconciliation/,
+  );
+  assert.ok(
+    bridge.calls.some((c) => c.op === "releaseHold"),
+    "a failed settlement releases the running hold so funds are not stranded",
   );
 }
 

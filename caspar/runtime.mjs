@@ -737,11 +737,93 @@ async function serveDirectTool(bridge, delivery) {
   }
 }
 
+function errText(err) {
+  return String(err?.message || err || "");
+}
+
+/**
+ * Release a running/open hold, swallowing and logging any release failure. A
+ * failed release (Caspar unreachable, or the hold already closed elsewhere) must
+ * never mask the original run error — reconciliation's stale-hold check is the
+ * backstop. Idempotent server-side: Caspar's releaseHold rejects an
+ * already-settled hold, so a release that races a settlement cannot double-refund.
+ */
+async function releaseBillingSafely(bridge, session, reason) {
+  if (!bridge || !session) return;
+  try {
+    await releaseBillingRun(bridge, session, reason);
+  } catch (releaseError) {
+    log("GROK_BOOT", { billing_release_error: errText(releaseError).slice(0, 200) });
+  }
+}
+
+/**
+ * Serve one agent prompt end to end, owning its billing lifecycle. The hold is
+ * moved open→running by `authorizeBillingRun`; from that point the payer's funds
+ * are "held for active runs" and ONLY this meter (the hold's settlement
+ * authority) can free them before the hold's TTL expires — the app, as payer,
+ * cannot release a *running* hold. So every exit path must reach the hold:
+ * settle it on a completed run, or release it when the run fails before a valid
+ * settlement. Leaving it dangling strands the authorization — up to the
+ * safety-factored ceiling (as much as 10× the estimate) — in the wallet for the
+ * full hold TTL, which is exactly the "money held for active runs that never
+ * comes back" wallet drain. Mirrors serveDirectTool's failure handling.
+ *
+ * `runTask` is injectable so the billing lifecycle can be exercised in tests
+ * without spawning a grok child; production always uses handleTask.
+ */
+export async function serveAgent(bridge, delivery, runTask = handleTask) {
+  // Every production platform run is billable and fails closed. The only bypass
+  // is an explicit test flag while NODE_ENV is exactly "test".
+  const unbilledTest = process.env.NODE_ENV === "test"
+    && creatureFlag("TEST_UNBILLED", false);
+  const billingSession = bridge && !unbilledTest
+    ? await authorizeBillingRun(bridge, delivery)
+    : null;
+
+  let result;
+  try {
+    result = await runTask(bridge, delivery, billingSession);
+  } catch (err) {
+    // The run authorized (and started) a hold but never produced a settlement.
+    // Release it with zero charge so the payer's funds return immediately
+    // instead of staying held until the hold's TTL expires.
+    await releaseBillingSafely(bridge, billingSession, `agent run failed before settlement: ${errText(err)}`);
+    throw err;
+  }
+
+  if (!billingSession) return result;
+
+  const observed = result[BILLING_OBSERVED] || {
+    promptTokens: 0,
+    completionTokens: 0,
+    durationMs: 0,
+    sandboxActive: false,
+  };
+  let settlement;
+  try {
+    settlement = await retrySettlement(
+      () => settleBillingRun(bridge, billingSession, observed),
+    );
+  } catch (err) {
+    // Settlement could not be applied — observed usage outran the authorized
+    // ceiling, a beneficiary cap was exceeded, or Caspar rejected the atomic
+    // write. The hold is still running; release it so the authorization is
+    // refunded rather than stranded, then surface the failure for reconciliation.
+    await releaseBillingSafely(bridge, billingSession, `agent settlement failed: ${errText(err)}`);
+    throw new Error(
+      `billing settlement pending reconciliation: ${errText(err) || "unknown error"}`,
+    );
+  }
+  result.chargedMinor = settlement.chargedMinor;
+  result.billingUsageHash = settlement.usageHash;
+  return result;
+}
+
 export async function serveOnce(bridge, delivery) {
   const directTool = delivery?.task?.kind === "direct_tool";
   let result;
   let directBilling = null;
-  let billingSession = null;
   try {
     if (directTool) {
       if (!bridge) throw new Error("direct tool execution requires a connected meter");
@@ -749,34 +831,7 @@ export async function serveOnce(bridge, delivery) {
       result = completed.result;
       directBilling = completed.billing;
     } else {
-      // Every production platform run is billable and fails closed. The only
-      // bypass is an explicit test flag while NODE_ENV is exactly "test".
-      const unbilledTest = process.env.NODE_ENV === "test"
-        && creatureFlag("TEST_UNBILLED", false);
-      if (bridge && !unbilledTest) {
-        billingSession = await authorizeBillingRun(bridge, delivery);
-      }
-      result = await handleTask(bridge, delivery, billingSession);
-      if (billingSession) {
-        const observed = result[BILLING_OBSERVED] || {
-          promptTokens: 0,
-          completionTokens: 0,
-          durationMs: 0,
-          sandboxActive: false,
-        };
-        let settlement;
-        try {
-          settlement = await retrySettlement(
-            () => settleBillingRun(bridge, billingSession, observed),
-          );
-        } catch (err) {
-          throw new Error(
-            `billing settlement pending reconciliation: ${String(err?.message || err || "unknown error")}`,
-          );
-        }
-        result.chargedMinor = settlement.chargedMinor;
-        result.billingUsageHash = settlement.usageHash;
-      }
+      result = await serveAgent(bridge, delivery);
     }
   } catch (err) {
     log("GROK_BOOT", { run_error: String(err?.stack || err).slice(0, 400) });
