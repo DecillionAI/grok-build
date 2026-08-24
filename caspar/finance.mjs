@@ -327,12 +327,78 @@ function usageHash(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+// Validate a run's committed quote against its authorization (pool or hold) for
+// the fields both paths share, and return the loaded quote. Throws on mismatch.
+function assertQuoteBinding(quote, { payerUserId, quoteId }, { task, correlationId }, expectedKind) {
+  if (String(quote.payerUserId) !== payerUserId) throw new Error("billing payer mismatch");
+  if (String(quote.quoteId) !== quoteId) throw new Error("billing quote mismatch");
+  if (String(quote.requestId) !== String(correlationId)) {
+    throw new Error("billing quote is not bound to this run");
+  }
+  if (String(quote.kind || "") !== expectedKind || String(quote.priceSnapshot?.kind || "") !== expectedKind) {
+    throw new Error(`billing quote is not for a ${expectedKind} run`);
+  }
+  const expectedResourceId = expectedKind === "agent"
+    ? String(task.proxyProgramId || "")
+    : String(task.toolProgramId || "");
+  if (String(quote.resourceId) !== expectedResourceId) {
+    throw new Error(`billing quote is not for this ${expectedKind}`);
+  }
+  if (String(quote.projectId || "") !== String(task.spaceId || "")) {
+    throw new Error("billing quote is not for this project");
+  }
+}
+
+// Reserve a run's slice from the payer's shared pool (the pool replaces per-run
+// holds). The reservation ceiling is the quote's authorized maxAmount; the run
+// later settles its actual usage against that slice and returns the remainder to
+// the pool. Concurrent runs across the user's spaces all draw down one pool.
+async function authorizePoolRun(bridge, { task, correlationId }, expectedKind, { poolId, payerUserId, quoteId }) {
+  if (!poolId || !payerUserId || !quoteId || !correlationId) {
+    throw new Error("incomplete billing authorization");
+  }
+  const [pool, quote] = await Promise.all([
+    readJson(bridge, `Json::FinancePool::${poolId}`, "pool"),
+    readJson(bridge, `Json::BillingQuote::${quoteId}`, "quote"),
+  ]);
+  if (!pool || !quote) throw new Error("billing pool or quote not found");
+  if (pool.status !== "open") throw new Error("billing pool is not open");
+  if (String(pool.payerUserId) !== payerUserId) throw new Error("billing payer mismatch");
+  assertQuoteBinding(quote, { payerUserId, quoteId }, { task, correlationId }, expectedKind);
+  if (String(pool.meterProgramId) !== String(bridge.programId || "")) {
+    throw new Error("billing pool is not assigned to this meter");
+  }
+  validateExecutionPlan(pool, quote, bridge.programId);
+  if (Date.now() > integer(pool.expiresAt, "pool.expiresAt")) {
+    throw new Error("billing pool expired");
+  }
+  const reserve = await bridge.call(
+    "reservePool",
+    {
+      poolId,
+      payerUserId,
+      quoteId,
+      runId: String(correlationId),
+      maxAmount: integer(quote.maxAmount, "quote.maxAmount"),
+    },
+    { timeoutMs: 35_000 },
+  );
+  if (!reserve || reserve.ok !== true) {
+    throw new Error(String(reserve?.error || "could not reserve from billing pool"));
+  }
+  return { poolId, payerUserId, quoteId, runId: String(correlationId), quote };
+}
+
 async function authorizeRun(bridge, { task, correlationId }, expectedKind) {
   const auth = authorization(task);
   if (!auth) throw new Error("billing authorization required");
-  const holdId = String(auth.holdId || "");
   const payerUserId = String(auth.payerUserId || "");
   const quoteId = String(auth.quoteId || "");
+  const poolId = String(auth.poolId || "");
+  if (poolId) {
+    return authorizePoolRun(bridge, { task, correlationId }, expectedKind, { poolId, payerUserId, quoteId });
+  }
+  const holdId = String(auth.holdId || "");
   if (!holdId || !payerUserId || !quoteId || !correlationId) {
     throw new Error("incomplete billing authorization");
   }
@@ -391,6 +457,28 @@ export function authorizeDirectToolRun(bridge, delivery) {
   return authorizeRun(bridge, delivery, "tool");
 }
 
+// Route a computed settlement to the right Caspar op: settlePool for a pool-backed
+// session (the run draws down the user's shared pool), settleHold for a legacy
+// per-run hold. The lines and their caps are identical either way — only the
+// authorization the actual usage settles against differs.
+async function submitSettlement(bridge, session, usageHashValue, lines) {
+  const shared = {
+    payerUserId: session.payerUserId,
+    quoteId: session.quoteId,
+    settlementId: session.runId,
+    usageHash: usageHashValue,
+    lines,
+  };
+  const [op, input] = session.poolId
+    ? ["settlePool", { poolId: session.poolId, runId: session.runId, ...shared }]
+    : ["settleHold", { holdId: session.holdId, ...shared }];
+  const response = await bridge.call(op, input, { timeoutMs: 35_000 });
+  if (!response || response.ok !== true) {
+    throw new Error(String(response?.error || "billing settlement failed"));
+  }
+  return response;
+}
+
 export async function settleBillingRun(bridge, session, observed) {
   if (!session[AGENT_SETTLEMENT_EVIDENCE]) {
     const settlement = agentSettlement(session.quote, observed, session.runId);
@@ -419,21 +507,7 @@ export async function settleBillingRun(bridge, session, observed) {
     data: { ...usage, usageHash: hash, status: "observed" },
     merge: false,
   });
-  const response = await bridge.call(
-    "settleHold",
-    {
-      holdId: session.holdId,
-      payerUserId: session.payerUserId,
-      quoteId: session.quoteId,
-      settlementId: session.runId,
-      usageHash: hash,
-      lines: settlement.lines,
-    },
-    { timeoutMs: 35_000 },
-  );
-  if (!response || response.ok !== true) {
-    throw new Error(String(response?.error || "billing settlement failed"));
-  }
+  await submitSettlement(bridge, session, hash, settlement.lines);
   await bridge.call("putJson", {
     key: `Json::BillingUsage::${session.runId}`,
     path: "usage",
@@ -471,21 +545,7 @@ export async function settleDirectToolRun(bridge, session, observed) {
     data: { ...usage, usageHash: hash, status: "observed" },
     merge: false,
   });
-  const response = await bridge.call(
-    "settleHold",
-    {
-      holdId: session.holdId,
-      payerUserId: session.payerUserId,
-      quoteId: session.quoteId,
-      settlementId: session.runId,
-      usageHash: hash,
-      lines: settlement.lines,
-    },
-    { timeoutMs: 35_000 },
-  );
-  if (!response || response.ok !== true) {
-    throw new Error(String(response?.error || "billing settlement failed"));
-  }
+  await submitSettlement(bridge, session, hash, settlement.lines);
   await bridge.call("putJson", {
     key: `Json::BillingUsage::${session.runId}`,
     path: "usage",
@@ -496,16 +556,12 @@ export async function settleDirectToolRun(bridge, session, observed) {
 }
 
 export async function releaseBillingRun(bridge, session, reason) {
-  const response = await bridge.call(
-    "releaseHold",
-    {
-      holdId: session.holdId,
-      payerUserId: session.payerUserId,
-      releaseId: `meter_release_${session.runId}`,
-      reason: String(reason || "execution did not produce a receipt").slice(0, 256),
-    },
-    { timeoutMs: 35_000 },
-  );
+  const releaseId = `meter_release_${session.runId}`;
+  const reasonText = String(reason || "execution did not produce a receipt").slice(0, 256);
+  const [op, input] = session.poolId
+    ? ["releasePool", { poolId: session.poolId, payerUserId: session.payerUserId, runId: session.runId, releaseId, reason: reasonText }]
+    : ["releaseHold", { holdId: session.holdId, payerUserId: session.payerUserId, releaseId, reason: reasonText }];
+  const response = await bridge.call(op, input, { timeoutMs: 35_000 });
   if (!response || response.ok !== true) {
     throw new Error(String(response?.error || "billing hold release failed"));
   }
