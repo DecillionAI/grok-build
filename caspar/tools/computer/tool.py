@@ -176,18 +176,21 @@ fi
 NOVNC=""
 for d in /usr/share/novnc /usr/share/webapps/novnc; do [ -d "$d" ] && { NOVNC="$d"; break; }; done
 
+# Detach helper: prefer setsid (own session), fall back to nohup, so daemons
+# survive this script exiting on images without util-linux's setsid.
+if have setsid; then DETACH="setsid"; else DETACH="nohup"; fi
+
 # --- 2. (re)start the daemons (idempotent) ---------------------------------
 pkill -f "Xvfb $DISP" 2>/dev/null || true
 echo "START: virtual display $DISP ($GEOM)"
-setsid Xvfb "$DISP" -screen 0 "$GEOM" -nolisten tcp -ac >"$DIR/xvfb.log" 2>&1 &
+$DETACH Xvfb "$DISP" -screen 0 "$GEOM" -nolisten tcp -ac >"$DIR/xvfb.log" 2>&1 &
 echo $! >"$DIR/xvfb.pid"
 sleep 2
 export DISPLAY="$DISP"
-export HOME="$HOME"
 
 if have fluxbox; then
   echo "START: window manager"
-  setsid fluxbox >"$DIR/wm.log" 2>&1 &
+  $DETACH fluxbox >"$DIR/wm.log" 2>&1 &
   echo $! >"$DIR/wm.pid"
   sleep 1
 fi
@@ -195,11 +198,11 @@ fi
 echo "START: launching the browser"
 case "$BROWSER_BIN" in
   *chrom*)
-    setsid "$BROWSER_BIN" --no-sandbox --disable-dev-shm-usage --user-data-dir="$DIR/profile" \
+    $DETACH "$BROWSER_BIN" --no-sandbox --disable-dev-shm-usage --user-data-dir="$DIR/profile" \
       --window-position=0,0 --start-maximized --no-first-run "$HOME_URL" >"$DIR/browser.log" 2>&1 &
     ;;
   *)
-    setsid "$BROWSER_BIN" --no-remote --profile "$DIR/profile" "$HOME_URL" >"$DIR/browser.log" 2>&1 &
+    $DETACH "$BROWSER_BIN" --no-remote --profile "$DIR/profile" "$HOME_URL" >"$DIR/browser.log" 2>&1 &
     ;;
 esac
 echo $! >"$DIR/browser.pid"
@@ -208,16 +211,16 @@ sleep 2
 pkill -f "x11vnc.*$DISP" 2>/dev/null || true
 echo "START: VNC server on port $VNC_PORT"
 if [ -n "$VNCPW" ]; then PWARG="-passwd $VNCPW"; else PWARG="-nopw"; fi
-setsid x11vnc -display "$DISP" -forever -shared -noxdamage -rfbport "$VNC_PORT" $PWARG >"$DIR/x11vnc.log" 2>&1 &
+$DETACH x11vnc -display "$DISP" -forever -shared -noxdamage -rfbport "$VNC_PORT" $PWARG >"$DIR/x11vnc.log" 2>&1 &
 echo $! >"$DIR/vnc.pid"
 sleep 1
 
 pkill -f "websockify.*$WEB_PORT" 2>/dev/null || true
 echo "START: noVNC web bridge on port $WEB_PORT"
 if [ -n "$NOVNC" ]; then
-  setsid websockify --web "$NOVNC" "0.0.0.0:$WEB_PORT" "127.0.0.1:$VNC_PORT" >"$DIR/novnc.log" 2>&1 &
+  $DETACH websockify --web "$NOVNC" "0.0.0.0:$WEB_PORT" "127.0.0.1:$VNC_PORT" >"$DIR/novnc.log" 2>&1 &
 else
-  setsid websockify "0.0.0.0:$WEB_PORT" "127.0.0.1:$VNC_PORT" >"$DIR/novnc.log" 2>&1 &
+  $DETACH websockify "0.0.0.0:$WEB_PORT" "127.0.0.1:$VNC_PORT" >"$DIR/novnc.log" 2>&1 &
 fi
 echo $! >"$DIR/novnc.pid"
 sleep 1
@@ -225,7 +228,7 @@ sleep 1
 pkill -f "cloudflared.*$WEB_PORT" 2>/dev/null || true
 rm -f "$DIR/url"
 echo "START: opening a secure Cloudflare tunnel"
-setsid "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$WEB_PORT" >"$DIR/cloudflared.log" 2>&1 &
+$DETACH "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$WEB_PORT" >"$DIR/cloudflared.log" 2>&1 &
 echo $! >"$DIR/tunnel.pid"
 
 # --- 3. wait for the public URL and record it ------------------------------
@@ -269,6 +272,7 @@ class Desktop:
         self.url: str = ""
         self.error: str = ""
         self.installed = False
+        self.home = ""  # the sandbox's absolute $HOME (so write/read agree with exec)
         self.lock = threading.Lock()
         self._log: List[str] = []
         self._provisioning = False
@@ -363,6 +367,37 @@ def _sbx_exec(space_id: str, command: str, *, timeout: float = EXEC_TIMEOUT_S,
     return _sbx("exec", payload, timeout=timeout)
 
 
+def _get_home(desk: "Desktop") -> str:
+    """The sandbox's absolute ``$HOME`` (cached). We create every file through
+    ``exec`` (which sees this ``$HOME``) and pass it as the ``cwd`` of any ``read``
+    so the file endpoints resolve to the same place the scripts write to — the
+    sandbox ``write`` endpoint's own base dir is NOT guaranteed to match exec's
+    ``$HOME`` (it isn't on the Modal/Vercel backends), which otherwise lands the
+    provision script where the launcher can't find it."""
+    if desk.home:
+        return desk.home
+    try:
+        res = _sbx_exec(desk.space_id, 'printf %s "$HOME"', timeout=EXEC_TIMEOUT_S)
+        home = str(res.get("stdout") or "").strip()
+    except SandboxError:
+        home = ""
+    desk.home = home or "/root"
+    return desk.home
+
+
+def _write_remote_file(desk: "Desktop", rel_path: str, content: str) -> None:
+    """Create a file on the sandbox under ``$HOME/<rel_path>`` via ``exec`` (base64
+    decode), so its path is guaranteed consistent with everything else the scripts
+    reference by ``$HOME`` — avoiding the write-endpoint base-dir mismatch."""
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    target = "\"$HOME/" + rel_path + "\""
+    cmd = ("mkdir -p \"$(dirname " + target + ")\" && printf %s '" + b64 + "' | base64 -d > " + target)
+    res = _sbx_exec(desk.space_id, cmd, timeout=EXEC_TIMEOUT_S)
+    if not res.get("ok"):
+        raise SandboxError("could not write " + rel_path + " to the sandbox: "
+                           + str(res.get("stderr") or res.get("error") or "")[:160])
+
+
 # --------------------------------------------------------------------------- #
 # Provisioning — drive the sandbox to install + run the desktop, stream its log
 # --------------------------------------------------------------------------- #
@@ -421,10 +456,17 @@ def _provision(desk: Desktop) -> None:
         desk._remote_log_off = 0
         desk.log("connecting to the space sandbox…")
 
-        # 1) Make sure the sandbox is up (this cold-boots the microVM if needed).
-        boot = _sbx_exec(space_id, "echo sandbox-ready", timeout=SANDBOX_BOOT_TIMEOUT_S)
+        # 1) Make sure the sandbox is up (this cold-boots the microVM if needed)
+        #    and learn its $HOME so file paths stay consistent.
+        boot = _sbx_exec(space_id, 'printf "DCOMP_HOME=%s\\n" "$HOME"; echo sandbox-ready',
+                         timeout=SANDBOX_BOOT_TIMEOUT_S)
         if not boot.get("ok") and "sandbox-ready" not in str(boot.get("stdout") or ""):
             raise RuntimeError("could not start the space sandbox: " + str(boot.get("error") or boot.get("stderr") or "")[:200])
+        for line in str(boot.get("stdout") or "").splitlines():
+            if line.startswith("DCOMP_HOME="):
+                desk.home = line[len("DCOMP_HOME="):].strip() or desk.home
+        if not desk.home:
+            _get_home(desk)
         desk.log("the space sandbox is up")
 
         # 2) Already running there? Then skip the install entirely.
@@ -436,17 +478,19 @@ def _provision(desk: Desktop) -> None:
             desk.log("the desktop is already running on the sandbox — reusing it")
             return
 
-        # 3) Write the provision/start script onto the sandbox and run it in the
-        #    background, capturing its output to install.log so we can stream it.
+        # 3) Write the provision/start script onto the sandbox (via exec, so its
+        #    path matches $HOME) and run it in the background, capturing its output
+        #    to install.log so we can stream it.
         desk.log("preparing the desktop on the sandbox" + ("" if desk.installed else " (first time — installing)"))
-        _sbx("write", {"space_id": space_id,
-                       "path": REMOTE_DIR + "/provision.sh",
-                       "content": _PROVISION_SCRIPT}, timeout=EXEC_TIMEOUT_S)
-        _sbx_exec(space_id,
-                  "mkdir -p \"$HOME/" + REMOTE_DIR + "\"; : > \"$HOME/" + REMOTE_DIR + "/install.log\"; "
-                  "setsid sh \"$HOME/" + REMOTE_DIR + "/provision.sh\" "
-                  ">\"$HOME/" + REMOTE_DIR + "/install.log\" 2>&1 </dev/null & echo launched",
-                  timeout=EXEC_TIMEOUT_S)
+        _write_remote_file(desk, REMOTE_DIR + "/provision.sh", _PROVISION_SCRIPT)
+        d = "\"$HOME/" + REMOTE_DIR + "\""
+        script = "\"$HOME/" + REMOTE_DIR + "/provision.sh\""
+        logf = "\"$HOME/" + REMOTE_DIR + "/install.log\""
+        launch = (
+            "mkdir -p " + d + "; : > " + logf + "; "
+            "if command -v setsid >/dev/null 2>&1; then DET=setsid; else DET=nohup; fi; "
+            "$DET sh " + script + " >" + logf + " 2>&1 </dev/null & echo launched")
+        _sbx_exec(space_id, launch, timeout=EXEC_TIMEOUT_S)
 
         # 4) Stream the sandbox's install log until it publishes a URL (or fails).
         deadline = time.time() + PROVISION_TIMEOUT_S
@@ -508,7 +552,8 @@ def _xdotool(space_id: str, args: str) -> Dict[str, Any]:
 
 
 def _act_screenshot(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    desk = _require_ready(space_id)
+    home = _get_home(desk)
     fmt = str(payload.get("format") or "png").lower()
     remote = REMOTE_DIR + "/shot.png"
     cmd = ("DISPLAY=" + REMOTE_DISPLAY + " sh -c 'scrot -o \"$HOME/" + remote + "\" "
@@ -516,7 +561,9 @@ def _act_screenshot(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     res = _sbx_exec(space_id, cmd, timeout=EXEC_TIMEOUT_S)
     if not res.get("ok"):
         raise SandboxError("screenshot failed: " + str(res.get("stderr") or res.get("error") or "")[:160])
-    read = _sbx("read", {"space_id": space_id, "path": REMOTE_DIR + "/shot.png"}, timeout=EXEC_TIMEOUT_S)
+    # Pass cwd=$HOME so the read endpoint resolves the file to where scrot wrote it.
+    read = _sbx("read", {"space_id": space_id, "cwd": home, "path": REMOTE_DIR + "/shot.png"},
+                timeout=EXEC_TIMEOUT_S)
     content = str(read.get("content") or "")
     if read.get("encoding") != "base64":
         # A text body means it wasn't a PNG — surface the failure.
@@ -525,7 +572,8 @@ def _act_screenshot(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         # Re-encode smaller on the sandbox to fit the signal frame.
         _sbx_exec(space_id, "convert \"$HOME/" + remote + "\" -resize 70% -quality 65 \"$HOME/" + REMOTE_DIR + "/shot.jpg\" 2>/dev/null || true",
                   timeout=EXEC_TIMEOUT_S)
-        read2 = _sbx("read", {"space_id": space_id, "path": REMOTE_DIR + "/shot.jpg"}, timeout=EXEC_TIMEOUT_S)
+        read2 = _sbx("read", {"space_id": space_id, "cwd": home, "path": REMOTE_DIR + "/shot.jpg"},
+                     timeout=EXEC_TIMEOUT_S)
         if read2.get("encoding") == "base64" and read2.get("content"):
             content = str(read2["content"])
             fmt = "jpeg"
