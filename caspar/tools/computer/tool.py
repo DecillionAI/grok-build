@@ -190,18 +190,38 @@ export DISPLAY="$DISP"
 
 if have fluxbox; then
   echo "START: window manager"
+  # Tell fluxbox NOT to set a wallpaper: no image viewer is installed, so its
+  # default fbsetbg call fails and pops an xmessage over the desktop. An overlay
+  # of `background: none` suppresses the wallpaper step for every style.
+  mkdir -p "$HOME/.fluxbox"
+  printf 'background: none\n' >"$HOME/.fluxbox/overlay"
   $DETACH fluxbox >"$DIR/wm.log" 2>&1 &
   echo $! >"$DIR/wm.pid"
   sleep 1
 fi
 
 echo "START: launching the browser"
+# Create the browser profile dir up front — Firefox's --profile refuses to start
+# ("Your Firefox profile cannot be loaded") when the path does not exist.
+mkdir -p "$DIR/profile"
 case "$BROWSER_BIN" in
   *chrom*)
     $DETACH "$BROWSER_BIN" --no-sandbox --disable-dev-shm-usage --user-data-dir="$DIR/profile" \
-      --window-position=0,0 --start-maximized --no-first-run "$HOME_URL" >"$DIR/browser.log" 2>&1 &
+      --window-position=0,0 --start-maximized --no-first-run --disable-infobars "$HOME_URL" >"$DIR/browser.log" 2>&1 &
     ;;
   *)
+    # Seed a minimal profile so Firefox doesn't stall on first-run / migration /
+    # crash-restore dialogs (which would sit over the page).
+    {
+      echo 'user_pref("browser.shell.checkDefaultBrowser", false);'
+      echo 'user_pref("browser.startup.homepage_override.mstone", "ignore");'
+      echo 'user_pref("browser.aboutwelcome.enabled", false);'
+      echo 'user_pref("datareporting.policy.dataSubmissionEnabled", false);'
+      echo 'user_pref("datareporting.policy.firstRunURL", "");'
+      echo 'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);'
+      echo 'user_pref("browser.sessionstore.resume_from_crash", false);'
+      echo 'user_pref("browser.tabs.warnOnClose", false);'
+    } >"$DIR/profile/user.js"
     $DETACH "$BROWSER_BIN" --no-remote --profile "$DIR/profile" "$HOME_URL" >"$DIR/browser.log" 2>&1 &
     ;;
 esac
@@ -252,7 +272,12 @@ if have Xvfb && have x11vnc && have websockify && [ -x "$DIR/cloudflared" ] && \
 fi
 run=DOWN
 url=""
-if [ -f "$DIR/tunnel.pid" ] && kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null && [ -s "$DIR/url" ]; then
+alive=1
+for p in xvfb browser vnc novnc tunnel; do
+  f="$DIR/$p.pid"
+  if [ ! -f "$f" ] || ! kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/null; then alive=0; fi
+done
+if [ "$alive" = 1 ] && [ -s "$DIR/url" ]; then
   run=UP; url="$(cat "$DIR/url" 2>/dev/null)"
 fi
 echo "INST=$inst"
