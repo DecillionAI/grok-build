@@ -1,0 +1,5 @@
+requests>=2.31
+# This creature only orchestrates the sandbox tool over the gateway — the whole
+# graphical stack (Xvfb, x11vnc, noVNC, the browser, cloudflared) is installed and
+# run on the space's Modal/Vercel sandbox, not here. So there are no heavy Python
+# deps; `requests` is kept for parity with the shared runtime/bridge.
