@@ -1,0 +1,243 @@
+{
+  "isMcp": true,
+  "kind": "tool",
+  "tool_id": "computer",
+  "name": "computer",
+  "vm_name": "computer-vm",
+  "machine_id": "computer-machine",
+  "image_name": "computer-tool:latest",
+  "container_name": "tool-computer",
+  "category": "automation",
+  "description": "A real graphical computer for the space: a full GUI web browser running on a virtual desktop and streamed live over VNC. The desktop runs on the space's own cloud sandbox (the Modal/Vercel microVM the sandbox tool provides) — the first time it is opened this tool installs and starts the desktop there (browser + VNC + secure Cloudflare tunnel), streaming the setup log; after that it detects the running desktop and returns instantly. People watch and drive the browser with mouse/touch/keyboard inside the app; agents drive the same desktop by taking screenshots and issuing click/type/key/scroll/navigate actions. Use it when a task needs a visible, interactive browser a person can also take over.",
+  "usecases": [
+    "you need a graphical browser a human can watch and take over with mouse/keyboard, not just a headless one",
+    "you (an agent) need to see the screen and click/type by coordinates like a person would",
+    "you need to hand a live, interactive browser session to the people in the space",
+    "a task mixes agent automation and human steps on the same browser (logins, captchas, review)"
+  ],
+  "howToTalk": "Signal it with `function` naming the operation. `open` provisions or reuses the space's desktop and returns its phase and, once ready, the public VNC `url` (the front-end opens that in Victor's webview). Poll `status` (pass a `cursor` to page new install-log lines). `url` returns just the ready URL. Drive the desktop with `screenshot` (base64 `image`; `format`=png|jpeg), `click` (`x`,`y`,`button`=left|right|middle, `double`), `move` (`x`,`y`), `type` (`text`), `key` (`key`, e.g. Return, ctrl+l, alt+Tab), `scroll` (`to`=up|down or `dy`), and `navigate` (`url`). `stop` tears the desktop down; `restart` rebuilds it.",
+  "prompt": "This is a real graphical computer with a visible web browser for the space, running on the space's cloud sandbox and streamed over VNC. Call `open` first — it installs and starts the desktop on the sandbox on first use (streaming an install log) or returns instantly if it is already up, giving you a `url` the people in the space open to watch and control the browser. To act yourself, `screenshot` to see the screen, then `click`/`move` by pixel coordinates, `type` text, press `key` combos (Return, ctrl+l, …), `scroll`, or `navigate` to a URL. You and the humans share the same desktop, so coordinate: take a screenshot before acting.",
+  "request_point": "tool::computer::request",
+  "response_point": "tool::computer::response",
+  "risk_level": "medium",
+  "risk": "medium",
+  "requires_network": true,
+  "requiresNetwork": true,
+  "bindSpace": true,
+  "autoAttach": false,
+  "function": "open",
+  "requiredArgs": [
+    "function"
+  ],
+  "categories": [
+    "automation",
+    "web"
+  ],
+  "routes": {
+    "automation": "open",
+    "web": "open"
+  },
+  "argSchema": {
+    "function": {
+      "type": "string",
+      "description": "operation: open (default) | status | url | screenshot | click | move | type | key | scroll | navigate | stop | restart"
+    },
+    "cursor": {
+      "type": "number",
+      "description": "for open/status: the log cursor from the previous reply, to fetch only new install-log lines"
+    },
+    "url": {
+      "type": "string",
+      "description": "for navigate: the page URL to open in the desktop browser"
+    },
+    "x": {
+      "type": "number",
+      "description": "for click/move: the X pixel coordinate on the desktop"
+    },
+    "y": {
+      "type": "number",
+      "description": "for click/move: the Y pixel coordinate on the desktop"
+    },
+    "button": {
+      "type": "string",
+      "description": "for click: left (default) | right | middle"
+    },
+    "double": {
+      "type": "bool",
+      "description": "for click: double-click"
+    },
+    "text": {
+      "type": "string",
+      "description": "for type: the text to type into the focused element"
+    },
+    "key": {
+      "type": "string",
+      "description": "for key: a key or chord, e.g. Return, Escape, ctrl+l, alt+Tab"
+    },
+    "to": {
+      "type": "string",
+      "description": "for scroll: up | down (or use dy for a pixel delta)"
+    },
+    "format": {
+      "type": "string",
+      "description": "for screenshot: png (default) | jpeg"
+    }
+  },
+  "tools": [
+    {
+      "name": "open",
+      "desc": "provision (first time — streams an install log) or reuse the space's graphical desktop; returns its phase and, once ready, the public VNC url the front-end opens in Victor's webview",
+      "args": {
+        "cursor": {
+          "type": "NUMBER",
+          "desc": "the log cursor from a previous reply, to fetch only new lines"
+        }
+      },
+      "widget": {
+        "heading": "Computer",
+        "details": [
+          "phase",
+          "url"
+        ],
+        "note": "Open the Computer tool on the space desktop to watch and control the browser."
+      }
+    },
+    {
+      "name": "status",
+      "desc": "the desktop's current phase (idle|installing|ready|error), the ready url, and any new install-log lines since your cursor",
+      "args": {
+        "cursor": {
+          "type": "NUMBER",
+          "desc": "the log cursor from a previous reply"
+        }
+      },
+      "widget": {
+        "heading": "Computer status",
+        "details": [
+          "phase",
+          "url",
+          "installed"
+        ]
+      }
+    },
+    {
+      "name": "url",
+      "desc": "the ready public VNC url for the space's desktop (or a not-ready message)",
+      "args": {},
+      "widget": {
+        "heading": "Computer",
+        "details": [
+          "phase",
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "screenshot",
+      "desc": "capture the desktop screen and return a base64 image (what an agent looks at before acting)",
+      "args": {
+        "format": {
+          "type": "STRING",
+          "desc": "png (default) | jpeg"
+        }
+      },
+      "widget": {
+        "heading": "Screenshot",
+        "image": [
+          "image"
+        ],
+        "imageFormat": "format"
+      }
+    },
+    {
+      "name": "click",
+      "desc": "click at a pixel coordinate on the desktop",
+      "args": {
+        "x": {
+          "type": "NUMBER",
+          "desc": "X pixel coordinate"
+        },
+        "y": {
+          "type": "NUMBER",
+          "desc": "Y pixel coordinate"
+        },
+        "button": {
+          "type": "STRING",
+          "desc": "left (default) | right | middle"
+        },
+        "double": {
+          "type": "BOOL",
+          "desc": "double-click"
+        }
+      }
+    },
+    {
+      "name": "move",
+      "desc": "move the mouse pointer to a pixel coordinate",
+      "args": {
+        "x": {
+          "type": "NUMBER",
+          "desc": "X pixel coordinate"
+        },
+        "y": {
+          "type": "NUMBER",
+          "desc": "Y pixel coordinate"
+        }
+      }
+    },
+    {
+      "name": "type",
+      "desc": "type text into the focused element",
+      "args": {
+        "text": {
+          "type": "STRING",
+          "desc": "the text to type"
+        }
+      }
+    },
+    {
+      "name": "key",
+      "desc": "press a keyboard key or chord (on the focused element)",
+      "args": {
+        "key": {
+          "type": "STRING",
+          "desc": "e.g. Return, Escape, ctrl+l, alt+Tab"
+        }
+      }
+    },
+    {
+      "name": "scroll",
+      "desc": "scroll the desktop up or down",
+      "args": {
+        "to": {
+          "type": "STRING",
+          "desc": "up | down"
+        },
+        "dy": {
+          "type": "NUMBER",
+          "desc": "pixels to scroll by (positive = down)"
+        }
+      }
+    },
+    {
+      "name": "navigate",
+      "desc": "open a URL in the desktop browser",
+      "args": {
+        "url": {
+          "type": "STRING",
+          "desc": "the page URL to open"
+        }
+      }
+    },
+    {
+      "name": "stop",
+      "desc": "tear the space's desktop down (frees the display, VNC and tunnel)",
+      "args": {}
+    },
+    {
+      "name": "restart",
+      "desc": "rebuild the space's desktop from scratch",
+      "args": {}
+    }
+  ]
+}
