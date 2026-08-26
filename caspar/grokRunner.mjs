@@ -589,6 +589,14 @@ export async function runGrok(opts) {
     env = process.env,
     tempDir,
     extraEnv,
+    // Resume a prior Grok session (a run paused mid-flow when the pool emptied):
+    // reuse its id and pass --resume so the CLI continues that conversation from
+    // the persisted session under this thread's GROK_HOME, instead of a new one.
+    resumeSessionId,
+    // A meter/caller may abort the run mid-flight (pool exhausted). When this
+    // AbortSignal fires the child is SIGTERM'd — its session is persisted, so the
+    // run can be resumed later. The result carries `aborted:true`.
+    abortSignal,
   } = opts;
 
   const warnings = [];
@@ -693,8 +701,12 @@ export async function runGrok(opts) {
     "--verbatim",
   ];
   if (chosenModel) args.push("--model", chosenModel);
-  const sessionId = newSessionId();
+  // Resume the paused session by id, or mint a fresh one. `--resume` finds the
+  // session in this thread's GROK_HOME (persisted across the pause).
+  const resuming = typeof resumeSessionId === "string" && /^[0-9a-f-]{36}$/i.test(resumeSessionId);
+  const sessionId = resuming ? resumeSessionId : newSessionId();
   args.push("--session-id", sessionId);
+  if (resuming) args.push("--resume", sessionId);
   if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
   if (disallowedTools?.length) args.push("--disallowed-tools", disallowedTools.join(","));
   if (systemPrompt) args.push("--rules", systemPrompt);
@@ -735,6 +747,7 @@ export async function runGrok(opts) {
   let stderr = "";
   let stdoutTail = "";
   let timedOut = false;
+  let aborted = false;
 
   const killTimer = setTimeout(
     () => {
@@ -744,6 +757,19 @@ export async function runGrok(opts) {
     },
     Math.max(1, maxWallSeconds) * 1000,
   );
+
+  // A caller-requested abort (pool exhausted): SIGTERM the child so Grok persists
+  // the session-so-far, then SIGKILL as a backstop. Not a timeout — `aborted` is
+  // surfaced separately so the run can be marked paused/resumable, not failed.
+  const onAbort = () => {
+    aborted = true;
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 5000).unref?.();
+  };
+  if (abortSignal) {
+    if (abortSignal.aborted) onAbort();
+    else abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
 
   let buffer = "";
   const processLine = (raw) => {
@@ -803,6 +829,7 @@ export async function runGrok(opts) {
 
   const outcome = await Promise.race([exited, spawnFailure]);
   clearTimeout(killTimer);
+  if (abortSignal) abortSignal.removeEventListener?.("abort", onAbort);
   // The child has closed and every stdout chunk has been delivered: flush any
   // final line the CLI emitted WITHOUT a trailing newline. A `type:"result"` that
   // arrives unterminated — a run SIGTERM'd mid-line, or stdout truncated as the
@@ -818,9 +845,9 @@ export async function runGrok(opts) {
 
   const argv = [command, ...args];
   if (outcome instanceof Error) {
-    return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
+    return { result: null, messages, exitCode: null, timedOut, aborted, stderr: `${outcome.message}\n${stderr}`, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
   }
-  return { result, messages, exitCode: outcome, timedOut, stderr, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
+  return { result, messages, exitCode: outcome, timedOut, aborted, stderr, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
 }
 
 /**
