@@ -251,10 +251,32 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "\n" +
     "Plan with them: prefer a listed tool over guessing or doing by hand what one " +
     "of them is built for. Only call a capability when it actually helps the " +
-    "current request. To bring in another agent for part of the work, do NOT look " +
+    "current request. A chat-only plan or review memo is not a substitute for using " +
+    "these tools. If the outcome needs a live page or service, write it on the shared " +
+    "machine, start it, expose a port, and tell the people the public URL. To bring " +
+    "in another agent for part of the work, do NOT look " +
     "for it here — @mention them in your reply (see the group chat section); that " +
     "hand-off happens asynchronously as its own chat turn, it is not a tool call.\n" +
     "=== END WHAT YOU CAN DO ===\n"
+  );
+}
+
+/** Living project brief: the outcome this space is hired to accomplish. */
+export function projectOutcomePreamble(task) {
+  const brief =
+    (typeof task.projectBrief === "string" && task.projectBrief.trim()) ||
+    (typeof task.brief === "string" && task.brief.trim()) ||
+    "";
+  if (!brief) return "";
+  return (
+    "=== PROJECT OUTCOME ===\n" +
+    "This space has a living brief — the outcome the team is hired to accomplish, " +
+    "not a one-off chatbot prompt. Keep working toward it on every turn unless the " +
+    "latest message clearly changes course. Do not stop at a plan, review memo, or " +
+    "essay if tools can produce a real artifact (files on the shared machine, a " +
+    "running preview URL, sourced research, an operated system).\n\n" +
+    brief +
+    "\n=== END PROJECT OUTCOME ===\n"
   );
 }
 
@@ -275,6 +297,9 @@ export function buildSystemPrompt(task, opts = {}) {
 
   const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv, disabledBuiltins: opts.disabledBuiltins });
   if (capabilities) parts.push(capabilities);
+
+  const outcome = projectOutcomePreamble(task);
+  if (outcome) parts.push(outcome);
 
   // When the shell/filesystem built-ins are disabled but the capabilities section
   // did not already explain it (no shared sandbox named there), state it plainly so
@@ -315,7 +340,9 @@ export function buildSystemPrompt(task, opts = {}) {
       "self-contained prose, no meta-commentary about tools, files or steps you " +
       "took unless it is what they asked for. Intermediate work (thinking, tool " +
       "calls, their results) is streamed to the UI separately as progress, so do " +
-      "not summarise your own process in the final message. You also have a " +
+      "not summarise your own process in the final message. Prefer a real artifact " +
+      "the team can open (sandbox files, a public preview URL from an exposed " +
+      "port, sourced findings) over a chat-only essay. You also have a " +
       "private local working directory of your own for scratch — but anything the " +
       "team must see belongs on the space's shared machine (see your capabilities " +
       "above), not there.\n" +

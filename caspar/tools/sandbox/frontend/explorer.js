@@ -176,7 +176,8 @@ var S = {
   entries: [],
   loading: false,
   error: null,
-  preview: null     // { name, content, encoding }
+  preview: null,    // { name, content, encoding }
+  previewUrl: ''
 };
 
 // Retained widget handles we rebuild on state change.
@@ -211,6 +212,22 @@ function refresh() {
     }
     renderChrome();
     renderList();
+  });
+  hostCall('info', {}, function (err, res) {
+    S.previewUrl = '';
+    if (err == null && res != null && res.ok !== false) {
+      var routes = res.routes || [];
+      var i = 0;
+      while (i < routes.length) {
+        var u = routes[i] && routes[i].url ? ('' + routes[i].url) : '';
+        if (u !== '') {
+          S.previewUrl = u;
+          break;
+        }
+        i = i + 1;
+      }
+    }
+    renderChrome();
   });
 }
 
@@ -307,6 +324,10 @@ function build() {
   W.subtitle = RN.text(ctx().sandboxName || 'the space machine', { color: T.muted, fontSize: 12 });
   titleCol.add(W.subtitle);
   header.add(titleCol);
+  W.liveBtn = pill('Live', function () {
+    if (S.previewUrl) hostCall('host:openWebview', { url: S.previewUrl, title: 'Preview' }, function () {});
+  }, false);
+  header.add(W.liveBtn);
   header.add(iconButton('↑', goUp));
   header.add(iconButton('⟳', refresh));
   root.add(header);
@@ -363,9 +384,18 @@ function renderChrome() {
       W.status.set('color', T.danger);
     } else {
       var n = S.entries.length;
-      W.status.set('text', n + (n === 1 ? ' item' : ' items'));
+      var extra = S.previewUrl ? ' · live preview' : '';
+      W.status.set('text', n + (n === 1 ? ' item' : ' items') + extra);
       W.status.set('color', T.muted);
     }
+  }
+  if (W.liveBtn != null) {
+    W.liveBtn.set('style', {
+      paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
+      backgroundColor: S.previewUrl ? T.accentSoft : 'transparent',
+      marginRight: 6,
+      opacity: S.previewUrl ? 1 : 0.35
+    });
   }
 }
 
@@ -466,6 +496,15 @@ function renderPreview() {
   nameCol.add(RN.text(S.preview.name, { color: T.text, fontSize: 14, fontWeight: '700' }));
   nameCol.add(RN.text(joinPath(S.parts) === '.' ? 'home' : joinPath(S.parts), { color: T.muted, fontSize: 11 }));
   bar.add(nameCol);
+  var htmlName = S.preview.name || '';
+  var isHtml = htmlName.length >= 5 && htmlName.substring(htmlName.length - 5).toLowerCase() === '.html';
+  if (!isHtml) isHtml = htmlName.length >= 4 && htmlName.substring(htmlName.length - 4).toLowerCase() === '.htm';
+  if (isHtml && S.preview.content && !S.preview.error && !S.preview.tooBig) {
+    bar.add(pill('Open', function () {
+      var page = 'data:text/html;charset=utf-8,' + encodeURIComponent(S.preview.content);
+      hostCall('host:openWebview', { url: page, title: S.preview.name }, function () {});
+    }, true));
+  }
   bar.add(iconButton('✕', closePreview));
   card.add(bar);
 

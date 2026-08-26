@@ -176,6 +176,19 @@ async function main() {
     assert.ok(/shared machine/i.test(sys));
   });
 
+  await check("living project brief is injected into every system prompt", () => {
+    const withBrief = buildSystemPrompt(
+      { spaceId: "space-1", projectBrief: "Launch a neighbourhood cafe with a partner." },
+      { capabilities: [{ name: "sandbox", description: "run code", kind: "tool" }] },
+    );
+    assert.ok(/PROJECT OUTCOME/i.test(withBrief));
+    assert.ok(withBrief.includes("Launch a neighbourhood cafe with a partner."));
+    const viaBrief = buildSystemPrompt({ spaceId: "space-1", brief: "Ship the API" });
+    assert.ok(viaBrief.includes("Ship the API"));
+    const none = buildSystemPrompt({ spaceId: "space-1" });
+    assert.ok(!/PROJECT OUTCOME/i.test(none));
+  });
+
   await check("built-in shell/fs tools are denied unconditionally (never a fallback)", () => {
     // the shell + filesystem built-ins are always off, sandbox present or not
     const denied = disallowedBuiltinTools({ env: {} });
