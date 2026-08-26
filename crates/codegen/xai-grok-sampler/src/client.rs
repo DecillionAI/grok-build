@@ -183,6 +183,33 @@ fn apply_terminal_event_overrides(event: &mut rs::ResponseStreamEvent, data: &st
     usage.total_tokens = total;
 }
 
+/// SSE `type` / `event:` tag of a transport keepalive heartbeat frame.
+///
+/// The xAI Responses API emits these liveness-only frames to hold the HTTP
+/// connection open while the model is still working (e.g. during a long
+/// server-side tool loop). They carry no model output.
+const KEEPALIVE_EVENT_TYPE: &str = "keepalive";
+
+/// True when an SSE frame IS a transport keepalive heartbeat — by its SSE
+/// `event:` name, or (for servers that omit the name) by a tolerant peek of
+/// the payload's `"type"` tag, gated on a cheap substring precheck so normal
+/// traffic never pays a JSON parse.
+///
+/// Keepalive frames are not part of async-openai's `ResponseStreamEvent`
+/// enum, so forwarding one to typed deserialization fails with
+/// `unknown variant `keepalive`` and aborts an otherwise healthy stream.
+/// Swallowing them (like the doom-loop check event) keeps long-running
+/// responses alive instead of surfacing a spurious serialization error.
+fn is_keepalive_event(event_name: &str, data: &str) -> bool {
+    if event_name == KEEPALIVE_EVENT_TYPE {
+        return true;
+    }
+    data.contains(KEEPALIVE_EVENT_TYPE)
+        && serde_json::from_str::<serde_json::Value>(data).is_ok_and(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some(KEEPALIVE_EVENT_TYPE)
+        })
+}
+
 /// Metadata key for cost ticks past typed Response events.
 pub(crate) const COST_USD_TICKS_METADATA_KEY: &str = "xai.cost_usd_ticks";
 
@@ -1478,6 +1505,14 @@ impl SamplingClient {
                             backend = "responses",
                             data = %data,
                         );
+
+                        // Swallow transport keepalive heartbeats before typed
+                        // deserialization — async-openai's event enum has no
+                        // `keepalive` variant, so forwarding one aborts the
+                        // stream with a spurious `unknown variant` error.
+                        if is_keepalive_event(&event.event, data) {
+                            return std::future::ready(Some(None));
+                        }
 
                         // Intercept the non-standard doom-loop event before
                         // typed deserialization; async-openai's event enum
@@ -2861,6 +2896,43 @@ mod tests {
         // total_tokens rewritten to ctx.input + ctx.output (5022 + 571).
         // NOT the wire's cumulative total (6714).
         assert_eq!(usage.total_tokens, 5_593);
+    }
+
+    /// A transport keepalive heartbeat is recognized by its SSE `event:`
+    /// name, by its payload `type`, or both — so it is swallowed before typed
+    /// deserialization instead of aborting the stream with `unknown variant`.
+    #[test]
+    fn is_keepalive_event_detects_heartbeats() {
+        // Named frame, payload confirms the tag.
+        assert!(is_keepalive_event(
+            "keepalive",
+            r#"{"type":"keepalive"}"#
+        ));
+        // Named frame with an empty data payload (name alone is enough).
+        assert!(is_keepalive_event("keepalive", ""));
+        // Unnamed frame, payload `type` carries the tag.
+        assert!(is_keepalive_event("", r#"{"type":"keepalive"}"#));
+
+        // Real content events are never mistaken for keepalives.
+        assert!(!is_keepalive_event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":"hi"}"#
+        ));
+        // The substring appearing only inside model text must not swallow it.
+        assert!(!is_keepalive_event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":"the keepalive frame"}"#
+        ));
+    }
+
+    /// The keepalive frame that the xAI Responses API actually emits is not a
+    /// known `ResponseStreamEvent` variant — deserializing it fails, which is
+    /// exactly why the SSE loop must swallow it upstream.
+    #[test]
+    fn keepalive_frame_is_not_a_typed_response_event() {
+        let sse = r#"{"type":"keepalive"}"#;
+        assert!(is_keepalive_event("keepalive", sse));
+        assert!(deserialize_response_event(sse).is_err());
     }
 
     #[test]
