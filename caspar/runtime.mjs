@@ -58,6 +58,7 @@ import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask, p
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
+  chargeAgentCheckpoint,
   releaseBillingRun,
   settleBillingRun,
   settleDirectToolRun,
@@ -495,9 +496,52 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   const heartbeatTimer = streamSteps && heartbeatMs > 0 ? setInterval(sendHeartbeat, heartbeatMs) : null;
   if (heartbeatTimer && typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
 
+  // Live billing checkpoints. While the run works, charge the tool + sandbox cost
+  // it has accrued so far against the shared pool. Model tokens are only known at
+  // the end, so they settle once on completion; tools (the runaway cost) are
+  // metered live here. If a debit reports the pool exhausted, abort the Grok child
+  // — its session is persisted, so the run pauses instead of running up unpayable
+  // cost, and the app can resume it after a top-up. Only live pool sessions charge.
+  const liveBilling = Boolean(billingSession && billingSession.mode === "live");
+  const abortController = liveBilling && typeof AbortController === "function" ? new AbortController() : null;
+  let pausedForFunds = false;
+  let checkpointBusy = false;
+  const runThreadId =
+    (typeof task.threadId === "string" && task.threadId.trim()) ||
+    (typeof task.thread_id === "string" && task.thread_id.trim()) ||
+    "main";
+  const checkpointMs = Math.max(0, creatureNumber("BILLING_CHECKPOINT_MS", 10000));
+  const runCheckpoint = async () => {
+    if (!liveBilling || checkpointBusy || pausedForFunds) return;
+    checkpointBusy = true;
+    try {
+      const res = await chargeAgentCheckpoint(bridge, billingSession, {
+        promptTokens: 0,
+        completionTokens: 0,
+        durationMs: Date.now() - started,
+        sandboxActive,
+        tools: invoker ? invoker.usageSnapshot() : [],
+      });
+      if (res && res.exhausted) {
+        pausedForFunds = true;
+        log("GROK_BILLING", { paused: "pool_exhausted", remaining: res.remaining });
+        abortController?.abort();
+      }
+    } catch (err) {
+      log("GROK_BILLING", { checkpoint_error: String(err?.message || err) });
+    } finally {
+      checkpointBusy = false;
+    }
+  };
+  const checkpointTimer =
+    liveBilling && checkpointMs > 0 ? setInterval(runCheckpoint, checkpointMs) : null;
+  if (checkpointTimer && typeof checkpointTimer.unref === "function") checkpointTimer.unref();
+
   let run;
   try {
     run = await runGrok({
+      abortSignal: abortController?.signal,
+      resumeSessionId: typeof task.resumeSessionId === "string" ? task.resumeSessionId : undefined,
       prompt,
       promptBlocks,
       systemPrompt,
@@ -532,6 +576,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     run = { result: null, messages: [], exitCode: null, timedOut: false, stderr: String(err?.message || err), warnings: [] };
   } finally {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (checkpointTimer) clearInterval(checkpointTimer);
     if (sandboxBridge) await sandboxBridge.stop();
     if (socketServer) await socketServer.stop();
     if (invoker) toolUsage = invoker.usageSnapshot();
@@ -593,6 +638,45 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     enumerable: false,
   });
   if (run.stderr?.trim()) log("GROK_STDERR", { tail: run.stderr.trim().split("\n").slice(-6) });
+
+  // The run was paused because the payer's pool emptied mid-flight. Mark the
+  // result (so serveAgent surfaces "paused", not "failed") and persist a
+  // non-rendering `run-paused` checkpoint on the space carrying the Grok session
+  // to resume — the app shows a Continue affordance and, after a top-up, re-signals
+  // the run with `resumeSessionId` so the backbone continues this exact session.
+  if (pausedForFunds) {
+    result.pausedForFunds = true;
+    result.resumeSessionId = run.sessionId || "";
+    try {
+      const endpoint = signalEndpointFromTask(task);
+      const spaceId = task.spaceId || task.storeId || task.space_id;
+      const selfId = bridge?.machineId || bridge?.programId || "";
+      if (endpoint && spaceId) {
+        await persistSpaceMessage(bridge, {
+          endpoint,
+          spaceId,
+          selfId,
+          data: {
+            role: "system",
+            kind: "run-paused",
+            text: "",
+            threadId: runThreadId,
+            msgId: `paused:${correlationId}`,
+            runPaused: {
+              runId: correlationId,
+              resumeSessionId: run.sessionId || "",
+              reason: "out-of-funds",
+              agentProgramId: task.proxyProgramId || task.self?.programId || "",
+              agentName: task.self?.name || task.agentName || "",
+            },
+          },
+        });
+      }
+    } catch (err) {
+      log("GROK_BILLING", { paused_marker_error: String(err?.message || err) });
+    }
+  }
+
   process.stdout.write(`DAVINCI_RESULT ${JSON.stringify(result)}\n`);
   return result;
 }

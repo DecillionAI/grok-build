@@ -125,11 +125,10 @@ function toolSettlement(quote, observed, sourceRef) {
   }
   const calls = integer(observed.calls, "tool.calls");
   const runtimeMs = integer(observed.runtimeMs, "tool.runtimeMs");
-  const authorizedCalls = integer(price.authorizedCalls, "tool.authorizedCalls");
-  const authorizedRuntimeMs = integer(price.authorizedRuntimeMs, "tool.authorizedRuntimeMs");
-  if (calls > authorizedCalls || runtimeMs > authorizedRuntimeMs) {
-    throw new Error("actual tool usage exceeds authorized quote ceiling");
-  }
+  // No per-run ceiling: the pool's remaining balance is the only limit (live pool
+  // metering debits actual usage and stops when the pool empties). authorizedCalls
+  // / authorizedRuntimeMs, when present, are only a sizing envelope — never a
+  // rejection threshold. See docs/LIVE-METERING-DESIGN.md in decillionai-server.
   const fixed = calls > 0 ? integer(price.fixedMinor, "tool.fixedMinor") : 0;
   const callCost = ceilMulDiv(calls, price.perCallMinor, 1, "tool.calls");
   const runtimeCost = ceilMulDiv(runtimeMs, price.runtimePerMinuteMinor, 60_000, "tool.runtime");
@@ -263,11 +262,9 @@ function agentSettlement(quote, observed, sourceRef) {
   }
   for (const usage of toolUsage.values()) {
     const tool = toolPrices.get(usage.resourceId);
-    const authorizedCalls = integer(tool.authorizedCalls, "tool.authorizedCalls");
-    const authorizedRuntimeMs = integer(tool.authorizedRuntimeMs, "tool.authorizedRuntimeMs");
-    if (usage.calls > authorizedCalls || usage.runtimeMs > authorizedRuntimeMs) {
-      throw new Error("actual tool usage exceeds authorized quote ceiling");
-    }
+    // No per-run ceiling — the pool's remaining balance is the only limit (see the
+    // note in toolSettlement above). authorizedCalls/authorizedRuntimeMs are a
+    // sizing envelope, not a rejection threshold.
     const fixed = usage.calls > 0 ? integer(tool.fixedMinor, "tool.fixedMinor") : 0;
     const callCost = ceilMulDiv(usage.calls, tool.perCallMinor, 1, "tool.calls");
     const runtimeCost = ceilMulDiv(
@@ -353,6 +350,12 @@ function assertQuoteBinding(quote, { payerUserId, quoteId }, { task, correlation
 // holds). The reservation ceiling is the quote's authorized maxAmount; the run
 // later settles its actual usage against that slice and returns the remainder to
 // the pool. Concurrent runs across the user's spaces all draw down one pool.
+// Authorize a live-metered run against the shared pool. Unlike the legacy hold
+// path, this does NOT reserve a per-run slice up front — there is no per-run
+// ceiling. It only verifies the pool is open, bound to this run's quote, on this
+// meter, unexpired, and not already empty; the run then debits actual accrued
+// cost against the pool's shared `remaining` as it works (chargeAgentCheckpoint /
+// finalizeLiveRun), and stops peacefully when a debit reports the pool exhausted.
 async function authorizePoolRun(bridge, { task, correlationId }, expectedKind, { poolId, payerUserId, quoteId }) {
   if (!poolId || !payerUserId || !quoteId || !correlationId) {
     throw new Error("incomplete billing authorization");
@@ -372,21 +375,25 @@ async function authorizePoolRun(bridge, { task, correlationId }, expectedKind, {
   if (Date.now() > integer(pool.expiresAt, "pool.expiresAt")) {
     throw new Error("billing pool expired");
   }
-  const reserve = await bridge.call(
-    "reservePool",
-    {
-      poolId,
-      payerUserId,
-      quoteId,
-      runId: String(correlationId),
-      maxAmount: integer(quote.maxAmount, "quote.maxAmount"),
-    },
-    { timeoutMs: 35_000 },
-  );
-  if (!reserve || reserve.ok !== true) {
-    throw new Error(String(reserve?.error || "could not reserve from billing pool"));
+  const remaining = integer(pool.remaining, "pool.remaining");
+  if (remaining <= 0) {
+    throw new Error("billing pool is empty");
   }
-  return { poolId, payerUserId, quoteId, runId: String(correlationId), quote };
+  return {
+    mode: "live",
+    poolId,
+    payerUserId,
+    quoteId,
+    runId: String(correlationId),
+    quote,
+    // Per-beneficiary cumulative charged (key `userId|role`), so each checkpoint
+    // charges only the delta and ceil-rounding applies to run totals, not deltas.
+    charged: new Map(),
+    totalCharged: 0,
+    lastRemaining: remaining,
+    lastUsageHash: "",
+    seq: 0,
+  };
 }
 
 async function authorizeRun(bridge, { task, correlationId }, expectedKind) {
@@ -457,6 +464,220 @@ export function authorizeDirectToolRun(bridge, delivery) {
   return authorizeRun(bridge, delivery, "tool");
 }
 
+// ── Live pool metering ───────────────────────────────────────────────────────
+// Price cumulative observed usage into beneficiary lines straight from the
+// quote's rate snapshot, with NO per-run ceiling and NO per-beneficiary cap — the
+// pool's remaining balance is the only limit, enforced atomically by debitPool.
+// Ceil-rounding is applied to cumulative totals (not per-checkpoint deltas) so
+// repeated checkpoints never over-round. Used by the live run path; the legacy
+// reserve/settle functions above are untouched.
+
+function pushLine(lines, payer, userId, role, amount, sourceRef) {
+  amount = integer(amount, `${role}.amount`);
+  if (amount <= 0 || !userId || userId === payer) return;
+  lines.push({ userId, role, amount, sourceRef });
+}
+
+function agentCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
+  const price = quote.priceSnapshot || {};
+  if (price.kind !== "agent") throw new Error("quote price snapshot is not agent pricing");
+  const payer = String(quote.payerUserId || "");
+  const promptTokens = integer(observed.promptTokens, "promptTokens");
+  const completionTokens = integer(observed.completionTokens, "completionTokens");
+  const sandboxMs = observed.sandboxActive ? integer(observed.durationMs, "sandboxMs") : 0;
+  const grossInput = ceilMulDiv(promptTokens, price.inputPerMillionMinor, 1_000_000, "input");
+  const grossOutput = ceilMulDiv(completionTokens, price.outputPerMillionMinor, 1_000_000, "output");
+  const gross = add(grossInput, grossOutput, "gross");
+  const providerInput = ceilMulDiv(promptTokens, price.providerInputPerMillionMinor, 1_000_000, "providerInput");
+  const providerOutput = ceilMulDiv(completionTokens, price.providerOutputPerMillionMinor, 1_000_000, "providerOutput");
+  const provider = add(providerInput, providerOutput, "provider");
+  const margin = gross >= provider ? gross - provider : 0;
+  const commission = ceilMulDiv(margin, price.platformCommissionBps, 10_000, "commission");
+  const creator = margin - commission;
+  const node = ceilMulDiv(sandboxMs, price.sandboxPerMinuteMinor, 60_000, "sandbox");
+  const lines = [];
+  pushLine(lines, payer, String(price.providerClearingAccountId), "provider_clearing", provider, sourceRef);
+  pushLine(lines, payer, String(price.creatorAccountId), "agent_creator", creator, sourceRef);
+  pushLine(lines, payer, String(price.platformAccountId), "platform", commission, sourceRef);
+  pushLine(lines, payer, String(price.nodeOwnerAccountId), "node_owner", node, sourceRef);
+
+  const toolPrices = new Map();
+  for (const raw of Array.isArray(price.tools) ? price.tools : []) {
+    const rid = String(raw?.resourceId || "");
+    if (rid && !toolPrices.has(rid)) toolPrices.set(rid, raw);
+  }
+  const toolUsage = new Map();
+  for (const raw of Array.isArray(observed.tools) ? observed.tools : []) {
+    const rid = String(raw?.resourceId || "");
+    if (!toolPrices.has(rid)) continue; // only quote-authorized tools are billable
+    if (String(raw?.outcome || "ok") === "timeout") continue; // unproven execution
+    const cur = toolUsage.get(rid) || { calls: 0, runtimeMs: 0 };
+    cur.calls = add(cur.calls, integer(raw?.calls, "tool.calls"), "tool.calls.total");
+    cur.runtimeMs = add(cur.runtimeMs, integer(raw?.runtimeMs, "tool.runtimeMs"), "tool.runtime.total");
+    toolUsage.set(rid, cur);
+  }
+  for (const [rid, usage] of toolUsage) {
+    const tool = toolPrices.get(rid);
+    const fixed = usage.calls > 0 ? integer(tool.fixedMinor, "tool.fixedMinor") : 0;
+    const callCost = ceilMulDiv(usage.calls, tool.perCallMinor, 1, "tool.calls");
+    const runtimeCost = ceilMulDiv(usage.runtimeMs, tool.runtimePerMinuteMinor, 60_000, "tool.runtime");
+    const toolGross = add(add(fixed, callCost, "tool.gross"), runtimeCost, "tool.gross");
+    const toolProvider = ceilMulDiv(usage.calls, tool.providerPerCallMinor, 1, "tool.provider");
+    const toolMargin = toolGross >= toolProvider ? toolGross - toolProvider : 0;
+    const toolCommission = ceilMulDiv(toolMargin, tool.platformCommissionBps, 10_000, "tool.commission");
+    const toolCreator = toolMargin - toolCommission;
+    const toolNode = ceilMulDiv(usage.runtimeMs, tool.sandboxPerMinuteMinor, 60_000, "tool.node");
+    const toolRef = `${sourceRef}:${rid}`;
+    pushLine(lines, payer, String(tool.providerClearingAccountId), "provider_clearing", toolProvider, toolRef);
+    pushLine(lines, payer, String(tool.creatorAccountId), "tool_owner", toolCreator, toolRef);
+    pushLine(lines, payer, String(tool.platformAccountId), "platform", toolCommission, toolRef);
+    pushLine(lines, payer, String(tool.nodeOwnerAccountId), "node_owner", toolNode, toolRef);
+  }
+
+  if (applyMinCharge) {
+    const total = lines.reduce((sum, line) => sum + line.amount, 0);
+    const minimum = integer(price.minChargeMinor, "minChargeMinor");
+    const platformId = String(price.platformAccountId || "");
+    if (total < minimum && platformId && platformId !== payer) {
+      pushLine(lines, payer, platformId, "platform", minimum - total, sourceRef);
+    }
+  }
+  return lines;
+}
+
+function toolCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
+  const price = quote.priceSnapshot || {};
+  if (price.kind !== "tool") throw new Error("quote price snapshot is not tool pricing");
+  const payer = String(quote.payerUserId || "");
+  const calls = integer(observed.calls, "tool.calls");
+  const runtimeMs = integer(observed.runtimeMs, "tool.runtimeMs");
+  const fixed = calls > 0 ? integer(price.fixedMinor, "tool.fixedMinor") : 0;
+  const callCost = ceilMulDiv(calls, price.perCallMinor, 1, "tool.calls");
+  const runtimeCost = ceilMulDiv(runtimeMs, price.runtimePerMinuteMinor, 60_000, "tool.runtime");
+  const gross = add(add(fixed, callCost, "tool.gross"), runtimeCost, "tool.gross");
+  const provider = ceilMulDiv(calls, price.providerPerCallMinor, 1, "tool.provider");
+  const margin = gross >= provider ? gross - provider : 0;
+  const commission = ceilMulDiv(margin, price.platformCommissionBps, 10_000, "tool.commission");
+  const creator = margin - commission;
+  const node = ceilMulDiv(runtimeMs, price.sandboxPerMinuteMinor, 60_000, "tool.node");
+  const lines = [];
+  pushLine(lines, payer, String(price.providerClearingAccountId), "provider_clearing", provider, sourceRef);
+  pushLine(lines, payer, String(price.creatorAccountId), "tool_owner", creator, sourceRef);
+  pushLine(lines, payer, String(price.platformAccountId), "platform", commission, sourceRef);
+  pushLine(lines, payer, String(price.nodeOwnerAccountId), "node_owner", node, sourceRef);
+  if (applyMinCharge) {
+    const total = lines.reduce((sum, line) => sum + line.amount, 0);
+    const minimum = integer(price.minChargeMinor, "minChargeMinor");
+    const platformId = String(price.platformAccountId || "");
+    if (total < minimum && platformId && platformId !== payer) {
+      pushLine(lines, payer, platformId, "platform", minimum - total, sourceRef);
+    }
+  }
+  return lines;
+}
+
+// Debit the pool for the delta between the run's cumulative cost so far and what
+// it has already been charged. Returns `{ charged, remaining, exhausted }`;
+// `exhausted:true` means the pool could not cover the delta — the caller stops
+// the run peacefully. Advances the session's per-beneficiary charged tracker only
+// after the debit commits, so a retried checkpoint (same debitId) is idempotent.
+async function chargePool(bridge, session, cumulativeLines, debitId) {
+  // Serialize all charges on one session: an interim checkpoint and the final
+  // settle both read/advance `session.charged`, so overlapping them would let two
+  // debits compute the same delta and double-charge. Chaining on `session._lock`
+  // makes them run one at a time in call order.
+  const prev = session._lock || Promise.resolve();
+  let release;
+  session._lock = new Promise((resolve) => (release = resolve));
+  await prev.catch(() => {});
+  try {
+    return await chargePoolLocked(bridge, session, cumulativeLines, debitId);
+  } finally {
+    release();
+  }
+}
+
+async function chargePoolLocked(bridge, session, cumulativeLines, debitId) {
+  const targets = new Map();
+  for (const line of cumulativeLines) {
+    const key = `${line.userId}|${line.role}`;
+    const cur = targets.get(key) || { userId: line.userId, role: line.role, amount: 0, sourceRef: line.sourceRef };
+    cur.amount += line.amount;
+    targets.set(key, cur);
+  }
+  const deltaLines = [];
+  for (const [key, target] of targets) {
+    const already = session.charged.get(key) || 0;
+    const delta = target.amount - already;
+    if (delta > 0) {
+      deltaLines.push({ userId: target.userId, role: target.role, amount: delta, sourceRef: target.sourceRef });
+    }
+  }
+  if (deltaLines.length === 0) {
+    return { charged: 0, remaining: session.lastRemaining, exhausted: false };
+  }
+  const usageHashValue = usageHash({ runId: session.runId, debitId, lines: deltaLines });
+  const res = await bridge.call(
+    "debitPool",
+    {
+      poolId: session.poolId,
+      payerUserId: session.payerUserId,
+      quoteId: session.quoteId,
+      runId: session.runId,
+      debitId,
+      usageHash: usageHashValue,
+      lines: deltaLines,
+    },
+    { timeoutMs: 35_000 },
+  );
+  if (res && res.exhausted === true) {
+    return { charged: 0, remaining: Number(res.remaining) || 0, exhausted: true };
+  }
+  if (!res || (res.applied !== true && res.alreadyApplied !== true)) {
+    throw new Error(String(res?.error || "billing pool debit failed"));
+  }
+  for (const line of deltaLines) {
+    const key = `${line.userId}|${line.role}`;
+    session.charged.set(key, (session.charged.get(key) || 0) + line.amount);
+  }
+  session.totalCharged += Number(res.charged) || 0;
+  session.lastRemaining = Number(res.remaining) || 0;
+  session.lastUsageHash = usageHashValue;
+  return { charged: Number(res.charged) || 0, remaining: session.lastRemaining, exhausted: false };
+}
+
+// One interim checkpoint: charge the run's cost accrued so far. `observed` is
+// cumulative (tokens/tools/sandbox from the run's start). No minimum-charge floor
+// — that is a whole-run minimum applied once at finalize.
+export async function chargeAgentCheckpoint(bridge, session, observed) {
+  if (!session || session.mode !== "live") return { charged: 0, exhausted: false };
+  session.seq += 1;
+  const lines = agentCumulativeLines(session.quote, observed, `${session.runId}:t${session.seq}`, false);
+  return chargePool(bridge, session, lines, `${session.runId}-${session.seq}`);
+}
+
+export async function chargeToolCheckpoint(bridge, session, observed) {
+  if (!session || session.mode !== "live") return { charged: 0, exhausted: false };
+  session.seq += 1;
+  const lines = toolCumulativeLines(session.quote, observed, `${session.runId}:t${session.seq}`, false);
+  return chargePool(bridge, session, lines, `${session.runId}-${session.seq}`);
+}
+
+// Final charge: the run's whole cumulative cost including the minimum-charge floor.
+async function finalizeLiveRun(bridge, session, observed, kind) {
+  const lines = kind === "agent"
+    ? agentCumulativeLines(session.quote, observed, `${session.runId}:final`, true)
+    : toolCumulativeLines(session.quote, observed, `${session.runId}:final`, true);
+  const res = await chargePool(bridge, session, lines, `${session.runId}-final`);
+  return {
+    chargedMinor: session.totalCharged,
+    usageHash: session.lastUsageHash,
+    lines,
+    exhausted: res.exhausted === true,
+    remaining: res.remaining,
+  };
+}
+
 // Route a computed settlement to the right Caspar op: settlePool for a pool-backed
 // session (the run draws down the user's shared pool), settleHold for a legacy
 // per-run hold. The lines and their caps are identical either way — only the
@@ -480,6 +701,9 @@ async function submitSettlement(bridge, session, usageHashValue, lines) {
 }
 
 export async function settleBillingRun(bridge, session, observed) {
+  // Live pool runs charge actual usage as they go; the final call just debits the
+  // tail (final tokens + minimum-charge floor). There is no reservation to settle.
+  if (session.mode === "live") return finalizeLiveRun(bridge, session, observed, "agent");
   if (!session[AGENT_SETTLEMENT_EVIDENCE]) {
     const settlement = agentSettlement(session.quote, observed, session.runId);
     const usage = {
@@ -518,6 +742,7 @@ export async function settleBillingRun(bridge, session, observed) {
 }
 
 export async function settleDirectToolRun(bridge, session, observed) {
+  if (session.mode === "live") return finalizeLiveRun(bridge, session, observed, "tool");
   if (!session[TOOL_SETTLEMENT_EVIDENCE]) {
     const settlement = toolSettlement(session.quote, observed, session.runId);
     const usage = {
@@ -556,6 +781,10 @@ export async function settleDirectToolRun(bridge, session, observed) {
 }
 
 export async function releaseBillingRun(bridge, session, reason) {
+  // A live run reserved nothing up front — it only debited what it actually used —
+  // so there is nothing to release/refund when it stops or fails. What it consumed
+  // before stopping stays charged; its progress stays on the space to resume.
+  if (!session || session.mode === "live") return;
   const releaseId = `meter_release_${session.runId}`;
   const reasonText = String(reason || "execution did not produce a receipt").slice(0, 256);
   const [op, input] = session.poolId
