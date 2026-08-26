@@ -280,6 +280,38 @@ export function projectOutcomePreamble(task) {
   );
 }
 
+/** Recurring crew check-ins. Agents propose them only when the outcome needs a cadence. */
+export function projectLoopsPreamble(task) {
+  if (!task || (!task.spaceId && !task.groupChat && !isGroupChat(task))) return "";
+  const raw = Array.isArray(task.spaceSchedules)
+    ? task.spaceSchedules
+    : Array.isArray(task.schedules)
+      ? task.schedules
+      : [];
+  const lines = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : "Loop";
+    const minutes = Number(row.intervalMinutes) || 1440;
+    const enabled = row.enabled !== false;
+    lines.push(`  • ${title} — every ${minutes}m${enabled ? "" : " (paused)"}`);
+  }
+  return (
+    "=== LOOPS ===\n" +
+    "Loops are recurring crew check-ins stored on this space. Propose a loop ONLY when the " +
+    "outcome needs unattended follow-up (a daily digest, a deploy watch, a weekly review). " +
+    "Never propose a loop for a one-shot question, a plan, or because someone chatted.\n" +
+    "If you need one, append a fenced JSON block at the end of your reply — the product " +
+    "creates it. Do not ask a person to click around:\n" +
+    "```decillion-loop\n" +
+    '{"title":"short name","intervalMinutes":1440,"prompt":"what the crew should do each run"}\n' +
+    "```\n" +
+    "Allowed intervalMinutes: 15, 60, 360, 1440, 10080. Do not duplicate an existing loop.\n\n" +
+    (lines.length ? `Existing loops:\n${lines.join("\n")}` : "Existing loops: none.") +
+    "\n=== END LOOPS ===\n"
+  );
+}
+
 /**
  * The system prompt appended to Grok's own (`--rules`): the group-chat context, the
  * space's callable capabilities, plus the agent's persona (its deployed skill),
@@ -300,6 +332,9 @@ export function buildSystemPrompt(task, opts = {}) {
 
   const outcome = projectOutcomePreamble(task);
   if (outcome) parts.push(outcome);
+
+  const loops = projectLoopsPreamble(task);
+  if (loops) parts.push(loops);
 
   // When the shell/filesystem built-ins are disabled but the capabilities section
   // did not already explain it (no shared sandbox named there), state it plainly so

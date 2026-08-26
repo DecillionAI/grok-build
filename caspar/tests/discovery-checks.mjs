@@ -187,6 +187,12 @@ async function main() {
     assert.ok(viaBrief.includes("Ship the API"));
     const none = buildSystemPrompt({ spaceId: "space-1" });
     assert.ok(!/PROJECT OUTCOME/i.test(none));
+    assert.ok(/LOOPS/i.test(withBrief));
+    const withLoop = buildSystemPrompt({
+      spaceId: "space-1",
+      spaceSchedules: [{ title: "Daily check", intervalMinutes: 1440, enabled: true }],
+    });
+    assert.ok(withLoop.includes("Daily check"));
   });
 
   await check("built-in shell/fs tools are denied unconditionally (never a fallback)", () => {
