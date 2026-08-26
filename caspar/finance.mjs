@@ -630,20 +630,29 @@ async function chargePoolLocked(bridge, session, cumulativeLines, debitId) {
     },
     { timeoutMs: 35_000 },
   );
-  if (res && res.exhausted === true) {
-    return { charged: 0, remaining: Number(res.remaining) || 0, exhausted: true };
-  }
-  if (!res || (res.applied !== true && res.alreadyApplied !== true)) {
+  // The node's pool-authority host gateway wraps the action result as
+  // { ok, statusCode, result: <action json> } — the applied/charged/remaining/
+  // exhausted fields live under `result`, not at the top level. A gateway-level
+  // failure (unknown op, unauthorized meter, timeout) has ok:false + top-level
+  // `error`.
+  if (!res || res.ok !== true) {
     throw new Error(String(res?.error || "billing pool debit failed"));
+  }
+  const result = res.result && typeof res.result === "object" ? res.result : res;
+  if (result.exhausted === true) {
+    return { charged: 0, remaining: Number(result.remaining) || 0, exhausted: true };
+  }
+  if (result.applied !== true && result.alreadyApplied !== true) {
+    throw new Error(String(result.error || res.error || "billing pool debit failed"));
   }
   for (const line of deltaLines) {
     const key = `${line.userId}|${line.role}`;
     session.charged.set(key, (session.charged.get(key) || 0) + line.amount);
   }
-  session.totalCharged += Number(res.charged) || 0;
-  session.lastRemaining = Number(res.remaining) || 0;
+  session.totalCharged += Number(result.charged) || 0;
+  session.lastRemaining = Number(result.remaining) || 0;
   session.lastUsageHash = usageHashValue;
-  return { charged: Number(res.charged) || 0, remaining: session.lastRemaining, exhausted: false };
+  return { charged: Number(result.charged) || 0, remaining: session.lastRemaining, exhausted: false };
 }
 
 // One interim checkpoint: charge the run's cost accrued so far. `observed` is
