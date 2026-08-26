@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
+  chargeAgentCheckpoint,
   releaseBillingRun,
   settleBillingRun,
   settleDirectToolRun,
@@ -99,6 +100,7 @@ class Bridge {
     quoteValue = quote,
     holdValue = hold,
     poolValue = null,
+    poolExhausted = false,
   } = {}) {
     this.programId = programId;
     this.calls = [];
@@ -106,6 +108,7 @@ class Bridge {
     this.quoteValue = quoteValue;
     this.holdValue = holdValue;
     this.poolValue = poolValue;
+    this.poolExhausted = poolExhausted;
   }
 
   async call(op, input) {
@@ -115,6 +118,12 @@ class Bridge {
     if (op === "getJson" && input.key === `Json::BillingQuote::${this.quoteValue.quoteId}`) return { data: this.quoteValue };
     if (op === "startHold" || op === "reservePool") return { ok: true };
     if (op === "settleHold" || op === "settlePool") return this.settlementOk ? { ok: true } : { ok: false, error: "rejected" };
+    if (op === "debitPool") {
+      if (!this.settlementOk) return { ok: false, error: "rejected" };
+      if (this.poolExhausted) return { applied: false, exhausted: true, remaining: 0, charged: 0 };
+      const charged = (input.lines || []).reduce((sum, line) => sum + line.amount, 0);
+      return { applied: true, charged, remaining: 1_000_000 };
+    }
     if (op === "releaseHold" || op === "releasePool") return { ok: true };
     if (op === "putJson") return { ok: true };
     throw new Error(`unexpected bridge call ${op}`);
@@ -214,19 +223,19 @@ await expectReject(
 }
 
 {
+  // No per-run ceiling any more: tool usage that would have tripped the old
+  // 8-call ceiling now settles (charges actual) instead of failing with
+  // "actual tool usage exceeds authorized quote ceiling".
   const bridge = new Bridge();
   const session = await authorizeBillingRun(bridge, { task, correlationId: "run-1" });
-  await expectReject(
-    "observed tool usage cannot exceed its server quote ceiling",
-    () => settleBillingRun(bridge, session, {
-      promptTokens: 1,
-      completionTokens: 1,
-      durationMs: 1,
-      sandboxActive: true,
-      tools: [{ resourceId: "tool-1", calls: 9, runtimeMs: 1 }],
-    }),
-    /exceeds authorized quote ceiling/,
-  );
+  const receipt = await settleBillingRun(bridge, session, {
+    promptTokens: 1,
+    completionTokens: 1,
+    durationMs: 1,
+    sandboxActive: true,
+    tools: [{ resourceId: "tool-1", calls: 9, runtimeMs: 1 }],
+  });
+  assert.ok(receipt.chargedMinor > 0, "high tool call count settles instead of hitting a ceiling");
 }
 
 {
@@ -382,28 +391,6 @@ const directToolTask = {
   assert.equal(bridge.calls.at(-1).input.releaseId, "meter_release_tool-run-1");
 }
 
-{
-  const bridge = new Bridge({
-    programId: "tool-meter",
-    quoteValue: directToolQuote,
-    holdValue: directToolHold,
-  });
-  const session = await authorizeDirectToolRun(
-    bridge,
-    { task: directToolTask, correlationId: "tool-run-1" },
-  );
-  await expectReject(
-    "direct tool runtime cannot exceed the server quote ceiling",
-    () => settleDirectToolRun(bridge, session, {
-      resourceId: "tool-1",
-      calls: 1,
-      runtimeMs: 60_001,
-      outcome: "ok",
-    }),
-    /exceeds authorized quote ceiling/,
-  );
-}
-
 // ── minimum-charge floor never fails a settlement ───────────────────────────
 // A zero-margin run whose actual cost lands below the catalog minimum must
 // still settle. The minimum-charge floor is a top-up routed to the platform
@@ -500,47 +487,54 @@ const agentDelivery = { task, correlationId: "run-1" };
   );
 }
 
-// ── shared-pool run path (reserve / settle / release against the pool) ───────
-// A run whose authorization carries a poolId draws down the user's shared pool
-// instead of taking its own hold: authorize -> reservePool, settle -> settlePool,
-// failure -> releasePool. Lines and caps are identical to the hold path.
+// ── shared-pool live-metering run path (debit against the pool) ──────────────
+// A run whose authorization carries a poolId meters live: no per-run reservation
+// or ceiling — it debits actual accrued cost from the pool's shared remaining
+// (debitPool) and stops peacefully when the pool reports exhausted. There is no
+// hold and nothing to release.
 {
   const bridge = new Bridge({ poolValue: pool });
   const session = await authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" });
   assert.equal(session.poolId, "pool-1", "a pool-backed run carries the pool id");
+  assert.equal(session.mode, "live", "a pool-backed run meters live");
   assert.ok(!session.holdId, "a pool-backed run has no per-run hold");
-  const reserve = bridge.calls.find((c) => c.op === "reservePool");
-  assert.ok(reserve, "authorization reserves a slice from the pool");
-  assert.equal(reserve.input.runId, "run-1");
-  assert.equal(reserve.input.maxAmount, quote.maxAmount, "reserves the quote's authorized ceiling");
+  assert.ok(!bridge.calls.some((c) => c.op === "reservePool"), "live runs do not reserve a slice up front");
   assert.ok(!bridge.calls.some((c) => c.op === "startHold"), "pool runs do not start a hold");
 
   const receipt = await settleBillingRun(bridge, session, {
     promptTokens: 1_000, completionTokens: 500, sandboxActive: false, durationMs: 1_000, tools: [],
   });
-  const settle = bridge.calls.find((c) => c.op === "settlePool");
-  assert.ok(settle, "settlement goes to the pool");
-  assert.equal(settle.input.poolId, "pool-1");
-  assert.equal(settle.input.runId, "run-1");
-  assert.equal(settle.input.settlementId, "run-1");
-  assert.equal(
-    settle.input.lines.reduce((sum, line) => sum + line.amount, 0),
-    receipt.chargedMinor,
-    "pool settlement charges exactly the computed lines",
+  const debit = bridge.calls.find((c) => c.op === "debitPool");
+  assert.ok(debit, "settlement debits the pool");
+  assert.equal(debit.input.poolId, "pool-1");
+  assert.equal(debit.input.runId, "run-1");
+  assert.equal(debit.input.usageHash.length, 64);
+  assert.ok(receipt.chargedMinor > 0, "a live pool run charges the computed cost");
+  assert.ok(
+    !bridge.calls.some((c) => c.op === "settleHold" || c.op === "settlePool"),
+    "live runs neither settle a hold nor a reservation",
   );
-  assert.ok(!bridge.calls.some((c) => c.op === "settleHold"), "pool runs do not settle a hold");
 }
 
-// A pool-backed run that fails before a receipt releases its whole slice back.
+// A live checkpoint that finds the pool exhausted stops peacefully (no throw).
+{
+  const bridge = new Bridge({ poolValue: pool, poolExhausted: true });
+  const session = await authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" });
+  const res = await chargeAgentCheckpoint(bridge, session, {
+    promptTokens: 1_000, completionTokens: 500, sandboxActive: false, durationMs: 1_000, tools: [],
+  });
+  assert.equal(res.exhausted, true, "an exhausted pool stops the run instead of failing it");
+}
+
+// A live run reserved nothing, so a failure/stop releases nothing.
 {
   const bridge = new Bridge({ poolValue: pool });
   const session = await authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" });
   await releaseBillingRun(bridge, session, "run failed before settlement");
-  const release = bridge.calls.find((c) => c.op === "releasePool");
-  assert.ok(release, "a failed pool run releases its reservation");
-  assert.equal(release.input.poolId, "pool-1");
-  assert.equal(release.input.runId, "run-1");
-  assert.ok(!bridge.calls.some((c) => c.op === "releaseHold"), "pool runs do not release a hold");
+  assert.ok(
+    !bridge.calls.some((c) => c.op === "releasePool" || c.op === "releaseHold"),
+    "a live run has no reservation to release",
+  );
 }
 
 // A closed/expired pool refuses new runs (fail closed).
