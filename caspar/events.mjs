@@ -197,10 +197,7 @@ export class TrajectoryMapper {
       return this.traceAll ? [this._event(`grok/system.${message.subtype}`, String(message.subtype), {}, "trace")] : [];
     }
     const mcp = Array.isArray(message.mcp_servers) ? message.mcp_servers : [];
-    const summary =
-      `Session started (model ${message.model || "default"}, ${Array.isArray(message.tools) ? message.tools.length : 0} built-in tools` +
-      (mcp.length ? `, creatures: ${mcp.map((s) => `${s.name}:${s.status}`).join(", ")}` : "") +
-      ")";
+    const summary = "Session started";
     return [
       this._event(
         "run_start",
