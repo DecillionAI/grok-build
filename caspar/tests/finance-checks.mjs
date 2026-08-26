@@ -119,10 +119,14 @@ class Bridge {
     if (op === "startHold" || op === "reservePool") return { ok: true };
     if (op === "settleHold" || op === "settlePool") return this.settlementOk ? { ok: true } : { ok: false, error: "rejected" };
     if (op === "debitPool") {
+      // The node's pool-authority host gateway wraps the action result under
+      // `result` with a top-level `ok`; mirror that here.
       if (!this.settlementOk) return { ok: false, error: "rejected" };
-      if (this.poolExhausted) return { applied: false, exhausted: true, remaining: 0, charged: 0 };
+      if (this.poolExhausted) {
+        return { ok: true, result: { applied: false, exhausted: true, remaining: 0, charged: 0 } };
+      }
       const charged = (input.lines || []).reduce((sum, line) => sum + line.amount, 0);
-      return { applied: true, charged, remaining: 1_000_000 };
+      return { ok: true, result: { applied: true, charged, remaining: 1_000_000 } };
     }
     if (op === "releaseHold" || op === "releasePool") return { ok: true };
     if (op === "putJson") return { ok: true };
