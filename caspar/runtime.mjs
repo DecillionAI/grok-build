@@ -55,7 +55,7 @@ import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
@@ -446,13 +446,23 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   if (bridge && !Array.isArray(task.history)) {
     const endpoint = historyEndpointFromTask(task);
     const spaceId = task.spaceId || task.storeId || task.space_id;
-    if (endpoint && spaceId) {
+    if (spaceId) {
       try {
-        const records = await fetchSpaceHistoryRecords(bridge, {
-          endpoint,
-          spaceId,
-          selfId: bridge.machineId || bridge.programId || "",
-        });
+        // Read the transcript straight from the store first: a couple of host
+        // reads, no dependency on the creature→creature history signal (which can
+        // be lost to a delivery-shape mismatch and, on a miss, only fails after an
+        // 8s timeout). The signal path is the fallback for the rare case a direct
+        // read comes back empty (e.g. a store that denies the prefix scan).
+        let records = await fetchSpaceHistoryDirect(bridge, spaceId);
+        let source = "direct";
+        if (!records.length && endpoint) {
+          records = await fetchSpaceHistoryRecords(bridge, {
+            endpoint,
+            spaceId,
+            selfId: bridge.machineId || bridge.programId || "",
+          });
+          source = "signal";
+        }
         // A space chat is split into threads (tabs), each its own conversation.
         // When the run belongs to a thread, scope the transcript to it so the
         // agent reasons only over that thread's history, not the whole space.
@@ -467,7 +477,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
           ? records.filter((r) => String((r && r.threadId) || "main") === threadId)
           : records;
         task.history = buildHistoryTurns(scoped, task.self, { excludeText: objective });
-        log("GROK_HISTORY", { spaceId, fetched: records.length, threadId: threadId || "all", scoped: scoped.length, turns: task.history.length });
+        log("GROK_HISTORY", { spaceId, source, fetched: records.length, threadId: threadId || "all", scoped: scoped.length, turns: task.history.length });
       } catch (err) {
         log("GROK_HISTORY", { error: String(err?.message || err) });
       }

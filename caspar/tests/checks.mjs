@@ -45,7 +45,7 @@ import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
 import { OutboundMediaCollector } from "../outboundMedia.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
 import { buildResult, normalizeUsage } from "../result.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryRecords } from "../spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
 import { ToolInvoker } from "../toolInvoker.mjs";
 import { ToolSocketServer } from "../toolSocket.mjs";
@@ -1348,6 +1348,46 @@ await check("the backbone fetches space history by signalling the spaces/history
     bridge.close();
     await gateway.close();
   }
+});
+
+await check("the backbone reads history straight from the store (getByPrefix fallback), any key shape", async () => {
+  // Canonical docs live at the base key (no trailing "::…"), exactly as
+  // writeSpaceHistory stores them.
+  const store = {
+    "Json::StoreHistory::sp::00000000000000000002": { text: "second", from: "agent", agentName: "Lead", threadId: "main" },
+    "Json::StoreHistory::sp::00000000000000000001": { text: "first", from: "user", fromName: "Sam", threadId: "main" },
+    "Json::StoreHistory::sp::00000000000000000003": { text: "third", from: "user", fromName: "Sam", threadId: "main" },
+  };
+  // getByPrefix may hand back a sub-key (a "::…" suffix) for a record; the reader
+  // must trim it back to the base id and dedupe, then read the base doc.
+  const prefixKeys = (prefix) => [
+    ...Object.keys(store).filter((k) => k.startsWith(prefix)),
+    `${prefix}00000000000000000003::sub`,
+  ];
+  const mkBridge = (prefixShape) => ({
+    async call(op, input) {
+      if (op === "getByPrefix") return prefixShape(prefixKeys(input.prefix));
+      if (op === "getJson") return { data: store[input.key] };
+      return {};
+    },
+  });
+  const asBareArray = (keys) => ({ data: keys });
+  const asKeyObjects = (keys) => ({ keys: keys.map((k) => ({ key: k })) });
+  const asFullKeyStrings = (keys) => keys; // getByPrefix returned a raw array
+
+  for (const shape of [asBareArray, asKeyObjects, asFullKeyStrings]) {
+    const recs = await fetchSpaceHistoryDirect(mkBridge(shape), "sp");
+    // Three keys, but the "::x" suffix collapses onto id 3 → 3 distinct records,
+    // newest last by zero-padded id.
+    assert.equal(recs.length, 3, "all distinct records read regardless of key shape");
+    const turns = buildHistoryTurns(recs, { name: "Writer" }, {});
+    assert.deepEqual(turns.map((t) => t.content), ["first", "second", "third"], "records ordered oldest→newest");
+  }
+
+  // A getByPrefix that throws yields no history rather than crashing the run.
+  const throwing = { async call(op) { if (op === "getByPrefix") throw new Error("boom"); return {}; } };
+  assert.deepEqual(await fetchSpaceHistoryDirect(throwing, "sp"), []);
+  assert.deepEqual(await fetchSpaceHistoryDirect(null, "sp"), []);
 });
 
 await check("the serve loop processes prompts in parallel — a slow prompt does not block others", async () => {
