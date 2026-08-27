@@ -1,0 +1,461 @@
+/**
+ * Server-side agent orchestration — the backbone drives the @mention fan-out
+ * chain itself, so multi-agent work continues with NO client present.
+ *
+ * Today the client (`onAskOrbit` in new-decillion) runs each agent, then reads
+ * whom its answer @mentioned and launches those teammates. That whole loop dies
+ * the moment the app closes. This module moves it into the backbone: after a
+ * server-orchestrated run persists its answer, the backbone resolves the
+ * teammates the answer @mentioned, mints a DELEGATED billing quote for each
+ * (drawing on the payer's already-open pool, bounded by the project's
+ * autonomous budget), and signals each teammate's proxy to run — re-entering
+ * this same backbone as an ordinary delivery. The chain therefore runs to
+ * completion (and every turn is persisted on-chain) whether or not a client is
+ * ever connected; a connected owner still sees it live because every run streams
+ * to `streamTo`.
+ *
+ * Billing note: only runs the backbone launches this way carry a delegated
+ * quote (`autonomousQuote`) and count against the project's autonomous budget.
+ * A user-initiated seed run keeps its own client-minted quote and is unaffected.
+ */
+import crypto from "node:crypto";
+
+const DEFAULT_MAX_HOPS = 8;
+const CALL_TIMEOUT_MS = 15000;
+
+function log(sentinel, payload) {
+  process.stdout.write(`${sentinel} ${JSON.stringify(payload)}\n`);
+}
+
+function endpointFrom(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const programId = String(raw.programId || raw.program_id || "").trim();
+  if (!programId) return null;
+  return {
+    programId,
+    creatureId: String(raw.creatureId || raw.creature_id || "").trim(),
+    entityId: String(raw.entityId || raw.entity_id || "main").trim() || "main",
+  };
+}
+
+export function billingEndpointFromTask(task) {
+  return endpointFrom(task && (task.billingEndpoint || task.billing_endpoint));
+}
+
+/**
+ * A server-orchestrated delivery is one the client (or a routine) marked so the
+ * backbone drives its @mention chain. Absent the flag, behaviour is unchanged —
+ * the client keeps orchestrating, exactly as before.
+ */
+export function isServerOrchestrated(task) {
+  if (!task || typeof task !== "object") return false;
+  if (task.serverOrchestrate === false) return false;
+  return Boolean(task.serverOrchestrate);
+}
+
+function toHandle(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function spaceIdOf(task) {
+  return String((task && (task.spaceId || task.storeId || task.space_id)) || "").trim();
+}
+
+/**
+ * Signal one creature and await its reply, mirroring the creature-to-creature
+ * dance in scheduleRoutine.mjs: a `StoresSend` on `creatures/signal` whose
+ * result the target dual-emits on `creatures/signal` so this docker creature can
+ * read it. Returns the parsed reply object, or null on timeout.
+ */
+async function callCreature(bridge, endpoint, payload, { spaceId, namespace, timeoutMs } = {}) {
+  if (!bridge || !endpoint) return null;
+  const correlationId = crypto.randomBytes(16).toString("hex");
+  const selfId = String(bridge.programId || bridge.machineId || "");
+  const inner = JSON.stringify({ action: payload.action, correlationId, payload: payload.payload });
+  const packet = {
+    action: "single",
+    user: { id: selfId },
+    store: { id: spaceId || "" },
+    data: JSON.stringify({ programId: endpoint.programId, entity: endpoint.entityId, payload: inner }),
+    entityId: endpoint.entityId,
+    correlationId,
+  };
+  let unsub = null;
+  const settled = new Promise((resolve) => {
+    unsub = bridge.onSignal((key, raw) => {
+      if (key !== "creatures/signal" && key !== "creatures/signal/result") return;
+      let pkt = raw;
+      if (pkt && typeof pkt === "object" && typeof pkt.data === "string") {
+        try {
+          pkt = JSON.parse(pkt.data);
+        } catch {
+          return;
+        }
+      }
+      if (!pkt || typeof pkt !== "object") return;
+      if (String(pkt.correlationId || "") !== correlationId) return;
+      if (namespace && pkt.namespace !== undefined && pkt.namespace !== namespace) return;
+      resolve(pkt);
+    });
+  });
+  try {
+    await bridge.signalUser("creatures/signal", endpoint.programId, packet);
+  } catch (err) {
+    if (unsub) unsub();
+    return null;
+  }
+  let timer;
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs || CALL_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([settled, timedOut]);
+  } finally {
+    clearTimeout(timer);
+    if (unsub) unsub();
+  }
+}
+
+/**
+ * The payer's one shared authorization pool, resolved by the node's
+ * `FinancePoolByUser` link. A delegated run reuses it (it is opened + funded by
+ * the client on the user's first run and lives for weeks); this never opens or
+ * funds a pool, so a delegated run can only ever draw funds the user has already
+ * pooled. Returns "" when the user has no open pool (then no autonomous run can
+ * proceed — correct: there is nothing to bill).
+ */
+export async function resolvePoolId(bridge, payer) {
+  if (!bridge || !payer) return "";
+  try {
+    const linked = await bridge.call("getLink", { key: `FinancePoolByUser::${payer}` });
+    let poolId = "";
+    if (typeof linked === "string") poolId = linked;
+    else if (linked && typeof linked === "object") {
+      poolId = String(linked.value || linked.data || linked.link || linked.id || "");
+    }
+    poolId = poolId.trim();
+    if (!poolId) return "";
+    const pool = await bridge.call("getJson", { key: `Json::FinancePool::${poolId}`, path: "pool" });
+    const p = pool && pool.data && typeof pool.data === "object" ? pool.data : null;
+    if (!p || p.status !== "open" || String(p.payerUserId || "") !== String(payer)) return "";
+    return poolId;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Mint a delegated agent quote for `payer` against `proxyProgramId`, bound to
+ * `correlationId`. The billing creature only honours a delegated payer when the
+ * requester IS the resource's settlement meter — which this backbone is — and
+ * enforces the project's autonomous budget. Returns the quoteId or "".
+ */
+async function mintDelegatedQuote(bridge, { billingEndpoint, payer, proxyProgramId, spaceId, correlationId }) {
+  const reply = await callCreature(
+    bridge,
+    billingEndpoint,
+    {
+      action: "quote",
+      payload: {
+        requestId: correlationId,
+        kind: "agent",
+        resourceId: proxyProgramId,
+        projectId: spaceId,
+        payerUserId: payer,
+      },
+    },
+    { spaceId, namespace: "billing" },
+  );
+  if (!reply) {
+    log("GROK_ORCH", { quote: "no-reply", proxyProgramId, spaceId });
+    return "";
+  }
+  if (reply.ok === false) {
+    log("GROK_ORCH", { quote: "rejected", error: String(reply.error || "").slice(0, 160) });
+    return "";
+  }
+  const quote = reply.quote && typeof reply.quote === "object" ? reply.quote : {};
+  return String(quote.quoteId || "");
+}
+
+export async function buildDelegatedAuthorization(bridge, { billingEndpoint, payer, poolId, proxyProgramId, spaceId, correlationId }) {
+  if (!billingEndpoint || !payer || !poolId || !proxyProgramId || !spaceId || !correlationId) return null;
+  const quoteId = await mintDelegatedQuote(bridge, { billingEndpoint, payer, proxyProgramId, spaceId, correlationId });
+  if (!quoteId) return null;
+  return { poolId, payerUserId: payer, quoteId };
+}
+
+/**
+ * The space's agents (proxy address + display name/handle), merged from the
+ * roster the caller supplied (which may carry richer handles) and the on-chain
+ * program index (authoritative for proxy addresses — and the only source when a
+ * routine fires with no client-supplied roster). Tools/sandbox are excluded:
+ * only agents are teammates.
+ */
+async function agentAddressBook(bridge, spaceId, roster) {
+  const byProgram = new Map();
+  const put = (a) => {
+    const programId = String(a.programId || "").trim();
+    if (!programId) return;
+    const prev = byProgram.get(programId) || {};
+    byProgram.set(programId, {
+      programId,
+      creatureId: String(a.creatureId || prev.creatureId || "").trim(),
+      entityId: String(a.entityId || prev.entityId || "agent").trim() || "agent",
+      resourceId: String(a.resourceId || prev.resourceId || programId).trim(),
+      name: String(a.name || prev.name || "").trim(),
+      handle: String(a.handle || prev.handle || toHandle(a.name || prev.name)).trim(),
+    });
+  };
+  try {
+    const res = await bridge.call("getJson", { key: `Json::StoreProgramIndex::${spaceId}`, path: "" });
+    const data = res && res.data && typeof res.data === "object" ? res.data : {};
+    for (const [pid, raw] of Object.entries(data)) {
+      const rec = raw && typeof raw === "object" ? raw : {};
+      const meta = rec.metadata && typeof rec.metadata === "object" ? rec.metadata : {};
+      const kind = String(meta.kind || meta.type || "").toLowerCase();
+      if (kind === "tool" || kind === "sandbox") continue;
+      put({
+        programId: rec.programId || pid,
+        creatureId: rec.creatureId || meta.creatureId,
+        entityId: rec.entityId || meta.entityId || "agent",
+        resourceId: meta.resourceId || rec.programId || pid,
+        name: meta.name || meta.title || rec.name,
+        handle: meta.handle,
+      });
+    }
+  } catch (err) {
+    log("GROK_ORCH", { roster_index_error: String(err?.message || err).slice(0, 160) });
+  }
+  // Overlay the caller's roster: it carries the handles the answer was written
+  // against and any proxy address the client already resolved.
+  for (const r of Array.isArray(roster) ? roster : []) {
+    if (!r || typeof r !== "object") continue;
+    if (r.kind && r.kind !== "agent") continue;
+    const programId = String(r.programId || r.id || "").trim();
+    if (!programId) continue;
+    put({
+      programId,
+      creatureId: r.creatureId,
+      entityId: r.entityId || "agent",
+      resourceId: r.resourceId || r.id || programId,
+      name: r.name,
+      handle: r.handle,
+    });
+  }
+  return [...byProgram.values()];
+}
+
+/** Which agents in `agents` did `answer` @mention (excluding self / visited)? */
+function mentionedTeammates(answer, agents, { visited, selfProgram }) {
+  const out = [];
+  const seen = new Set();
+  for (const a of agents) {
+    if (!a.handle || !a.programId || !a.creatureId) continue;
+    if (a.programId === selfProgram || visited.has(a.programId) || seen.has(a.programId)) continue;
+    const esc = a.handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(^|[^a-z0-9-])@${esc}(?![a-z0-9-])`, "i").test(answer)) {
+      seen.add(a.programId);
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+/** Signal a teammate's proxy to run one turn; the proxy injects its skill/LLM
+ * config and forwards to this backbone, where it re-enters as a delivery. */
+async function signalProxyRun(bridge, teammate, task, { spaceId, correlationId, streamTo }) {
+  const packet = {
+    action: "single",
+    user: { id: String(streamTo || bridge.programId || "") },
+    store: { id: spaceId },
+    data: JSON.stringify({
+      programId: teammate.programId,
+      entity: teammate.entityId || "agent",
+      payload: JSON.stringify(task),
+    }),
+    entityId: teammate.entityId || "agent",
+    correlationId,
+  };
+  await bridge.signalUser("creatures/signal", teammate.programId, packet);
+}
+
+/** Fields carried forward unchanged onto every hand-off in the chain. */
+function forwardContext(task) {
+  const out = {};
+  for (const k of [
+    "billingEndpoint",
+    "signalEndpoint",
+    "historyEndpoint",
+    "routinesEndpoint",
+    "schedulerProgramId",
+    "projectBrief",
+    "brief",
+    "roster",
+  ]) {
+    if (task[k] !== undefined) out[k] = task[k];
+  }
+  return out;
+}
+
+/**
+ * After a server-orchestrated run finishes, launch every teammate its answer
+ * @mentioned. Each teammate gets a fresh correlation, a delegated quote, and the
+ * advanced orchestration state (visited set + hop depth) so the chain cannot
+ * loop or double-launch an agent. Returns the number launched.
+ */
+export async function planAndLaunchFollowups(bridge, delivery, result) {
+  const task = (delivery && delivery.task) || {};
+  if (!bridge || !isServerOrchestrated(task)) return 0;
+  if (!result || result.success === false || result.pausedForFunds) return 0;
+  const answer = typeof result.answer === "string" ? result.answer : "";
+  if (!answer.trim()) return 0;
+  const spaceId = spaceIdOf(task);
+  if (!spaceId) return 0;
+
+  const orch = task.orchestration && typeof task.orchestration === "object" ? task.orchestration : {};
+  const depth = Number(orch.depth || 0);
+  const maxHops = Number(orch.maxHops || DEFAULT_MAX_HOPS);
+  if (depth + 1 >= maxHops) return 0;
+  const visited = new Set((Array.isArray(orch.visited) ? orch.visited : []).map(String));
+  const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
+  if (selfProgram) visited.add(selfProgram);
+
+  const payer = String(orch.payerUserId || task.streamTo || "");
+  let poolId = String(orch.poolId || "");
+  if (!poolId) poolId = await resolvePoolId(bridge, payer);
+  const billingEndpoint = billingEndpointFromTask(task);
+  if (!payer || !poolId || !billingEndpoint) {
+    log("GROK_ORCH", { followups: "no-billing-context", payer: Boolean(payer), poolId: Boolean(poolId), billingEndpoint: Boolean(billingEndpoint) });
+    return 0;
+  }
+
+  const agents = await agentAddressBook(bridge, spaceId, task.roster);
+  const teammates = mentionedTeammates(answer, agents, { visited, selfProgram });
+  if (!teammates.length) return 0;
+
+  // Claim the whole batch in the visited set up front so two concurrent branches
+  // of the chain can never launch the same agent twice.
+  const nextVisited = [...visited, ...teammates.map((t) => t.programId)];
+  const threadId = String(task.threadId || "main") || "main";
+  const base = forwardContext(task);
+  let launched = 0;
+  for (const teammate of teammates) {
+    const correlationId = crypto.randomBytes(16).toString("hex");
+    const auth = await buildDelegatedAuthorization(bridge, {
+      billingEndpoint,
+      payer,
+      poolId,
+      proxyProgramId: teammate.programId,
+      spaceId,
+      correlationId,
+    });
+    if (!auth) {
+      // Budget reached or quote failed: stop expanding down this teammate rather
+      // than spend past the cap. The answer that named them is already persisted.
+      log("GROK_ORCH", { skip_teammate: teammate.programId, reason: "no-delegated-quote" });
+      continue;
+    }
+    const childTask = {
+      ...base,
+      prompt: answer,
+      objective: answer,
+      streamTo: payer,
+      spaceId,
+      groupChat: true,
+      threadId,
+      proxyProgramId: teammate.programId,
+      agentProgramId: teammate.programId,
+      agentCreatureId: teammate.creatureId,
+      targetAgentId: teammate.resourceId,
+      self: { id: teammate.resourceId, name: teammate.name, handle: teammate.handle, programId: teammate.programId },
+      mentions: [{ programId: teammate.programId, name: teammate.name, handle: teammate.handle, kind: "agent" }],
+      billingAuthorization: auth,
+      autonomousQuote: true,
+      correlationId,
+      serverOrchestrate: true,
+      orchestration: { depth: depth + 1, maxHops, visited: nextVisited, poolId, payerUserId: payer },
+    };
+    try {
+      await signalProxyRun(bridge, teammate, childTask, { spaceId, correlationId, streamTo: payer });
+      launched += 1;
+    } catch (err) {
+      log("GROK_ORCH", { launch_error: teammate.programId, error: String(err?.message || err).slice(0, 160) });
+    }
+  }
+  if (launched) log("GROK_ORCH", { launched, depth: depth + 1, spaceId, threadId });
+  return launched;
+}
+
+/**
+ * A server-orchestrated delivery that arrived without a billing authorization —
+ * a routine firing with no client to mint one — needs a delegated quote built
+ * before it can run. Mutates `delivery.task` in place; returns true on success.
+ */
+export async function ensureDelegatedAuthorization(bridge, delivery) {
+  const task = (delivery && delivery.task) || {};
+  if (!bridge || !isServerOrchestrated(task)) return true;
+  if (task.billingAuthorization && typeof task.billingAuthorization === "object") return true;
+  const spaceId = spaceIdOf(task);
+  const proxyProgramId = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
+  const payer = String((task.orchestration && task.orchestration.payerUserId) || task.streamTo || task.ownerUserId || "");
+  const correlationId = String(delivery.correlationId || task.correlationId || "");
+  const billingEndpoint = billingEndpointFromTask(task);
+  if (!spaceId || !proxyProgramId || !payer || !correlationId || !billingEndpoint) {
+    log("GROK_ORCH", { ensure_auth: "missing-context", spaceId: Boolean(spaceId), proxyProgramId: Boolean(proxyProgramId), payer: Boolean(payer) });
+    return false;
+  }
+  const poolId = String((task.orchestration && task.orchestration.poolId) || "") || (await resolvePoolId(bridge, payer));
+  if (!poolId) {
+    log("GROK_ORCH", { ensure_auth: "no-pool", payer });
+    return false;
+  }
+  const auth = await buildDelegatedAuthorization(bridge, {
+    billingEndpoint,
+    payer,
+    poolId,
+    proxyProgramId,
+    spaceId,
+    correlationId,
+  });
+  if (!auth) return false;
+  task.billingAuthorization = auth;
+  task.autonomousQuote = true;
+  const orch = task.orchestration && typeof task.orchestration === "object" ? { ...task.orchestration } : {};
+  orch.poolId = poolId;
+  orch.payerUserId = payer;
+  if (orch.depth === undefined) orch.depth = 0;
+  task.orchestration = orch;
+  return true;
+}
+
+/**
+ * Record a delegated run's actual charge against the project's autonomous
+ * budget and release its reservation. Only runs whose quote the backbone minted
+ * (`autonomousQuote`) touch the ledger — a user-initiated seed keeps its own
+ * client quote and must not count as autonomous spend. Best-effort.
+ */
+export async function settleAutonomousSpend(bridge, delivery, result) {
+  const task = (delivery && delivery.task) || {};
+  if (!bridge || !task.autonomousQuote) return;
+  const auth = task.billingAuthorization;
+  const quoteId = auth && typeof auth === "object" ? String(auth.quoteId || "") : "";
+  const spaceId = spaceIdOf(task);
+  const billingEndpoint = billingEndpointFromTask(task);
+  if (!quoteId || !spaceId || !billingEndpoint) return;
+  const charged = Math.max(0, Number((result && result.chargedMinor) || 0) || 0);
+  try {
+    await callCreature(
+      bridge,
+      billingEndpoint,
+      { action: "settleAutonomous", payload: { spaceId, quoteId, chargedMinor: charged } },
+      { spaceId, namespace: "billing" },
+    );
+  } catch (err) {
+    log("GROK_ORCH", { settle_autonomous_error: String(err?.message || err).slice(0, 160) });
+  }
+}

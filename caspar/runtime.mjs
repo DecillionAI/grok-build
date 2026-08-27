@@ -65,6 +65,12 @@ import {
   settleDirectToolRun,
 } from "./finance.mjs";
 import { runDirectTool } from "./directTool.mjs";
+import {
+  ensureDelegatedAuthorization,
+  isServerOrchestrated,
+  planAndLaunchFollowups,
+  settleAutonomousSpend,
+} from "./orchestrate.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -1123,7 +1129,24 @@ export async function main() {
   const startDelivery = (activeBridge, delivery) => {
     const task = (async () => {
       try {
-        await serveOnce(activeBridge, delivery);
+        // A server-orchestrated delivery that arrived without a billing
+        // authorization (a routine firing with no client to mint one) needs a
+        // delegated quote built before it can run. No-op when the client already
+        // supplied one.
+        if (activeBridge && isServerOrchestrated(delivery.task)) {
+          const ready = await ensureDelegatedAuthorization(activeBridge, delivery);
+          if (!ready) {
+            log("GROK_ORCH", { skipped: "no-delegated-authorization", correlationId: delivery.correlationId });
+            return;
+          }
+        }
+        const result = await serveOnce(activeBridge, delivery);
+        // Record autonomous spend and drive the @mention chain forward — the
+        // backbone launches whichever teammates this answer named, so the chain
+        // completes with no client present. Both are no-ops for an ordinary,
+        // non-orchestrated run.
+        await settleAutonomousSpend(activeBridge, delivery, result);
+        await planAndLaunchFollowups(activeBridge, delivery, result);
       } catch (err) {
         log("GROK_BOOT", { serve_error: String(err?.message || err).slice(0, 200) });
       } finally {

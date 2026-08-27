@@ -106,11 +106,30 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
 
   const self = task.self && typeof task.self === "object" ? task.self : {};
   const agentProgramId = String(task.agentProgramId || self.id || "").trim();
+  const agentCreatureId = String(task.agentCreatureId || self.creatureId || "").trim();
+  const agentEntityId = String(task.proxyEntityId || task.agentEntityId || "agent").trim() || "agent";
   const agentName = String(self.name || "").trim();
   const handle = String(self.handle || "").trim() || toMentionHandle(agentName);
   const mention = handle ? `@${handle}` : "";
   const threadId = String(task.threadId || "main").trim() || "main";
   const schedulerProgramId = String(task.schedulerProgramId || endpoint.programId || "").trim();
+  // Endpoints carried onto the routine so a later fire can run the agent
+  // server-side with delegated billing (see startRoutineServerRun in the
+  // routines creature). Only well-formed {programId,...} addresses are passed.
+  const endpointOf = (raw) => {
+    if (!raw || typeof raw !== "object") return null;
+    const programId = String(raw.programId || raw.program_id || "").trim();
+    if (!programId) return null;
+    return {
+      programId,
+      creatureId: String(raw.creatureId || raw.creature_id || "").trim(),
+      entityId: String(raw.entityId || raw.entity_id || "main").trim() || "main",
+    };
+  };
+  const billingEndpoint = endpointOf(task.billingEndpoint);
+  const signalEndpoint = endpointOf(task.signalEndpoint);
+  const historyEndpoint = endpointOf(task.historyEndpoint);
+  const routinesEndpoint = endpointOf(task.routinesEndpoint) || endpoint;
 
   const payload = {
     action: "create",
@@ -123,8 +142,14 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
     mode,
     ...(mode === "loop" ? { intervalSeconds: Math.max(60, seconds) } : { delaySeconds: seconds }),
     ...(agentProgramId ? { agentProgramId } : {}),
+    ...(agentCreatureId ? { agentCreatureId } : {}),
+    ...(agentEntityId ? { agentEntityId } : {}),
     ...(agentName ? { agentName } : {}),
     ...(mention ? { mention } : {}),
+    ...(billingEndpoint ? { billingEndpoint } : {}),
+    ...(signalEndpoint ? { signalEndpoint } : {}),
+    ...(historyEndpoint ? { historyEndpoint } : {}),
+    ...(routinesEndpoint ? { routinesEndpoint } : {}),
   };
 
   const correlationId = crypto.randomBytes(16).toString("hex");
