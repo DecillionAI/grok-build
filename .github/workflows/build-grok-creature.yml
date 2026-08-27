@@ -33,7 +33,6 @@ on:
   push:
     branches:
       - main
-      - "claude/**"
     tags:
       - "v*"
     # Only what the creature is built from — docs and unrelated crates changes do
