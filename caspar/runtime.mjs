@@ -50,6 +50,7 @@ import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.mjs";
 import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
+import { SCHEDULE_ROUTINE_TOOL, scheduleRoutine } from "./scheduleRoutine.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
@@ -226,7 +227,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   // existing internet URL or a file from the shared sandbox.
   const initialCatalog = buildToolDefinitions(catalog);
   const byName = initialCatalog.byName;
-  const platformToolDefs = [GENERATE_MEDIA_TOOL, SHARE_MEDIA_TOOL];
+  const platformToolDefs = [GENERATE_MEDIA_TOOL, SHARE_MEDIA_TOOL, SCHEDULE_ROUTINE_TOOL];
   const reservedToolNames = new Set(platformToolDefs.map((tool) => tool.name));
   const installCatalog = (rebuilt) => {
     // `initialCatalog.byName` is the same Map object as `byName`; snapshot it
@@ -237,7 +238,8 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
       if (!reservedToolNames.has(name)) byName.set(name, entry);
     }
     for (const tool of platformToolDefs) {
-      byName.set(tool.name, { name: tool.name, kind: "tool", category: "media" });
+      const category = tool.name === SCHEDULE_ROUTINE_TOOL.name ? "scheduler" : "media";
+      byName.set(tool.name, { name: tool.name, kind: "tool", category });
     }
     return [...rebuilt.tools.filter((tool) => !reservedToolNames.has(tool.name)), ...platformToolDefs];
   };
@@ -313,6 +315,8 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     call: (name, args) => {
       if (name === GENERATE_MEDIA_TOOL.name) return mediaGenerator.generate(args);
       if (name === SHARE_MEDIA_TOOL.name) return mediaCollector.share(args);
+      if (name === SCHEDULE_ROUTINE_TOOL.name)
+        return scheduleRoutine(bridge, task, streamTo, args, { log });
       if (!invoker) return { ok: false, error: `tool ${name} needs a live Caspar bridge` };
       return invoker.invoke(name, args);
     },
