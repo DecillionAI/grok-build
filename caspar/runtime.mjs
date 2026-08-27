@@ -69,6 +69,7 @@ import {
   ensureDelegatedAuthorization,
   isServerOrchestrated,
   planAndLaunchFollowups,
+  recordServerRun,
   settleAutonomousSpend,
 } from "./orchestrate.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
@@ -1150,7 +1151,15 @@ export async function main() {
             return;
           }
         }
+        // Show a backbone-launched (teammate/routine) run in the app's Status
+        // while it works — a no-op for the client's own seed run.
+        await recordServerRun(activeBridge, delivery, { status: "started", startedAt: Date.now() });
         const result = await serveOnce(activeBridge, delivery);
+        await recordServerRun(activeBridge, delivery, {
+          status: result && result.success === false ? "error" : "ok",
+          endedAt: Date.now(),
+          ...(result && result.success === false && result.error ? { error: String(result.error).slice(0, 300) } : {}),
+        });
         // Record autonomous spend and drive the @mention chain forward — the
         // backbone launches whichever teammates this answer named, so the chain
         // completes with no client present. Both are no-ops for an ordinary,
