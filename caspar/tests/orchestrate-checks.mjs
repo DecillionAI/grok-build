@@ -18,6 +18,12 @@
  */
 
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+
+// Shrink the delegated-quote poll so the "refused" case (no doc ever written)
+// resolves in a few ms instead of the production ~6s. Read at call time.
+process.env.DELEGATED_QUOTE_ATTEMPTS = "8";
+process.env.DELEGATED_QUOTE_INTERVAL_MS = "3";
 
 import {
   billingEndpointFromTask,
@@ -27,6 +33,16 @@ import {
   resolvePoolId,
   settleAutonomousSpend,
 } from "../orchestrate.mjs";
+
+/** The deterministic quote id the billing creature (and the backbone) compute. */
+function fakeQuoteId(payer, requestId) {
+  const h = crypto.createHash("sha256");
+  h.update(Buffer.from(String(payer), "utf8"));
+  h.update(Buffer.from([0]));
+  h.update(Buffer.from(String(requestId), "utf8"));
+  h.update(Buffer.from([0]));
+  return h.digest("hex");
+}
 
 const GREEN = "\x1b[0;32m";
 const RED = "\x1b[0;31m";
@@ -53,11 +69,24 @@ const PROGRAM_INDEX = {
   "tool-prog": { programId: "tool-prog", creatureId: "tool-cr", entityId: "main", metadata: { kind: "tool", name: "sandbox" } },
 };
 
-/** A minimal node-shaped bridge for the orchestration flow. */
-function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user-1" } }, quoteOk = true, quoteId = "q-1" } = {}) {
-  const listeners = new Set();
+/**
+ * A minimal node-shaped bridge for the orchestration flow. Mirrors the real
+ * path: a delegated quote is fired at the billing creature (signalUser) and read
+ * back as the committed doc (getJson Json::BillingQuote::<id>) — no reliance on a
+ * signal reply. A refused quote (quoteOk:false) writes no doc, so the read times
+ * out and the teammate is not launched. Teammate launches signal the proxy.
+ */
+function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user-1" } }, quoteOk = true } = {}) {
   const launched = [];
   const settled = [];
+  const quoteDocs = new Map(); // quoteId -> committed quote doc
+  const parseInner = (packet) => {
+    try {
+      return JSON.parse(JSON.parse(packet.data).payload);
+    } catch {
+      return {};
+    }
+  };
   const bridge = {
     programId: "meter-prog",
     machineId: "meter-machine",
@@ -75,33 +104,34 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
         }
         m = key.match(/^Json::StoreProgramIndex::/);
         if (m) return { ok: true, data: PROGRAM_INDEX };
+        m = key.match(/^Json::BillingQuote::(.+)$/);
+        if (m) {
+          const doc = quoteDocs.get(m[1]);
+          return doc ? { ok: true, data: doc } : { ok: true };
+        }
         return { ok: true };
       }
       return { ok: true };
     },
-    onSignal(fn) {
-      listeners.add(fn);
-      return () => listeners.delete(fn);
+    onSignal() {
+      return () => {};
     },
     async signalUser(key, target, packet) {
       if (target === BILLING_PROG) {
-        let action = "";
-        try {
-          action = JSON.parse(JSON.parse(packet.data).payload).action;
-        } catch {
-          /* ignore */
+        const inner = parseInner(packet);
+        const p = inner.payload || {};
+        if (inner.action === "quote" && quoteOk) {
+          const qid = fakeQuoteId(p.payerUserId, p.requestId);
+          quoteDocs.set(qid, {
+            quoteId: qid,
+            payerUserId: p.payerUserId,
+            requestId: p.requestId,
+            resourceId: p.resourceId,
+            projectId: p.projectId,
+          });
+        } else if (inner.action === "settleAutonomous") {
+          settled.push({ payload: p });
         }
-        const cid = packet.correlationId;
-        if (action === "settleAutonomous") settled.push({ cid, packet });
-        setImmediate(() => {
-          const reply =
-            action === "quote"
-              ? quoteOk
-                ? { correlationId: cid, namespace: "billing", ok: true, quote: { quoteId } }
-                : { correlationId: cid, namespace: "billing", ok: false, error: "autonomous budget reached for this project" }
-              : { correlationId: cid, namespace: "billing", ok: true };
-          for (const fn of [...listeners]) fn("creatures/signal", { data: JSON.stringify(reply) });
-        });
         return { ok: true };
       }
       launched.push({ target, packet, task: JSON.parse(JSON.parse(packet.data).payload) });
@@ -150,7 +180,9 @@ await check("an answer's @mentioned teammate is launched with a delegated quote"
   assert.equal(launched[0].target, "mate-prog");
   const t = launched[0].task;
   assert.equal(t.proxyProgramId, "mate-prog");
-  assert.equal(t.billingAuthorization.quoteId, "q-1");
+  // The quote id is deterministic (sha256 of payer+requestId) and read back from
+  // the committed doc — so it is a 64-hex digest bound to this run, not a stub.
+  assert.match(t.billingAuthorization.quoteId, /^[0-9a-f]{64}$/);
   assert.equal(t.billingAuthorization.payerUserId, "user-1");
   assert.equal(t.billingAuthorization.poolId, "pool-1");
   assert.equal(t.autonomousQuote, true);
@@ -241,7 +273,7 @@ await check("ensureDelegatedAuthorization mints a quote for a routine seed with 
   };
   const ready = await ensureDelegatedAuthorization(bridge, delivery);
   assert.equal(ready, true);
-  assert.equal(delivery.task.billingAuthorization.quoteId, "q-1");
+  assert.match(delivery.task.billingAuthorization.quoteId, /^[0-9a-f]{64}$/);
   assert.equal(delivery.task.autonomousQuote, true);
   assert.equal(delivery.task.orchestration.poolId, "pool-1");
 });
