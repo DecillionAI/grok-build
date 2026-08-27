@@ -292,12 +292,14 @@ async function agentAddressBook(bridge, spaceId, roster) {
   return [...byProgram.values()];
 }
 
-/** Which agents in `agents` did `answer` @mention (excluding self / visited)? */
+/** Which agents in `agents` did `answer` @mention (excluding self / visited)?
+ * Only a handle + program id are required — the launch signals the proxy by
+ * program id + entity, so a missing creatureId must NOT drop a teammate. */
 function mentionedTeammates(answer, agents, { visited, selfProgram }) {
   const out = [];
   const seen = new Set();
   for (const a of agents) {
-    if (!a.handle || !a.programId || !a.creatureId) continue;
+    if (!a.handle || !a.programId) continue;
     if (a.programId === selfProgram || visited.has(a.programId) || seen.has(a.programId)) continue;
     const esc = a.handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     if (new RegExp(`(^|[^a-z0-9-])@${esc}(?![a-z0-9-])`, "i").test(answer)) {
@@ -352,17 +354,33 @@ function forwardContext(task) {
  */
 export async function planAndLaunchFollowups(bridge, delivery, result) {
   const task = (delivery && delivery.task) || {};
-  if (!bridge || !isServerOrchestrated(task)) return 0;
-  if (!result || result.success === false || result.pausedForFunds) return 0;
+  if (!bridge) return 0;
+  if (!isServerOrchestrated(task)) {
+    log("GROK_ORCH", { followups: "not-orchestrated", serverOrchestrate: task.serverOrchestrate ?? null });
+    return 0;
+  }
+  if (!result || result.success === false || result.pausedForFunds) {
+    log("GROK_ORCH", { followups: "run-not-ok", success: result ? result.success : null, paused: Boolean(result && result.pausedForFunds) });
+    return 0;
+  }
   const answer = typeof result.answer === "string" ? result.answer : "";
-  if (!answer.trim()) return 0;
+  if (!answer.trim()) {
+    log("GROK_ORCH", { followups: "empty-answer" });
+    return 0;
+  }
   const spaceId = spaceIdOf(task);
-  if (!spaceId) return 0;
+  if (!spaceId) {
+    log("GROK_ORCH", { followups: "no-space" });
+    return 0;
+  }
 
   const orch = task.orchestration && typeof task.orchestration === "object" ? task.orchestration : {};
   const depth = Number(orch.depth || 0);
   const maxHops = Number(orch.maxHops || DEFAULT_MAX_HOPS);
-  if (depth + 1 >= maxHops) return 0;
+  if (depth + 1 >= maxHops) {
+    log("GROK_ORCH", { followups: "hop-cap", depth, maxHops });
+    return 0;
+  }
   const visited = new Set((Array.isArray(orch.visited) ? orch.visited : []).map(String));
   const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
   if (selfProgram) visited.add(selfProgram);
@@ -378,7 +396,17 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
   const teammates = mentionedTeammates(answer, agents, { visited, selfProgram });
-  if (!teammates.length) return 0;
+  if (!teammates.length) {
+    // The chain stops here because the answer named no launchable teammate.
+    // Log what we saw so a handle/roster mismatch is diagnosable from the VM log.
+    log("GROK_ORCH", {
+      followups: "no-teammates",
+      agents: agents.map((a) => a.handle).filter(Boolean),
+      rosterSize: Array.isArray(task.roster) ? task.roster.length : 0,
+      answerMentions: (answer.match(/(^|[^a-z0-9-])@[a-z0-9-]+/gi) || []).map((m) => m.trim().replace(/^@?/, "")).slice(0, 10),
+    });
+    return 0;
+  }
 
   // Claim the whole batch in the visited set up front so two concurrent branches
   // of the chain can never launch the same agent twice.
