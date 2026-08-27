@@ -447,10 +447,18 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
   if (selfProgram) visited.add(selfProgram);
 
-  // The @handles this answer actually mentioned — used both for diagnostics and
-  // to decide whether a stall is worth flagging (a plain answer with no @mention
-  // is a normal end-of-turn, not a failure).
-  const answerHandles = [...parseAnswerMentions(answer)];
+  // The @handles this answer actually mentioned, minus the ones that name a
+  // PERSON in the roster (a human @mention is not a fan-out target, so it must
+  // not read as a stall). What remains is the set of agent-directed mentions
+  // used both for diagnostics and to decide whether a stall is worth flagging.
+  const personHandles = new Set(
+    (Array.isArray(task.roster) ? task.roster : [])
+      .filter((r) => r && (r.kind === "user" || r.kind === "person"))
+      .flatMap((r) => [r.handle, toHandle(r.name)])
+      .filter((v) => v && typeof v === "string")
+      .map((v) => v.toLowerCase()),
+  );
+  const answerHandles = [...parseAnswerMentions(answer)].filter((h) => !personHandles.has(h));
 
   const payer = String(orch.payerUserId || task.streamTo || "");
   let poolId = String(orch.poolId || "");
