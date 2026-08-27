@@ -448,39 +448,43 @@ async function main() {
     assert.equal(ep2.entityId, "main");
   });
 
-  await check("persistSpaceMessage signals spaces/signal with persist:true and the message data", async () => {
-    const calls = [];
-    const bridge = {
+  await check("persistSpaceMessage writes straight to StoreHistory (bypassing the spaces/signal ACL), upserting by msgId", async () => {
+    // A fake store backing getJson/putJson/genId.
+    const store = new Map();
+    let counter = 100;
+    const mkBridge = () => ({
       machineId: "self-1",
-      signalUser: async (key, target, packet) => {
-        calls.push({ key, target, packet });
+      call: async (op, input) => {
+        if (op === "genId") return { id: `${counter++}@origin` };
+        if (op === "getJson") return { data: store.get(String(input.key)) };
+        if (op === "putJson") {
+          const key = String(input.key);
+          store.set(key, input.merge ? { ...(store.get(key) || {}), ...input.data } : input.data);
+          return { ok: true };
+        }
         return { ok: true };
       },
-    };
-    const data = { text: "done", from: "agent", msgId: "cid-1", threadId: "main" };
-    const ok = await persistSpaceMessage(bridge, {
-      endpoint: { programId: "p-sig", entityId: "main" },
-      spaceId: "space-1",
-      selfId: "self-1",
-      data,
     });
+    const bridge = mkBridge();
+    const data = { text: "done", from: "agent", msgId: "cid-1", threadId: "main" };
+    const ok = await persistSpaceMessage(bridge, { spaceId: "space-1", selfId: "self-1", data });
     assert.equal(ok, true);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].key, "creatures/signal");
-    assert.equal(calls[0].target, "p-sig");
-    // The outer StoresSend carries the store + a JSON `data` envelope whose inner
-    // payload is the persist:true spaces/signal call with our message data.
-    assert.equal(calls[0].packet.store.id, "space-1");
-    const env = JSON.parse(calls[0].packet.data);
-    assert.equal(env.programId, "p-sig");
-    const inner = JSON.parse(env.payload);
-    assert.equal(inner.action, "signal");
-    assert.equal(inner.payload.persist, true);
-    assert.equal(inner.payload.storeId, "space-1");
-    assert.deepEqual(inner.payload.data, data);
-    // Missing endpoint / space / bridge is a no-op, never a throw.
-    assert.equal(await persistSpaceMessage(null, { endpoint: {}, spaceId: "s", data }), false);
-    assert.equal(await persistSpaceMessage(bridge, { endpoint: null, spaceId: "s", data }), false);
+    // The turn is written under a zero-padded StoreHistory key with the message data.
+    const idx = store.get("Json::StoreHistoryIndex::space-1");
+    assert.ok(idx && idx["cid-1"], "msgId is indexed");
+    const rec = store.get(`Json::StoreHistory::space-1::${idx["cid-1"]}`);
+    assert.equal(rec.text, "done");
+    assert.equal(rec.from, "agent");
+    assert.equal(rec.storeId, "space-1");
+    // A second write of the SAME msgId (e.g. the app enriching the turn) merges
+    // into the same record — no duplicate bubble.
+    await persistSpaceMessage(bridge, { spaceId: "space-1", data: { msgId: "cid-1", usageLabel: "$0.01" } });
+    const idx2 = store.get("Json::StoreHistoryIndex::space-1");
+    assert.equal(Object.keys(idx2).length, 1, "still one indexed turn for the msgId");
+    assert.equal(store.get(`Json::StoreHistory::space-1::${idx2["cid-1"]}`).usageLabel, "$0.01");
+    // Missing space / bridge / data is a no-op, never a throw.
+    assert.equal(await persistSpaceMessage(null, { spaceId: "s", data }), false);
+    assert.equal(await persistSpaceMessage(bridge, { spaceId: "", data }), false);
   });
 
   console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);

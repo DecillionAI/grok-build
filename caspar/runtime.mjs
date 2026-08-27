@@ -55,7 +55,7 @@ import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage } from "./spaceHistory.mjs";
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
@@ -669,12 +669,10 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     result.pausedForFunds = true;
     result.resumeSessionId = run.sessionId || "";
     try {
-      const endpoint = signalEndpointFromTask(task);
       const spaceId = task.spaceId || task.storeId || task.space_id;
       const selfId = bridge?.machineId || bridge?.programId || "";
-      if (endpoint && spaceId) {
+      if (spaceId) {
         await persistSpaceMessage(bridge, {
-          endpoint,
           spaceId,
           selfId,
           data: {
@@ -735,10 +733,13 @@ async function persistAnswer(bridge, task, result) {
     if (!bridge || !task || !result || result.success === false) return;
     const answer = typeof result.answer === "string" ? result.answer.trim() : "";
     if (!answer) return;
-    const endpoint = signalEndpointFromTask(task);
     const spaceId = task.spaceId || task.storeId || task.space_id;
     const correlationId = task.correlationId || task.correlation_id;
-    if (!endpoint || !spaceId || !correlationId) return;
+    // persistSpaceMessage writes straight to the store, so it needs the space +
+    // an msgId, NOT the signal endpoint (the creature ACL rejected the backbone
+    // anyway). Don't skip a durable write just because no signal endpoint rode
+    // along.
+    if (!spaceId || !correlationId) return;
     const self = task.self && typeof task.self === "object" ? task.self : {};
     const agentName = typeof self.name === "string" && self.name.trim() ? self.name.trim() : undefined;
     const threadId = typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : undefined;
@@ -755,8 +756,8 @@ async function persistAnswer(bridge, task, result) {
       ...(mentions.length ? { mentions } : {}),
     };
     const selfId = bridge.machineId || bridge.programId || "";
-    await persistSpaceMessage(bridge, { endpoint, spaceId, selfId, data });
-    log("GROK_PERSIST", { spaceId, threadId: threadId || "main", chars: answer.length, mentions: mentions.length });
+    const persisted = await persistSpaceMessage(bridge, { spaceId, selfId, data });
+    log("GROK_PERSIST", { spaceId, threadId: threadId || "main", chars: answer.length, mentions: mentions.length, ok: persisted });
   } catch (err) {
     log("GROK_PERSIST", { error: String(err?.message || err).slice(0, 200) });
   }

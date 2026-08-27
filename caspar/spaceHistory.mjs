@@ -220,41 +220,84 @@ export function signalEndpointFromTask(task) {
   };
 }
 
+/** Mint a node-authoritative monotonic id, as the creatures' `genID` does. */
+async function genHistoryId(bridge) {
+  try {
+    const res = await bridge.call("genId", { source: "spaces.history" });
+    if (typeof res === "string") return res;
+    if (res && typeof res === "object") return String(res.id || res.data || "");
+  } catch {
+    /* fall through */
+  }
+  return "";
+}
+
 /**
- * Persist one chat message to the space, creature→creature, exactly the way the
- * app persists a user message: signal `spaces/signal` with `persist:true` and the
- * message `data`. Best-effort and non-throwing. When `data.msgId` is set (the
- * run's correlationId), the store upserts by it, so this write and the app's own
- * write of the same turn converge on ONE record instead of duplicating it.
+ * Write one chat turn STRAIGHT to the space's on-chain history, mirroring the
+ * spaces creature's `writeSpaceHistory` exactly — same `Json::StoreHistory::
+ * <store>::<zero-padded-seq>` key and the same `Json::StoreHistoryIndex::<store>`
+ * msgId→seq upsert index. This is how the backbone durably persists an agent's
+ * answer: the `spaces/signal` creature applies a member-only ACL and the backbone
+ * is not a space member, so a creature-routed persist is silently dropped — a
+ * teammate's answer never reached history. A direct host write is authorized as
+ * the trusted container (not by the member ACL), and because it upserts by the
+ * run's `msgId` it converges with the app's own write of the same turn instead of
+ * duplicating it. Best-effort and non-throwing.
  */
-export async function persistSpaceMessage(
-  bridge,
-  { endpoint, spaceId, selfId, data, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
-) {
-  if (!bridge || !endpoint || !spaceId || !data || typeof data !== "object") return false;
-  const correlationId = crypto.randomBytes(16).toString("hex");
-  const inner = JSON.stringify({
-    action: "signal",
-    correlationId,
-    payload: { storeId: spaceId, type: "message", persist: true, data },
-  });
-  const packet = {
-    action: "single",
-    user: { id: String(selfId || "") },
-    store: { id: spaceId },
-    data: JSON.stringify({ programId: endpoint.programId, entity: endpoint.entityId, payload: inner }),
-    entityId: endpoint.entityId,
-    correlationId,
+export async function persistSpaceMessageDirect(bridge, spaceId, data) {
+  if (!bridge || !spaceId || !data || typeof data !== "object") return false;
+  const record = { ...data };
+  const historyKey = (num) => `Json::StoreHistory::${spaceId}::${num}`;
+  const allocate = async () => {
+    const seq = await genHistoryId(bridge);
+    let num = seq.split("@")[0] || "";
+    if (!num) return false;
+    while (num.length < 20) num = `0${num}`;
+    record.id = num;
+    record.seq = seq;
+    record.storeId = spaceId;
+    return { num, seq };
   };
   try {
-    await Promise.race([
-      bridge.signalUser("creatures/signal", endpoint.programId, packet),
-      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
-    ]);
+    const msgId = typeof record.msgId === "string" ? record.msgId.trim() : "";
+    if (msgId) {
+      const idxKey = `Json::StoreHistoryIndex::${spaceId}`;
+      const idxRes = await bridge.call("getJson", { key: idxKey, path: "" });
+      const idx = idxRes && idxRes.data && typeof idxRes.data === "object" && !Array.isArray(idxRes.data) ? { ...idxRes.data } : {};
+      const existing = typeof idx[msgId] === "string" ? idx[msgId] : "";
+      if (existing) {
+        await bridge.call("putJson", { key: historyKey(existing), path: "", data: record, merge: true });
+        return true;
+      }
+      const alloc = await allocate();
+      if (!alloc) return false;
+      idx[msgId] = alloc.num;
+      await bridge.call("putJson", { key: idxKey, path: "", data: idx, merge: false });
+      await bridge.call("putJson", { key: historyKey(alloc.num), path: "", data: record, merge: false });
+      return true;
+    }
+    const alloc = await allocate();
+    if (!alloc) return false;
+    await bridge.call("putJson", { key: historyKey(alloc.num), path: "", data: record, merge: false });
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Persist one chat message to the space's durable history. Writes straight to the
+ * store (`persistSpaceMessageDirect`) rather than routing through `spaces/signal`,
+ * whose member-only ACL rejects the backbone (not a space member) and silently
+ * dropped agents' answers. `endpoint`/`selfId` are accepted for call-site
+ * compatibility but no longer required for the write. Best-effort.
+ */
+export async function persistSpaceMessage(bridge, { spaceId, selfId, data }) {
+  const record = data && typeof data === "object" ? { ...data } : null;
+  if (!record) return false;
+  if (!record.from) record.from = "agent";
+  if (selfId && !record.senderId) record.senderId = String(selfId);
+  return persistSpaceMessageDirect(bridge, spaceId, record);
 }
 
 function firstString(...vals) {

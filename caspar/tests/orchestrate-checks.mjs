@@ -91,13 +91,25 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
       return {};
     }
   };
+  const historyStore = new Map(); // StoreHistory / StoreHistoryIndex writes
+  let seqCounter = 1000;
   const bridge = {
     programId: "meter-prog",
     machineId: "meter-machine",
     async call(op, input) {
+      if (op === "genId") return { id: `${seqCounter++}@origin` };
       if (op === "getLink") {
         const m = String(input?.key || "").match(/^FinancePoolByUser::(.+)$/);
         return m ? String(pools[m[1]]?.poolId || "") : "";
+      }
+      if (op === "putJson") {
+        const key = String(input?.key || "");
+        historyStore.set(key, input.merge ? { ...(historyStore.get(key) || {}), ...input.data } : input.data);
+        // A stall note is a StoreHistory record with kind "orch-stall".
+        if (/^Json::StoreHistory::/.test(key) && input.data && input.data.kind === "orch-stall") {
+          notes.push({ key, data: input.data });
+        }
+        return { ok: true };
       }
       if (op === "getJson") {
         const key = String(input?.key || "");
@@ -113,6 +125,7 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
           const doc = quoteDocs.get(m[1]);
           return doc ? { ok: true, data: doc } : { ok: true };
         }
+        if (historyStore.has(key)) return { ok: true, data: historyStore.get(key) };
         return { ok: true };
       }
       return { ok: true };
