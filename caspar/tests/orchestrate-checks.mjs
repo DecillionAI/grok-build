@@ -76,9 +76,13 @@ const PROGRAM_INDEX = {
  * signal reply. A refused quote (quoteOk:false) writes no doc, so the read times
  * out and the teammate is not launched. Teammate launches signal the proxy.
  */
+const SIGNAL_PROG = "signal-prog"; // the spaces/signal endpoint used by noteStall
+const HISTORY_PROG = "history-prog";
+
 function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user-1" } }, quoteOk = true } = {}) {
   const launched = [];
   const settled = [];
+  const notes = []; // in-chat stall notes (persistSpaceMessage → spaces/signal)
   const quoteDocs = new Map(); // quoteId -> committed quote doc
   const parseInner = (packet) => {
     try {
@@ -134,11 +138,16 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
         }
         return { ok: true };
       }
+      if (target === SIGNAL_PROG || target === HISTORY_PROG) {
+        // A persistSpaceMessage (noteStall) or history write — not a teammate launch.
+        notes.push({ target, packet });
+        return { ok: true };
+      }
       launched.push({ target, packet, task: JSON.parse(JSON.parse(packet.data).payload) });
       return { ok: true };
     },
   };
-  return { bridge, launched, settled };
+  return { bridge, launched, settled, notes };
 }
 
 function seedDelivery(overrides = {}) {
@@ -169,6 +178,28 @@ await check("resolvePoolId returns the payer's open pool, else empty", async () 
   const { bridge } = makeBridge();
   assert.equal(await resolvePoolId(bridge, "user-1"), "pool-1");
   assert.equal(await resolvePoolId(bridge, "nobody"), "");
+});
+
+await check("teammate is detected from the program index by name-slug when NO roster reached the backbone", async () => {
+  // The real-world failure: task.roster missing/empty, so the handle must be
+  // derived from the program-index name ("Writer" → "writer") and still match
+  // the @mention the agent wrote.
+  const { bridge, launched, notes } = makeBridge();
+  const delivery = seedDelivery({ roster: [] });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "On it. **@writer** please draft the copy.", chargedMinor: 10 });
+  assert.equal(n, 1, "the index-resolved teammate is launched");
+  assert.equal(launched.length, 1);
+  assert.equal(launched[0].target, "mate-prog");
+  assert.equal(notes.length, 0, "no stall note when a teammate was launched");
+});
+
+await check("a stall note is posted in-chat when a mention matches no known agent", async () => {
+  const { bridge, launched, notes } = makeBridge();
+  const delivery = seedDelivery({ roster: [] });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@nobody-here please help" });
+  assert.equal(n, 0);
+  assert.equal(launched.length, 0);
+  assert.equal(notes.length, 1, "the stall is surfaced into the chat");
 });
 
 await check("an answer's @mentioned teammate is launched with a delegated quote", async () => {
