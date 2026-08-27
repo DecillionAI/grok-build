@@ -128,6 +128,80 @@ export async function fetchSpaceHistoryRecords(
 }
 
 /**
+ * Pull key strings out of a `getByPrefix` reply, whatever shape the node used:
+ * a bare array, or `{data|keys|items: [...]}`, and entries that are either the
+ * key string itself or an object carrying it under `key`/`id`/`name`. Mirrors
+ * the decillion creature's `hostPrefixKeys`.
+ */
+function extractPrefixKeys(res) {
+  const out = [];
+  const seen = new Set();
+  const add = (s) => {
+    if (typeof s === "string" && s.trim() && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  };
+  const walk = (v) => {
+    if (typeof v === "string") add(v);
+    else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") {
+      if (typeof v.key === "string") add(v.key);
+      else if (typeof v.id === "string") add(v.id);
+      else if (typeof v.name === "string") add(v.name);
+      else Object.values(v).forEach(walk);
+    }
+  };
+  if (res && typeof res === "object" && !Array.isArray(res)) {
+    walk(res.data);
+    walk(res.keys);
+    walk(res.items);
+  } else {
+    walk(res);
+  }
+  return out;
+}
+
+/**
+ * Read the space's transcript STRAIGHT from the store (`getByPrefix` on
+ * `Json::StoreHistory::<space>::` + a `getJson` per record), exactly the way the
+ * `spaces/history` creature's `readSpaceHistory` does. This never depends on the
+ * creature→creature signal round-trip (which can be lost to a signal
+ * delivery-shape mismatch), so an agent always gets its history. Bounded to the
+ * most recent `limit` turns (ids are zero-padded, so lexicographic sort is
+ * arrival order) to keep the per-record reads cheap on a long-lived space.
+ */
+export async function fetchSpaceHistoryDirect(bridge, spaceId, { limit = 80 } = {}) {
+  if (!bridge || !spaceId) return [];
+  const prefix = `Json::StoreHistory::${spaceId}::`;
+  let res;
+  try {
+    res = await bridge.call("getByPrefix", { prefix });
+  } catch {
+    return [];
+  }
+  const ids = new Set();
+  for (const key of extractPrefixKeys(res)) {
+    let id = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+    const dc = id.indexOf("::");
+    if (dc >= 0) id = id.slice(0, dc);
+    if (id) ids.add(id);
+  }
+  const recent = [...ids].sort().slice(-Math.max(1, limit));
+  const records = [];
+  for (const id of recent) {
+    try {
+      const doc = await bridge.call("getJson", { key: prefix + id, path: "" });
+      const data = doc && doc.data && typeof doc.data === "object" && !Array.isArray(doc.data) ? doc.data : null;
+      if (data) records.push(data);
+    } catch {
+      /* one unreadable record must not sink the whole transcript */
+    }
+  }
+  return records;
+}
+
+/**
  * The `spaces/signal` endpoint address the client put on the task (mirrors
  * `historyEndpointFromTask`). Used to durably persist the agent's own final
  * answer creature→creature, so completion survives even if the app's socket
