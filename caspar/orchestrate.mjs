@@ -389,6 +389,7 @@ function forwardContext(task) {
   const out = {};
   for (const k of [
     "billingEndpoint",
+    "adminEndpoint",
     "signalEndpoint",
     "historyEndpoint",
     "routinesEndpoint",
@@ -617,4 +618,46 @@ export async function settleAutonomousSpend(bridge, delivery, result) {
     { action: "settleAutonomous", payload: { spaceId, quoteId, chargedMinor: charged } },
     { spaceId },
   );
+}
+
+function adminEndpointFromTask(task) {
+  return endpointFrom(task && (task.adminEndpoint || task.admin_endpoint));
+}
+
+/**
+ * Record a backbone-launched (autonomousQuote) run in the shared work log the
+ * same way the client records its own runs — so the app's Status shows the
+ * teammate/routine agents actually working, instead of "no agents working",
+ * while the backbone drives the chain server-side. Only backbone-launched runs
+ * are recorded here (the client already records the seed it started).
+ * Fire-and-forget; visibility must never block or fail a run.
+ */
+export async function recordServerRun(bridge, delivery, fields = {}) {
+  const task = (delivery && delivery.task) || {};
+  if (!bridge || !task.autonomousQuote) return;
+  const endpoint = adminEndpointFromTask(task);
+  const spaceId = spaceIdOf(task);
+  const correlationId = String((delivery && delivery.correlationId) || task.correlationId || "");
+  if (!endpoint || !spaceId || !correlationId) return;
+  const self = task.self && typeof task.self === "object" ? task.self : {};
+  try {
+    await sendCreatureSignal(
+      bridge,
+      endpoint,
+      {
+        action: "recordRun",
+        payload: {
+          correlationId,
+          spaceId,
+          agentProgramId: String(task.proxyProgramId || task.agentProgramId || self.programId || ""),
+          agentName: String(self.name || task.agentName || ""),
+          updatedAt: Date.now(),
+          ...fields,
+        },
+      },
+      { spaceId },
+    );
+  } catch {
+    /* visibility is best-effort */
+  }
 }
