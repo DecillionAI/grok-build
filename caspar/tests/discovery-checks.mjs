@@ -187,12 +187,15 @@ async function main() {
     assert.ok(viaBrief.includes("Ship the API"));
     const none = buildSystemPrompt({ spaceId: "space-1" });
     assert.ok(!/PROJECT OUTCOME/i.test(none));
-    assert.ok(/LOOPS/i.test(withBrief));
-    const withLoop = buildSystemPrompt({
+    // Scheduling is advertised only when the space wired the routines endpoint
+    // through, and points the agent at the schedule_routine tool (no client fence).
+    assert.ok(!/ROUTINES/i.test(withBrief), "no routines block without a routines endpoint");
+    const withRoutines = buildSystemPrompt({
       spaceId: "space-1",
-      spaceSchedules: [{ title: "Daily check", intervalMinutes: 1440, enabled: true }],
+      routinesEndpoint: { programId: "routines-prog" },
     });
-    assert.ok(withLoop.includes("Daily check"));
+    assert.ok(/ROUTINES/i.test(withRoutines));
+    assert.ok(/schedule_routine/.test(withRoutines));
   });
 
   await check("built-in shell/fs tools are denied unconditionally (never a fallback)", () => {

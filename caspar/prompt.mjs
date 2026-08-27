@@ -280,35 +280,34 @@ export function projectOutcomePreamble(task) {
   );
 }
 
-/** Recurring crew check-ins. Agents propose them only when the outcome needs a cadence. */
-export function projectLoopsPreamble(task) {
+/**
+ * Routines — scheduled follow-up work an agent can create for itself. Backed by
+ * the `schedule_routine` tool (not a client-side fence): when the model calls
+ * it, the backbone creates the routine on the routines creature and sets THIS
+ * agent as the one responsible, so nothing here needs to parse the reply. The
+ * preamble only tells the model WHEN to reach for the tool.
+ */
+export function projectRoutinesPreamble(task) {
   if (!task || (!task.spaceId && !task.groupChat && !isGroupChat(task))) return "";
-  const raw = Array.isArray(task.spaceSchedules)
-    ? task.spaceSchedules
-    : Array.isArray(task.schedules)
-      ? task.schedules
-      : [];
-  const lines = [];
-  for (const row of raw) {
-    if (!row || typeof row !== "object") continue;
-    const title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : "Loop";
-    const minutes = Number(row.intervalMinutes) || 1440;
-    const enabled = row.enabled !== false;
-    lines.push(`  • ${title} — every ${minutes}m${enabled ? "" : " (paused)"}`);
-  }
+  // Only advertise scheduling when the space actually wired the routines
+  // endpoint through (older clients / non-space runs won't have the tool).
+  const hasEndpoint =
+    task.routinesEndpoint && typeof task.routinesEndpoint === "object"
+      ? Boolean(task.routinesEndpoint.programId || task.routinesEndpoint.program_id)
+      : false;
+  if (!hasEndpoint) return "";
   return (
-    "=== LOOPS ===\n" +
-    "Loops are recurring crew check-ins stored on this space. Propose a loop ONLY when the " +
-    "outcome needs unattended follow-up (a daily digest, a deploy watch, a weekly review). " +
-    "Never propose a loop for a one-shot question, a plan, or because someone chatted.\n" +
-    "If you need one, append a fenced JSON block at the end of your reply — the product " +
-    "creates it. Do not ask a person to click around:\n" +
-    "```decillion-loop\n" +
-    '{"title":"short name","intervalMinutes":1440,"prompt":"what the crew should do each run"}\n' +
-    "```\n" +
-    "Allowed intervalMinutes: 15, 60, 360, 1440, 10080. Do not duplicate an existing loop.\n\n" +
-    (lines.length ? `Existing loops:\n${lines.join("\n")}` : "Existing loops: none.") +
-    "\n=== END LOOPS ===\n"
+    "=== ROUTINES ===\n" +
+    "You can schedule your OWN follow-up work in this project with the `schedule_routine` " +
+    "tool. Call it whenever the user asks you to do something after a delay (once) or on a " +
+    "recurring cadence (repeat) — e.g. \"remind me in an hour\", \"post a digest every " +
+    "morning\", \"check the deploy in 30 minutes\". When it runs, the platform posts your " +
+    "`prompt` into this chat mentioning you, and you handle it then — so you become the " +
+    "responsible agent automatically; do not ask a person to click around.\n" +
+    "Use it ONLY for genuinely deferred or recurring work the user asked for. Never schedule " +
+    "a routine for a one-shot question you can answer now, and don't re-create a routine you " +
+    "already scheduled in this conversation.\n" +
+    "=== END ROUTINES ===\n"
   );
 }
 
@@ -333,8 +332,8 @@ export function buildSystemPrompt(task, opts = {}) {
   const outcome = projectOutcomePreamble(task);
   if (outcome) parts.push(outcome);
 
-  const loops = projectLoopsPreamble(task);
-  if (loops) parts.push(loops);
+  const routines = projectRoutinesPreamble(task);
+  if (routines) parts.push(routines);
 
   // When the shell/filesystem built-ins are disabled but the capabilities section
   // did not already explain it (no shared sandbox named there), state it plainly so
