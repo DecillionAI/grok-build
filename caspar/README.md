@@ -44,19 +44,22 @@ progress, employing sibling creatures — rides that connection.
 
 | Direction | Key | Packet |
 |---|---|---|
-| in | `creatures/signal` | `{prompt\|objective, skill, self, roster, groupChat, sessionId, spaceId, historyEndpoint, streamTo, correlationId, replyTo, attachments, config:{tools, llm, max_wall_seconds}}` |
+| in | `creatures/signal` | `{prompt\|objective, skill, self, roster, groupChat, sessionId, spaceId, threadId, streamTo, correlationId, replyTo, attachments, config:{tools, llm, max_wall_seconds}}` |
 | out (per step) | `creatures/signal` | `{kind:"davinci/step", correlationId, seq, channel, event, stream:true, final:false}` |
 | out (terminal) | `creatures/signal` | `{kind:"davinci/result", correlationId, result, stream:false, final:true}` |
 | out (tool call) | `creatures/signal` | `{kind:"invoke", entityId, correlationId, reply_to, tool_id, function, payload}` |
 | in (tool reply) | `creatures/signal` | `{kind:"tools/result", correlationId, result}` |
-| out (history fetch) | `creatures/signal` | `{action:"single", user:{id:self}, store:{id:spaceId}, data, entityId, correlationId}` → `spaces/history` |
-| in (history reply) | `creatures/signal` | `{namespace:"spaces", action:"history", correlationId, history:[…]}` |
+| out (read the chat) | host call | `readSignals {storeId, tagsAll:["thread=…"], tagsAny:["kind=message","kind=answer"], count}` |
+| out (post a turn) | host call | `signal {type:"all", storeId, data, tags:["kind=…","thread=…","agent=…","run=…"]}` |
 
-The group-chat **history is not sent in the prompt** — the client passes only
-`historyEndpoint` (the `spaces/history` creature's address), and this creature
-signals that endpoint for the thread itself before building the prompt
-(`spaceHistory.mjs`). The reply comes back on `creatures/signal` (not
-`creatures/signal/result`, which the node never delivers to a docker creature).
+The group-chat **history is not sent in the prompt**, and no creature is asked for
+it either: a space's chat is the store's own **signal log**, and this creature
+reads it and writes to it through the node's host calls (`spaceHistory.mjs`).
+Reading is a tag filter — this thread, conversational kinds only. Writing posts one
+signal per turn, which the node records AND fans out live to every member in the
+same delivery, so a run's steps, its tool calls and its final answer are streamed
+and recorded by one act. Steps of a run with **no** space still push straight to
+the requester, since there is no store to post to.
 
 **Multimodal attachments.** `attachments` on the task carries files the person
 sent with the message (`[{name, mime_type, data|path|url, description}]`, `data`
@@ -133,8 +136,8 @@ which the node relays while keeping the correlation open.
 | `bridge.mjs` | The docker-host bridge gateway client: chunked framing, HELLO/WELCOME, host calls (`signalUser`, `dbOp`, `httpRequest`), pushed signals. |
 | `taskSignal.mjs` | Peels the StoresSend / `payload` / proxy envelopes into a task; derives the conversation thread key. |
 | `prompt.mjs` | Composes what Grok is given: the agent's skill as persona, the group-chat preamble and roster, the thread's history with `[From → To]` annotations. |
-| `spaceHistory.mjs` | Fetches the space's group-chat transcript and turns the persisted records into the annotated history turns `prompt.mjs` renders. Reads the store **directly** (`getByPrefix` on `Json::StoreHistory::<space>::` + a `getJson` per record — the primary path, so an agent always sees the conversation regardless of signal delivery quirks); falls back to the creature→creature `spaces/history` signal only when a direct read comes back empty. |
-| `orchestrate.mjs` | **Server-side agent orchestration.** After a run marked `serverOrchestrate` persists its answer, the backbone resolves the teammates it @mentioned (roster + program index), mints a **delegated** billing quote for each against the payer's pool (`billing/quote` with an explicit `payerUserId`, honoured because this backbone IS the settlement meter; bounded by the project's autonomous budget), and signals each teammate's proxy to run — so the @mention chain (and routine-fired runs) complete with **no client present**. `visited`/`maxHops` carry on the task, so the chain can't loop or double-launch; only backbone-minted (`autonomousQuote`) runs settle against the autonomous budget. Wired into `runtime.mjs`'s `startDelivery` (ensure-auth → serve → settle → fan out). |
+| `spaceHistory.mjs` | The space's chat, read and written through the node's signal log: `readSpaceSignals` / `fetchSpaceConversation` (tag-filtered read → the annotated history turns `prompt.mjs` renders) and `postSpaceSignal` (one tagged signal per turn — recorded and fanned out live in one call). Owns the tag vocabulary (`KIND`, `SIGNAL_TAGS`), which is shared with the Expo client and the decillion creatures. |
+| `orchestrate.mjs` | **Server-side agent orchestration.** After a run marked `serverOrchestrate` posts its answer, the backbone resolves the teammates it @mentioned (roster + program index), mints a **delegated** billing quote for each against the payer's pool (`billing/quote` with an explicit `payerUserId`, honoured because this backbone IS the settlement meter; bounded by the project's autonomous budget), and signals each teammate's proxy to run — so the @mention chain (and routine-fired runs) complete with **no client present**. `visited`/`maxHops` carry on the task, so the chain can't loop or double-launch; only backbone-minted (`autonomousQuote`) runs settle against the autonomous budget. Wired into `runtime.mjs`'s `startDelivery` (ensure-auth → serve → settle → fan out). |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
 | `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time — the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`) — and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
 | `toolInvoker.mjs` | Employs a tool creature over the gateway and awaits its correlated `tools/result`. |

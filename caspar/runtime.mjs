@@ -55,7 +55,7 @@ import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords, historyEndpointFromTask, persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, KIND } from "./spaceHistory.mjs";
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
@@ -175,22 +175,67 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   if (extractedTexts.length) log("GROK_EXTRACT", { extracted: extractedTexts.map((d) => ({ name: d.name, kind: d.kind, chars: d.text.length })) });
 
   const mapper = new TrajectoryMapper({ traceAll: creatureFlag("TRACE_ALL", false) });
-  // Steps ride the channel the backend named; the terminal result always goes
-  // back through `replyTo` (the proxy), which is what closes the correlation.
+  // Where a step goes depends on whether the run has a space.
+  //
+  //   • In a space, a step IS a signal on that space: posted to the store, so
+  //     the node records it in the signal log (that is the agent's work history,
+  //     replayable after a reload) and fans it out live to every participant in
+  //     the same delivery. One path, one record.
+  //   • With no space (a spaceless prompt, e.g. the market advisor), there is no
+  //     store to post to, so the step is pushed straight to the requester.
+  //
+  // The terminal result always goes back through `replyTo` (the proxy), which is
+  // what closes the correlation the caller is waiting on.
   const stepTarget = streamTo || replyTo;
-  const streamSteps = Boolean(bridge && stepTarget && creatureFlag("STREAM_STEPS", true));
+  const stepSpaceId = task.spaceId || task.storeId || task.space_id || "";
+  // The thread this run belongs to. Every turn it produces — steps, tool calls,
+  // the final answer — is tagged with it, so switching tabs mid-run can never
+  // leak a turn into another thread.
+  const runThreadId =
+    (typeof task.threadId === "string" && task.threadId.trim()) ||
+    (typeof task.thread_id === "string" && task.thread_id.trim()) ||
+    "main";
+  const streamSteps = Boolean(bridge && (stepSpaceId || stepTarget) && creatureFlag("STREAM_STEPS", true));
 
   // When the stream last carried anything to the client. A real step resets it;
   // the heartbeat below uses it to tell "actively working but quiet" (a long tool
   // call or model turn) from "the run went away", so the client's own idle
   // watchdog never kills a healthy-but-silent run.
   let lastStreamAt = Date.now();
+  const stepAgentProgramId = task.proxyProgramId || task.agentProgramId || task.self?.programId || "";
+  const stepAgentName = task.self?.name || task.agentName || "";
+  /**
+   * Deliver one trajectory event. A tool call is labelled `kind=toolcall` and
+   * everything else `kind=step`, so a reader can pull an agent's tool trail out
+   * of the log without re-parsing channels.
+   */
   const emit = (event) => {
     process.stdout.write(`DAVINCI_TRACE ${JSON.stringify(event)}\n`);
     if (!streamSteps) return;
     lastStreamAt = Date.now();
     // Best-effort: a step that cannot be delivered must never break the run —
     // the authoritative result is still signalled at the end.
+    if (stepSpaceId) {
+      postSpaceSignal(bridge, {
+        spaceId: stepSpaceId,
+        kind: event.channel === "action" ? KIND.TOOLCALL : KIND.STEP,
+        threadId: runThreadId,
+        agentProgramId: stepAgentProgramId,
+        correlationId,
+        data: {
+          role: "agent",
+          from: "agent",
+          runId: correlationId,
+          seq: event.seq,
+          channel: event.channel,
+          text: event.message || "",
+          event,
+          ...(stepAgentName ? { agentName: stepAgentName } : {}),
+          ...(stepAgentProgramId ? { agentProgramId: stepAgentProgramId } : {}),
+        },
+      }).catch(() => {});
+      return;
+    }
     bridge
       .signalUser("creatures/signal", String(stepTarget), {
         kind: "davinci/step",
@@ -216,6 +261,20 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   const sendHeartbeat = () => {
     if (!streamSteps || Date.now() - lastStreamAt < heartbeatMs) return;
     lastStreamAt = Date.now();
+    if (stepSpaceId) {
+      // `temp`: delivered live so the client's idle watchdog sees the run is
+      // alive, never recorded — a heartbeat is not work.
+      postSpaceSignal(bridge, {
+        spaceId: stepSpaceId,
+        kind: KIND.STEP,
+        threadId: runThreadId,
+        agentProgramId: stepAgentProgramId,
+        correlationId,
+        temp: true,
+        data: { channel: "heartbeat", runId: correlationId, ts: lastStreamAt },
+      }).catch(() => {});
+      return;
+    }
     bridge
       .signalUser("creatures/signal", String(stepTarget), {
         kind: "davinci/step",
@@ -436,49 +495,24 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   const sandboxActive = Boolean(sandboxBridge);
   const disallowedTools = disallowedBuiltinTools({ sandboxActive });
 
-  // Fetch the space's group-chat transcript ourselves, creature→creature, by
-  // signalling the decillion `spaces/history` creature. The client sends only
-  // that creature's address (`task.historyEndpoint`), never the transcript, so
-  // the agent always reasons over the authoritative on-chain thread — and sees
-  // the whole group chat (every human message + every agent's final answer), not
-  // just what was aimed at it. Best-effort and bounded: a miss leaves the run
-  // with whatever history the task already carried (usually none). Skipped when
-  // the client already inlined `history` (back-compat) or there is no space.
+  // Read the space's group-chat transcript ourselves, straight from the node's
+  // signal log. A space chat is split into threads (tabs), each its own
+  // conversation, so the read is scoped by the run's `thread=` tag and to the
+  // conversational kinds — every human message and every agent's final answer,
+  // not just what was aimed at this agent. The agent's own work steps and tool
+  // calls are in the same log under other tags; they are not conversation and
+  // never enter a prompt.
   if (bridge && !Array.isArray(task.history)) {
-    const endpoint = historyEndpointFromTask(task);
     const spaceId = task.spaceId || task.storeId || task.space_id;
+    const threadId =
+      (typeof task.threadId === "string" && task.threadId.trim()) ||
+      (typeof task.thread_id === "string" && task.thread_id.trim()) ||
+      "main";
     if (spaceId) {
       try {
-        // Read the transcript straight from the store first: a couple of host
-        // reads, no dependency on the creature→creature history signal (which can
-        // be lost to a delivery-shape mismatch and, on a miss, only fails after an
-        // 8s timeout). The signal path is the fallback for the rare case a direct
-        // read comes back empty (e.g. a store that denies the prefix scan).
-        let records = await fetchSpaceHistoryDirect(bridge, spaceId);
-        let source = "direct";
-        if (!records.length && endpoint) {
-          records = await fetchSpaceHistoryRecords(bridge, {
-            endpoint,
-            spaceId,
-            selfId: bridge.machineId || bridge.programId || "",
-          });
-          source = "signal";
-        }
-        // A space chat is split into threads (tabs), each its own conversation.
-        // When the run belongs to a thread, scope the transcript to it so the
-        // agent reasons only over that thread's history, not the whole space.
-        // Records carry `threadId` in their stored data (default "main"); legacy
-        // turns without one are treated as the main thread.
-        const threadId = typeof task.threadId === "string" && task.threadId.trim()
-          ? task.threadId.trim()
-          : typeof task.thread_id === "string" && task.thread_id.trim()
-            ? task.thread_id.trim()
-            : "";
-        const scoped = threadId
-          ? records.filter((r) => String((r && r.threadId) || "main") === threadId)
-          : records;
-        task.history = buildHistoryTurns(scoped, task.self, { excludeText: objective });
-        log("GROK_HISTORY", { spaceId, source, fetched: records.length, threadId: threadId || "all", scoped: scoped.length, turns: task.history.length });
+        const packets = await fetchSpaceConversation(bridge, { spaceId, threadId });
+        task.history = buildHistoryTurns(packets, task.self, { excludeText: objective });
+        log("GROK_HISTORY", { spaceId, threadId, fetched: packets.length, turns: task.history.length });
       } catch (err) {
         log("GROK_HISTORY", { error: String(err?.message || err) });
       }
@@ -527,10 +561,6 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   const abortController = liveBilling && typeof AbortController === "function" ? new AbortController() : null;
   let pausedForFunds = false;
   let checkpointBusy = false;
-  const runThreadId =
-    (typeof task.threadId === "string" && task.threadId.trim()) ||
-    (typeof task.thread_id === "string" && task.thread_id.trim()) ||
-    "main";
   const checkpointMs = Math.max(0, creatureNumber("BILLING_CHECKPOINT_MS", 10000));
   const runCheckpoint = async () => {
     if (!liveBilling || checkpointBusy || pausedForFunds) return;
@@ -669,20 +699,22 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     result.pausedForFunds = true;
     result.resumeSessionId = run.sessionId || "";
     try {
-      const endpoint = signalEndpointFromTask(task);
       const spaceId = task.spaceId || task.storeId || task.space_id;
-      const selfId = bridge?.machineId || bridge?.programId || "";
-      if (endpoint && spaceId) {
-        await persistSpaceMessage(bridge, {
-          endpoint,
+      if (spaceId) {
+        await postSpaceSignal(bridge, {
           spaceId,
-          selfId,
+          // A pause is addressed to the person, not part of the work trail: it
+          // rides the conversation so the app reads it in the same fetch as the
+          // chat and can offer the Continue affordance after a top-up.
+          kind: KIND.MESSAGE,
+          threadId: runThreadId,
+          agentProgramId: task.proxyProgramId || task.self?.programId || "",
+          correlationId,
           data: {
             role: "system",
             kind: "run-paused",
             text: "",
             threadId: runThreadId,
-            msgId: `paused:${correlationId}`,
             runPaused: {
               runId: correlationId,
               resumeSessionId: run.sessionId || "",
@@ -723,22 +755,21 @@ function scanMentions(answer, roster) {
 }
 
 /**
- * Durably store the agent's final answer as a space chat message, the same way
- * the app stores a user message (`spaces/signal` with `persist:true`). Tagged
- * with the run's correlationId as `msgId`, so it converges with the app's own
- * write of the same turn instead of duplicating it — and is stored even when the
- * app's socket dropped before it could persist. Best-effort; never blocks/breaks
- * the run.
+ * Store the agent's final answer as one persistent chat signal on the space.
+ *
+ * This backbone is the ONLY writer of an agent's answer: it runs the turn, so it
+ * is the one party that always knows the answer happened, whether or not a
+ * client was still connected. The app never writes it, which is why there is no
+ * longer any two-writer convergence to reconcile.
  */
 async function persistAnswer(bridge, task, result) {
   try {
     if (!bridge || !task || !result || result.success === false) return;
     const answer = typeof result.answer === "string" ? result.answer.trim() : "";
     if (!answer) return;
-    const endpoint = signalEndpointFromTask(task);
     const spaceId = task.spaceId || task.storeId || task.space_id;
     const correlationId = task.correlationId || task.correlation_id;
-    if (!endpoint || !spaceId || !correlationId) return;
+    if (!spaceId || !correlationId) return;
     const self = task.self && typeof task.self === "object" ? task.self : {};
     const agentName = typeof self.name === "string" && self.name.trim() ? self.name.trim() : undefined;
     const threadId = typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : undefined;
@@ -747,15 +778,28 @@ async function persistAnswer(bridge, task, result) {
     const data = {
       text: answer,
       from: "agent",
-      msgId: String(correlationId),
+      role: "agent",
+      runId: String(correlationId),
       at: new Date().toISOString(),
       ...(agentName ? { agentName } : {}),
       ...(agentProgramId ? { agentProgramId } : {}),
       ...(threadId ? { threadId } : {}),
       ...(mentions.length ? { mentions } : {}),
+      ...(result.usage ? { usage: result.usage } : {}),
+      ...(Number.isFinite(result.chargedMinor) ? { chargedMinor: result.chargedMinor } : {}),
+      ...(Number.isFinite(result.sandboxMinor) ? { sandboxMinor: result.sandboxMinor } : {}),
+      ...(Number.isFinite(result.llmMinor) ? { llmMinor: result.llmMinor } : {}),
+      ...(Number.isFinite(result.durationMs) ? { durationMs: result.durationMs } : {}),
     };
-    const selfId = bridge.machineId || bridge.programId || "";
-    await persistSpaceMessage(bridge, { endpoint, spaceId, selfId, data });
+    await postSpaceSignal(bridge, {
+      spaceId,
+      kind: KIND.ANSWER,
+      threadId: threadId || "main",
+      agentProgramId,
+      correlationId,
+      mentions,
+      data,
+    });
     log("GROK_PERSIST", { spaceId, threadId: threadId || "main", chars: answer.length, mentions: mentions.length });
   } catch (err) {
     log("GROK_PERSIST", { error: String(err?.message || err).slice(0, 200) });

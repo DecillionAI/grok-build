@@ -76,13 +76,11 @@ const PROGRAM_INDEX = {
  * signal reply. A refused quote (quoteOk:false) writes no doc, so the read times
  * out and the teammate is not launched. Teammate launches signal the proxy.
  */
-const SIGNAL_PROG = "signal-prog"; // the spaces/signal endpoint used by noteStall
-const HISTORY_PROG = "history-prog";
 
 function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user-1" } }, quoteOk = true } = {}) {
   const launched = [];
   const settled = [];
-  const notes = []; // in-chat stall notes (persistSpaceMessage → spaces/signal)
+  const notes = []; // stall notes — posted as store signals on the space
   const quoteDocs = new Map(); // quoteId -> committed quote doc
   const parseInner = (packet) => {
     try {
@@ -95,6 +93,10 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
     programId: "meter-prog",
     machineId: "meter-machine",
     async call(op, input) {
+      if (op === "signal") {
+        notes.push({ storeId: input?.storeId, tags: input?.tags || [], data: JSON.parse(input?.data || "{}") });
+        return { ok: true };
+      }
       if (op === "getLink") {
         const m = String(input?.key || "").match(/^FinancePoolByUser::(.+)$/);
         return m ? String(pools[m[1]]?.poolId || "") : "";
@@ -138,11 +140,6 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
         }
         return { ok: true };
       }
-      if (target === SIGNAL_PROG || target === HISTORY_PROG) {
-        // A persistSpaceMessage (noteStall) or history write — not a teammate launch.
-        notes.push({ target, packet });
-        return { ok: true };
-      }
       launched.push({ target, packet, task: JSON.parse(JSON.parse(packet.data).payload) });
       return { ok: true };
     },
@@ -158,8 +155,6 @@ function seedDelivery(overrides = {}) {
     proxyProgramId: "self-prog",
     self: { programId: "self-prog", name: "Lead", handle: "lead" },
     billingEndpoint: { programId: BILLING_PROG, creatureId: "billing-cr", entityId: "main" },
-    signalEndpoint: { programId: "signal-prog", creatureId: "signal-cr", entityId: "main" },
-    historyEndpoint: { programId: "history-prog", creatureId: "history-cr", entityId: "main" },
     orchestration: { depth: 0, maxHops: 8, visited: ["self-prog"], poolId: "pool-1", payerUserId: "user-1" },
     ...overrides,
   };
@@ -199,7 +194,10 @@ await check("a stall note is posted in-chat when a mention matches no known agen
   const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@nobody-here please help" });
   assert.equal(n, 0);
   assert.equal(launched.length, 0);
-  assert.equal(notes.length, 1, "the stall is surfaced into the chat");
+  assert.equal(notes.length, 1, "the stall is surfaced into the space");
+  assert.equal(notes[0].storeId, "space-1");
+  assert.ok(notes[0].tags.includes("kind=step"), "a stall is work-trail, not a chat bubble");
+  assert.match(notes[0].data.text, /Hand-off didn't continue/);
 });
 
 await check("an answer's @mentioned teammate is launched with a delegated quote", async () => {
@@ -221,9 +219,12 @@ await check("an answer's @mentioned teammate is launched with a delegated quote"
   assert.equal(t.orchestration.depth, 1);
   assert.ok(t.orchestration.visited.includes("self-prog"));
   assert.ok(t.orchestration.visited.includes("mate-prog"));
-  // Context carried forward for the next hop.
-  assert.equal(t.historyEndpoint.programId, "history-prog");
+  // Context carried forward for the next hop. The teammate reads and writes the
+  // space's signal log through the node's own host calls, so the only address it
+  // still needs handed to it is billing.
   assert.equal(t.billingEndpoint.programId, BILLING_PROG);
+  assert.equal(t.historyEndpoint, undefined);
+  assert.equal(t.signalEndpoint, undefined);
 });
 
 await check("no @mention → nothing launched", async () => {

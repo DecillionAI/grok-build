@@ -10,10 +10,10 @@
  * @mentioning the agent — no client needs to be open for the routine to fire,
  * and the agent runs it like any other mention.
  *
- * This mirrors the creature-to-creature signalling `spaceHistory.mjs` uses: a
- * `StoresSend` packet pushed on `creatures/signal`, with the reply awaited on
- * `creatures/signal` (the routines creature dual-emits its result there so a
- * docker creature — this backbone — can read it).
+ * Creature-to-creature signalling: a `StoresSend` packet pushed on
+ * `creatures/signal`, with the reply awaited on `creatures/signal` (the routines
+ * creature dual-emits its result there so a docker creature — this backbone —
+ * can read it).
  */
 import crypto from "node:crypto";
 
@@ -127,8 +127,6 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
     };
   };
   const billingEndpoint = endpointOf(task.billingEndpoint);
-  const signalEndpoint = endpointOf(task.signalEndpoint);
-  const historyEndpoint = endpointOf(task.historyEndpoint);
   const routinesEndpoint = endpointOf(task.routinesEndpoint) || endpoint;
 
   const payload = {
@@ -147,8 +145,6 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
     ...(agentName ? { agentName } : {}),
     ...(mention ? { mention } : {}),
     ...(billingEndpoint ? { billingEndpoint } : {}),
-    ...(signalEndpoint ? { signalEndpoint } : {}),
-    ...(historyEndpoint ? { historyEndpoint } : {}),
     ...(routinesEndpoint ? { routinesEndpoint } : {}),
   };
 
