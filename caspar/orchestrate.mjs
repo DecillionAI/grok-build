@@ -20,7 +20,37 @@
  */
 import crypto from "node:crypto";
 
+import { persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+
 const DEFAULT_MAX_HOPS = 8;
+
+// Surface a stalled @mention chain IN THE CHAT (not just the VM log) so the exact
+// blocker is visible in-app. On by default while stabilising server-side
+// orchestration; set GROK_ORCH_NOTES=off to silence.
+const ORCH_NOTES = String(process.env.GROK_ORCH_NOTES ?? "").trim().toLowerCase() !== "off";
+
+async function noteStall(bridge, task, reason) {
+  if (!ORCH_NOTES || !bridge) return;
+  try {
+    const endpoint = signalEndpointFromTask(task);
+    const spaceId = String((task && (task.spaceId || task.storeId || task.space_id)) || "");
+    if (!endpoint || !spaceId) return;
+    await persistSpaceMessage(bridge, {
+      endpoint,
+      spaceId,
+      selfId: bridge.machineId || bridge.programId || "",
+      data: {
+        role: "system",
+        kind: "orch-stall",
+        text: `⚠️ Hand-off didn't continue: ${reason}`,
+        threadId: String((task && task.threadId) || "main") || "main",
+        at: new Date().toISOString(),
+      },
+    });
+  } catch {
+    /* diagnostics must never break the run */
+  }
+}
 
 function log(sentinel, payload) {
   process.stdout.write(`${sentinel} ${JSON.stringify(payload)}\n`);
@@ -292,17 +322,43 @@ async function agentAddressBook(bridge, spaceId, roster) {
   return [...byProgram.values()];
 }
 
+/** The distinct @handles an answer mentions, lowercased (no leading @). */
+function parseAnswerMentions(answer) {
+  const out = new Set();
+  const re = /(^|[^a-z0-9_-])@([a-z0-9][a-z0-9_-]*)/gi;
+  let m;
+  while ((m = re.exec(String(answer || "")))) {
+    const h = m[2].toLowerCase();
+    if (h) out.add(h);
+  }
+  return out;
+}
+
 /** Which agents in `agents` did `answer` @mention (excluding self / visited)?
- * Only a handle + program id are required — the launch signals the proxy by
- * program id + entity, so a missing creatureId must NOT drop a teammate. */
+ * Matching is robust: an agent matches if a mention equals its roster handle OR
+ * its name slug (the two can differ when the roster didn't reach the backbone
+ * and the handle was derived from the program-index name). Only a handle/name +
+ * program id are required — the launch signals the proxy by program id + entity,
+ * so a missing creatureId must NOT drop a teammate. */
 function mentionedTeammates(answer, agents, { visited, selfProgram }) {
+  const mentions = parseAnswerMentions(answer);
+  if (!mentions.size) return [];
   const out = [];
   const seen = new Set();
   for (const a of agents) {
-    if (!a.handle || !a.programId) continue;
+    if (!a.programId) continue;
     if (a.programId === selfProgram || visited.has(a.programId) || seen.has(a.programId)) continue;
-    const esc = a.handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (new RegExp(`(^|[^a-z0-9-])@${esc}(?![a-z0-9-])`, "i").test(answer)) {
+    const forms = new Set(
+      [a.handle, toHandle(a.handle), toHandle(a.name)].filter((v) => v && typeof v === "string").map((v) => v.toLowerCase()),
+    );
+    let hit = false;
+    for (const f of forms) {
+      if (mentions.has(f)) {
+        hit = true;
+        break;
+      }
+    }
+    if (hit) {
       seen.add(a.programId);
       out.push(a);
     }
@@ -355,15 +411,21 @@ function forwardContext(task) {
 export async function planAndLaunchFollowups(bridge, delivery, result) {
   const task = (delivery && delivery.task) || {};
   if (!bridge) return 0;
+  const answer = result && typeof result.answer === "string" ? result.answer : "";
+  const hasMention = /(^|[^a-z0-9-])@[a-z0-9-]+/i.test(answer);
   if (!isServerOrchestrated(task)) {
     log("GROK_ORCH", { followups: "not-orchestrated", serverOrchestrate: task.serverOrchestrate ?? null });
+    // The answer named teammates but this run never carried serverOrchestrate —
+    // almost always a stale client/backbone that isn't sending the flag yet.
+    if (hasMention && result && result.success !== false) {
+      await noteStall(bridge, task, "this run wasn't marked for server orchestration (serverOrchestrate absent). Redeploy the client and the davinci backbone so runs carry it.");
+    }
     return 0;
   }
   if (!result || result.success === false || result.pausedForFunds) {
     log("GROK_ORCH", { followups: "run-not-ok", success: result ? result.success : null, paused: Boolean(result && result.pausedForFunds) });
     return 0;
   }
-  const answer = typeof result.answer === "string" ? result.answer : "";
   if (!answer.trim()) {
     log("GROK_ORCH", { followups: "empty-answer" });
     return 0;
@@ -385,26 +447,47 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
   if (selfProgram) visited.add(selfProgram);
 
+  // The @handles this answer actually mentioned, minus the ones that name a
+  // PERSON in the roster (a human @mention is not a fan-out target, so it must
+  // not read as a stall). What remains is the set of agent-directed mentions
+  // used both for diagnostics and to decide whether a stall is worth flagging.
+  const personHandles = new Set(
+    (Array.isArray(task.roster) ? task.roster : [])
+      .filter((r) => r && (r.kind === "user" || r.kind === "person"))
+      .flatMap((r) => [r.handle, toHandle(r.name)])
+      .filter((v) => v && typeof v === "string")
+      .map((v) => v.toLowerCase()),
+  );
+  const answerHandles = [...parseAnswerMentions(answer)].filter((h) => !personHandles.has(h));
+
   const payer = String(orch.payerUserId || task.streamTo || "");
   let poolId = String(orch.poolId || "");
   if (!poolId) poolId = await resolvePoolId(bridge, payer);
   const billingEndpoint = billingEndpointFromTask(task);
   if (!payer || !poolId || !billingEndpoint) {
     log("GROK_ORCH", { followups: "no-billing-context", payer: Boolean(payer), poolId: Boolean(poolId), billingEndpoint: Boolean(billingEndpoint) });
+    if (answerHandles.length) {
+      await noteStall(
+        bridge,
+        task,
+        `billing context missing (payer:${Boolean(payer)} pool:${Boolean(poolId)} billingEndpoint:${Boolean(billingEndpoint)}).`,
+      );
+    }
     return 0;
   }
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
   const teammates = mentionedTeammates(answer, agents, { visited, selfProgram });
   if (!teammates.length) {
-    // The chain stops here because the answer named no launchable teammate.
-    // Log what we saw so a handle/roster mismatch is diagnosable from the VM log.
-    log("GROK_ORCH", {
-      followups: "no-teammates",
-      agents: agents.map((a) => a.handle).filter(Boolean),
-      rosterSize: Array.isArray(task.roster) ? task.roster.length : 0,
-      answerMentions: (answer.match(/(^|[^a-z0-9-])@[a-z0-9-]+/gi) || []).map((m) => m.trim().replace(/^@?/, "")).slice(0, 10),
-    });
+    const known = agents.map((a) => a.handle).filter(Boolean);
+    log("GROK_ORCH", { followups: "no-teammates", agents: known, rosterSize: Array.isArray(task.roster) ? task.roster.length : 0, answerMentions: answerHandles });
+    if (answerHandles.length) {
+      await noteStall(
+        bridge,
+        task,
+        `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`,
+      );
+    }
     return 0;
   }
 
@@ -458,6 +541,13 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
     }
   }
   if (launched) log("GROK_ORCH", { launched, depth: depth + 1, spaceId, threadId });
+  else if (teammates.length) {
+    await noteStall(
+      bridge,
+      task,
+      `couldn't authorize a delegated run for ${teammates.map((t) => "@" + t.handle).join(", ")} (budget reached, no open pool, or billing rejected). Check the project's autonomous budget and that the wallet has a funded pool.`,
+    );
+  }
   return launched;
 }
 
