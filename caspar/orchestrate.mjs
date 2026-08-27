@@ -21,7 +21,6 @@
 import crypto from "node:crypto";
 
 const DEFAULT_MAX_HOPS = 8;
-const CALL_TIMEOUT_MS = 15000;
 
 function log(sentinel, payload) {
   process.stdout.write(`${sentinel} ${JSON.stringify(payload)}\n`);
@@ -71,11 +70,20 @@ function spaceIdOf(task) {
  * result the target dual-emits on `creatures/signal` so this docker creature can
  * read it. Returns the parsed reply object, or null on timeout.
  */
-async function callCreature(bridge, endpoint, payload, { spaceId, namespace, timeoutMs } = {}) {
-  if (!bridge || !endpoint) return null;
+/**
+ * Fire a creature→creature action at `endpoint` and return without waiting for a
+ * reply. A docker creature cannot reliably read a creature→creature reply (the
+ * node's machine listener only ever hands it `creatures/signal`, and a WASM
+ * endpoint's `signalResult` lands on `creatures/signal/result`), so orchestration
+ * never depends on the reply — the effect is read back from the store instead
+ * (the committed quote doc / the ledger). This just triggers the WASM creature to
+ * run, exactly the way scheduleRoutine.mjs triggers routines/manage.
+ */
+async function sendCreatureSignal(bridge, endpoint, { action, payload }, { spaceId } = {}) {
+  if (!bridge || !endpoint) return false;
   const correlationId = crypto.randomBytes(16).toString("hex");
   const selfId = String(bridge.programId || bridge.machineId || "");
-  const inner = JSON.stringify({ action: payload.action, correlationId, payload: payload.payload });
+  const inner = JSON.stringify({ action, correlationId, payload });
   const packet = {
     action: "single",
     user: { id: selfId },
@@ -84,40 +92,58 @@ async function callCreature(bridge, endpoint, payload, { spaceId, namespace, tim
     entityId: endpoint.entityId,
     correlationId,
   };
-  let unsub = null;
-  const settled = new Promise((resolve) => {
-    unsub = bridge.onSignal((key, raw) => {
-      if (key !== "creatures/signal" && key !== "creatures/signal/result") return;
-      let pkt = raw;
-      if (pkt && typeof pkt === "object" && typeof pkt.data === "string") {
-        try {
-          pkt = JSON.parse(pkt.data);
-        } catch {
-          return;
-        }
-      }
-      if (!pkt || typeof pkt !== "object") return;
-      if (String(pkt.correlationId || "") !== correlationId) return;
-      if (namespace && pkt.namespace !== undefined && pkt.namespace !== namespace) return;
-      resolve(pkt);
-    });
-  });
   try {
     await bridge.signalUser("creatures/signal", endpoint.programId, packet);
-  } catch (err) {
-    if (unsub) unsub();
-    return null;
+    return true;
+  } catch {
+    return false;
   }
-  let timer;
-  const timedOut = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs || CALL_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([settled, timedOut]);
-  } finally {
-    clearTimeout(timer);
-    if (unsub) unsub();
+}
+
+/**
+ * The deterministic quote id the billing creature mints for (payer, requestId):
+ * sha256 of each part followed by a NUL byte (mirrors the creature's
+ * `billingHash`). Because it is deterministic, the backbone can read the
+ * committed quote doc straight from the store instead of awaiting a reply.
+ */
+function billingQuoteId(payer, requestId) {
+  const h = crypto.createHash("sha256");
+  h.update(Buffer.from(String(payer), "utf8"));
+  h.update(Buffer.from([0]));
+  h.update(Buffer.from(String(requestId), "utf8"));
+  h.update(Buffer.from([0]));
+  return h.digest("hex");
+}
+
+/**
+ * Poll for the committed quote doc at `Json::BillingQuote::<quoteId>` and return
+ * it once it is bound to this exact run. Returns null on timeout — a delegated
+ * quote that is REJECTED (budget reached, unauthorized) never writes a doc, so a
+ * miss here is the "do not launch" signal.
+ */
+async function readCommittedQuote(bridge, { quoteId, payer, requestId, resourceId, spaceId }, options = {}) {
+  const attempts = options.attempts ?? Math.max(1, Number(process.env.DELEGATED_QUOTE_ATTEMPTS) || 30);
+  const intervalMs = options.intervalMs ?? Math.max(5, Number(process.env.DELEGATED_QUOTE_INTERVAL_MS) || 200);
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const res = await bridge.call("getJson", { key: `Json::BillingQuote::${quoteId}`, path: "quote" });
+      const q = res && res.data && typeof res.data === "object" && !Array.isArray(res.data) ? res.data : null;
+      if (
+        q &&
+        String(q.quoteId) === quoteId &&
+        String(q.payerUserId) === String(payer) &&
+        String(q.requestId) === String(requestId) &&
+        String(q.resourceId) === String(resourceId) &&
+        String(q.projectId || "") === String(spaceId)
+      ) {
+        return q;
+      }
+    } catch {
+      /* transient read error — retry */
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
+  return null;
 }
 
 /**
@@ -155,7 +181,12 @@ export async function resolvePoolId(bridge, payer) {
  * enforces the project's autonomous budget. Returns the quoteId or "".
  */
 async function mintDelegatedQuote(bridge, { billingEndpoint, payer, proxyProgramId, spaceId, correlationId }) {
-  const reply = await callCreature(
+  const quoteId = billingQuoteId(payer, correlationId);
+  // Trigger the billing creature to mint + commit the quote, then read the
+  // committed doc directly — never depend on the (unreliable for a container)
+  // reply. A quote the creature REJECTS (budget/auth) writes no doc, so a null
+  // read is the correct "do not launch this teammate" outcome.
+  const sent = await sendCreatureSignal(
     bridge,
     billingEndpoint,
     {
@@ -168,18 +199,24 @@ async function mintDelegatedQuote(bridge, { billingEndpoint, payer, proxyProgram
         payerUserId: payer,
       },
     },
-    { spaceId, namespace: "billing" },
+    { spaceId },
   );
-  if (!reply) {
-    log("GROK_ORCH", { quote: "no-reply", proxyProgramId, spaceId });
+  if (!sent) {
+    log("GROK_ORCH", { quote: "signal-failed", proxyProgramId, spaceId });
     return "";
   }
-  if (reply.ok === false) {
-    log("GROK_ORCH", { quote: "rejected", error: String(reply.error || "").slice(0, 160) });
+  const quote = await readCommittedQuote(bridge, {
+    quoteId,
+    payer,
+    requestId: correlationId,
+    resourceId: proxyProgramId,
+    spaceId,
+  });
+  if (!quote) {
+    log("GROK_ORCH", { quote: "not-committed", proxyProgramId, spaceId, note: "rejected or timed out" });
     return "";
   }
-  const quote = reply.quote && typeof reply.quote === "object" ? reply.quote : {};
-  return String(quote.quoteId || "");
+  return quoteId;
 }
 
 export async function buildDelegatedAuthorization(bridge, { billingEndpoint, payer, poolId, proxyProgramId, spaceId, correlationId }) {
@@ -202,10 +239,15 @@ async function agentAddressBook(bridge, spaceId, roster) {
     const programId = String(a.programId || "").trim();
     if (!programId) return;
     const prev = byProgram.get(programId) || {};
+    // The launch must target the agent's PROXY entity ("agent") so the node
+    // injects the agent's skill/LLM config and forwards to the backbone. A stored
+    // "main"/empty (a non-proxy default) is corrected to "agent".
+    let entityId = String(a.entityId || prev.entityId || "").trim();
+    if (!entityId || entityId === "main") entityId = "agent";
     byProgram.set(programId, {
       programId,
       creatureId: String(a.creatureId || prev.creatureId || "").trim(),
-      entityId: String(a.entityId || prev.entityId || "agent").trim() || "agent",
+      entityId,
       resourceId: String(a.resourceId || prev.resourceId || programId).trim(),
       name: String(a.name || prev.name || "").trim(),
       handle: String(a.handle || prev.handle || toHandle(a.name || prev.name)).trim(),
@@ -448,14 +490,13 @@ export async function settleAutonomousSpend(bridge, delivery, result) {
   const billingEndpoint = billingEndpointFromTask(task);
   if (!quoteId || !spaceId || !billingEndpoint) return;
   const charged = Math.max(0, Number((result && result.chargedMinor) || 0) || 0);
-  try {
-    await callCreature(
-      bridge,
-      billingEndpoint,
-      { action: "settleAutonomous", payload: { spaceId, quoteId, chargedMinor: charged } },
-      { spaceId, namespace: "billing" },
-    );
-  } catch (err) {
-    log("GROK_ORCH", { settle_autonomous_error: String(err?.message || err).slice(0, 160) });
-  }
+  // Fire-and-forget: recording spend must not block the chain, and a miss only
+  // leaves the reservation to be swept at its expiry. The ledger write is the
+  // effect; there is nothing to read back.
+  await sendCreatureSignal(
+    bridge,
+    billingEndpoint,
+    { action: "settleAutonomous", payload: { spaceId, quoteId, chargedMinor: charged } },
+    { spaceId },
+  );
 }
