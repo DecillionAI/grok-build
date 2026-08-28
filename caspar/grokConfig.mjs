@@ -105,7 +105,19 @@ export function renderConfigToml({ mcpServers = {}, model, defaultModel, modelDe
   }
 
   for (const [name, server] of Object.entries(mcpServers)) {
-    if (!server || !server.command) continue;
+    if (!server) continue;
+    const url = typeof server.url === "string" ? server.url.trim() : "";
+    if (url) {
+      lines.push(`[mcp_servers.${tomlKey(name)}]`);
+      lines.push(`url = ${tomlString(url)}`);
+      const headers = tomlInlineTable(server.headers);
+      if (headers) lines.push(`headers = ${headers}`);
+      if (Number.isFinite(server.startupTimeoutSec)) lines.push(`startup_timeout_sec = ${Math.floor(server.startupTimeoutSec)}`);
+      if (Number.isFinite(server.toolTimeoutSec)) lines.push(`tool_timeout_sec = ${Math.floor(server.toolTimeoutSec)}`);
+      lines.push("");
+      continue;
+    }
+    if (!server.command) continue;
     lines.push(`[mcp_servers.${tomlKey(name)}]`);
     lines.push(`command = ${tomlString(server.command)}`);
     const args = Array.isArray(server.args) ? server.args : [];

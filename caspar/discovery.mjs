@@ -145,40 +145,35 @@ function describeDescriptor(d) {
  * carries them — it only fills a gap.
  */
 export function entryFromDescriptor(d, routing) {
-  const kind = d.kind === "agent" || d.kind === "frontend" ? d.kind : "tool";
+  const kind =
+    d.kind === "agent" || d.kind === "frontend" || d.kind === "mcp" ? d.kind : "tool";
   const argSchema = d.argSchema || (kind === "agent" ? { prompt: { type: "string", description: "the request for this sub-agent" } } : {});
-  const entityId = routing.entityId || (kind === "agent" ? "agent" : "main");
+  const entityId = routing.entityId || (kind === "agent" ? "agent" : kind === "mcp" ? "mcp" : "main");
+  const mcpUrl = String(d.mcpUrl || d.mcp_url || "").trim();
+  const mcpToken = String(d.mcpToken || d.mcp_token || "").trim();
   return {
     name: String(d.name || routing.programId || routing.creatureId || "creature"),
     kind,
-    category: d.category || (kind === "agent" ? "agent" : "general"),
+    category: d.category || (kind === "agent" ? "agent" : kind === "mcp" ? "mcp" : "general"),
     description: describeDescriptor(d),
     arg_schema: argSchema,
     ...(Array.isArray(d.requiredArgs) ? { required: d.requiredArgs } : {}),
     ...(d.function ? { function: d.function } : {}),
-    // How long the backbone's ToolInvoker should wait for this creature to
-    // reply before giving up. The sandbox needs a generous window (long
-    // installs/builds/pushes); without it the invoker falls to its 420s
-    // default. Carried through so a slow-but-legitimate op isn't killed.
     ...(Number(d.maxExecSeconds || d.max_exec_seconds) > 0
       ? { max_exec_seconds: Number(d.maxExecSeconds || d.max_exec_seconds) }
       : {}),
-    // The descriptor's per-action listing is what tells the model which
-    // operations it can pass in `function`. Carrying `tools` (and any
-    // explicit `functions` array the descriptor provides) through unchanged
-    // lets `catalog.extractFunctions` derive the enum without a second
-    // metadata fetch — otherwise the model sees a bare string field and
-    // routinely invents a compound tool name.
     ...(Array.isArray(d.tools) ? { tools: d.tools } : {}),
     ...(Array.isArray(d.functions) ? { functions: d.functions } : {}),
-    requires_network: !!d.requiresNetwork,
+    requires_network: kind === "mcp" ? true : !!d.requiresNetwork,
     risk: d.risk || "low",
-    // Routing ids in the snake_case shape catalog.mjs + toolInvoker.mjs read.
     tool_id: routing.programId || routing.creatureId,
     program_id: routing.programId,
     creature_id: routing.creatureId,
     entity_id: entityId,
     discovered: true,
+    ...(mcpUrl ? { mcp_url: mcpUrl, mcpUrl } : {}),
+    ...(mcpToken ? { mcp_token: mcpToken, mcpToken } : {}),
+    ...(d.mcpHeaders && typeof d.mcpHeaders === "object" ? { mcp_headers: d.mcpHeaders, mcpHeaders: d.mcpHeaders } : {}),
   };
 }
 
@@ -243,7 +238,7 @@ function programKind(rec, descriptor) {
   const raw = String(
     (descriptor && descriptor.kind) || pick(rec?.metadata, ["kind"]) || pick(rec, ["kind"]) || "",
   ).toLowerCase();
-  return raw === "agent" || raw === "frontend" || raw === "tool" ? raw : "";
+  return raw === "agent" || raw === "frontend" || raw === "tool" || raw === "mcp" ? raw : "";
 }
 
 /**

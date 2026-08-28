@@ -47,6 +47,7 @@ import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
 import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
+import { httpMcpServersFromCatalog } from "./mcpAttach.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.mjs";
 import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
@@ -426,6 +427,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     log("GROK_BOOT", { tool_bridge_error: String(err?.message || err) });
     socketServer = null;
   }
+  mcpServers = { ...(mcpServers || {}), ...httpMcpServersFromCatalog(catalog) };
 
   // If the space has a sandbox creature attached, also swap Grok's built-in
   // filesystem and shell over to that shared machine.

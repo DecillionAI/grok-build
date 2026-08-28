@@ -1117,6 +1117,30 @@ await check("a space's creatures are wired into the run as an MCP server", async
   assert.match(invocation.rules, /caspar__project_sandbox/, "platform tools must not erase the space's external creature catalog");
 });
 
+await check("attached HTTP MCP servers are written as [mcp_servers.*] url entries", async () => {
+  const { renderConfigToml } = await import("../grokConfig.mjs");
+  const { httpMcpServersFromCatalog } = await import("../mcpAttach.mjs");
+  const catalog = [
+    {
+      name: "Linear",
+      kind: "mcp",
+      mcpUrl: "https://mcp.linear.app/mcp",
+      mcpToken: "lin_tok",
+      program_id: "mcp-1",
+    },
+    { name: "sandbox", kind: "tool", program_id: "p1", tool_id: "p1" },
+  ];
+  const { tools } = buildToolDefinitions(catalog);
+  assert.equal(tools.some((t) => /linear/i.test(t.name)), false, "MCP servers are not Caspar tools");
+  const servers = httpMcpServersFromCatalog(catalog);
+  assert.equal(servers.Linear.url, "https://mcp.linear.app/mcp");
+  assert.match(servers.Linear.headers.Authorization, /Bearer lin_tok/);
+  const toml = renderConfigToml({ mcpServers: { caspar: { command: "node", args: ["x"] }, ...servers } });
+  assert.match(toml, /\[mcp_servers\.Linear\]/);
+  assert.match(toml, /url = "https:\/\/mcp\.linear\.app\/mcp"/);
+  assert.match(toml, /\[mcp_servers\.caspar\]/);
+});
+
 await check("a native/default-backbone run still gets a bounded idle timeout + retries", async () => {
   // The prior stall fix only wrote resilience knobs into the per-agent
   // `[model.<id>]` block, so an agent on the creature's own backbone (no

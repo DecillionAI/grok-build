@@ -162,6 +162,10 @@ export function buildToolDefinitions(catalog) {
     // chat, never through a synchronous tool call. Keep them out of the callable
     // surface entirely.
     if (entry.kind === "agent") continue;
+    // Remote MCP servers are wired into Grok as native HTTP MCP, not as Caspar
+    // creatures to signal. Listing them here would make the model call a
+    // program id that cannot answer `tools/result`.
+    if (entry.kind === "mcp") continue;
     const target = entry.program_id || entry.programId || entry.machine_id || entry.tool_id || entry.creature_id || "";
     if (!target) continue;
     const name = mcpToolName(entry, taken);
