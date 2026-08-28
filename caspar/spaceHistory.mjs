@@ -179,6 +179,14 @@ export async function postSpaceSignal(
   if (!res || res.ok === false) {
     throw new Error(String(res?.error || "store refused the signal"));
   }
+  // Accepted is not the same as recorded. A store that does not keep history
+  // fans a signal out live and drops it, so an agent's whole trajectory — and
+  // its answer — would be shown to whoever happened to be connected and be gone
+  // by the next read, while every post reported success. Only `temp` traffic is
+  // allowed to be unrecorded, because that is what `temp` means.
+  if (!temp && res.persisted !== true) {
+    throw new Error("the store did not record the signal (the space keeps no history)");
+  }
   return res;
 }
 
