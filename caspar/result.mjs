@@ -141,8 +141,15 @@ export function buildResult(objective, grokResult, mapper, extra = {}) {
     sessionId: sessionId || grokResult?.session_id || undefined,
   };
   if (!succeeded) result.error = failure;
+  // Attachments are storage references by the time they reach here — the run
+  // uploads the bytes before building this result, so nothing base64 crosses the
+  // signal frame.
   if (Array.isArray(extra.attachments) && extra.attachments.length) {
     result.attachments = extra.attachments;
+  }
+  // Media that could not be stored, named so the turn can say what is missing.
+  if (Array.isArray(extra.attachmentErrors) && extra.attachmentErrors.length) {
+    result.attachmentErrors = extra.attachmentErrors;
   }
   if (warnings.length) result.warnings = warnings;
   if (Array.isArray(grokResult?.permission_denials) && grokResult.permission_denials.length) {

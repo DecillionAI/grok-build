@@ -50,6 +50,7 @@ import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.mjs";
 import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
+import { uploadOutboundMedia } from "./mediaUpload.mjs";
 import { SCHEDULE_ROUTINE_TOOL, scheduleRoutine } from "./scheduleRoutine.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
@@ -657,12 +658,22 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   } catch (err) {
     log("GROK_MEDIA", { collect_error: String(err?.message || err) });
   }
-  const outboundAttachments = mediaCollector.attachments();
-  if (outboundAttachments.length) {
+  // Media the agent shared: upload the bytes to blob storage HERE, as this
+  // creature, and carry only references from this point on. Bytes never enter
+  // the terminal result (which crosses the node's signal frame) nor the space's
+  // log — a reference is what a chat turn holds, and every client builds the
+  // file's address from the id against its own storage base.
+  const collectedMedia = mediaCollector.attachments();
+  if (collectedMedia.length) {
     log("GROK_MEDIA", {
-      outbound: outboundAttachments.map(({ name, mimeType, kind, size, source }) => ({ name, mimeType, kind, size, source })),
+      outbound: collectedMedia.map(({ name, mimeType, kind, size, source }) => ({ name, mimeType, kind, size, source })),
     });
   }
+  const { refs: outboundAttachments, failed: attachmentErrors } = await uploadOutboundMedia(
+    bridge,
+    collectedMedia,
+  );
+  if (attachmentErrors.length) log("GROK_MEDIA", { upload_failed: attachmentErrors });
   const result = buildResult(objective, run.result, mapper, {
     durationMs: Date.now() - started,
     timedOut: run.timedOut,
@@ -674,6 +685,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     initMessage,
     warnings: run.warnings,
     attachments: outboundAttachments,
+    attachmentErrors,
   });
   // Keep charge-driving observations private. In particular, result.durationMs
   // may reflect a child-runner field; billing uses only this host-measured wall
@@ -775,6 +787,11 @@ async function persistAnswer(bridge, task, result) {
     const threadId = typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : undefined;
     const agentProgramId = typeof task.agentProgramId === "string" && task.agentProgramId.trim() ? task.agentProgramId.trim() : undefined;
     const mentions = scanMentions(answer, task.roster);
+    // References, already uploaded by the run itself — recorded on the same turn
+    // as the answer they came with, so the media and the words are ONE record
+    // with one writer.
+    const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+    const failed = Array.isArray(result.attachmentErrors) ? result.attachmentErrors : [];
     const data = {
       text: answer,
       from: "agent",
@@ -790,6 +807,10 @@ async function persistAnswer(bridge, task, result) {
       ...(Number.isFinite(result.sandboxMinor) ? { sandboxMinor: result.sandboxMinor } : {}),
       ...(Number.isFinite(result.llmMinor) ? { llmMinor: result.llmMinor } : {}),
       ...(Number.isFinite(result.durationMs) ? { durationMs: result.durationMs } : {}),
+      ...(attachments.length ? { attachments } : {}),
+      // Media that could not be stored is named in the turn rather than dropped:
+      // a missing image with no explanation is worse than a note saying why.
+      ...(failed.length ? { attachmentErrors: failed } : {}),
     };
     await postSpaceSignal(bridge, {
       spaceId,
@@ -800,7 +821,13 @@ async function persistAnswer(bridge, task, result) {
       mentions,
       data,
     });
-    log("GROK_PERSIST", { spaceId, threadId: threadId || "main", chars: answer.length, mentions: mentions.length });
+    log("GROK_PERSIST", {
+      spaceId,
+      threadId: threadId || "main",
+      chars: answer.length,
+      mentions: mentions.length,
+      attachments: attachments.length,
+    });
   } catch (err) {
     log("GROK_PERSIST", { error: String(err?.message || err).slice(0, 200) });
   }

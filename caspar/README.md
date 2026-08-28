@@ -51,6 +51,7 @@ progress, employing sibling creatures — rides that connection.
 | in (tool reply) | `creatures/signal` | `{kind:"tools/result", correlationId, result}` |
 | out (read the chat) | host call | `readSignals {storeId, tagsAll:["thread=…"], tagsAny:["kind=message","kind=answer"], count}` |
 | out (post a turn) | host call | `signal {type:"all", storeId, data, tags:["kind=…","thread=…","agent=…","run=…"]}` |
+| out (store media) | host call | `execShellAction {path:"/storage/upload", asSelf:true, payload:{dataBase64, contentType}}` |
 
 The group-chat **history is not sent in the prompt**, and no creature is asked for
 it either: a space's chat is the store's own **signal log**, and this creature
@@ -136,6 +137,7 @@ which the node relays while keeping the correlation open.
 | `bridge.mjs` | The docker-host bridge gateway client: chunked framing, HELLO/WELCOME, host calls (`signalUser`, `dbOp`, `httpRequest`), pushed signals. |
 | `taskSignal.mjs` | Peels the StoresSend / `payload` / proxy envelopes into a task; derives the conversation thread key. |
 | `prompt.mjs` | Composes what Grok is given: the agent's skill as persona, the group-chat preamble and roster, the thread's history with `[From → To]` annotations. |
+| `mediaUpload.mjs` | Puts media an agent shared into blob storage before the turn is built, so a chat record holds `{name, mimeType, kind, storageId, size}` and never base64. Uploads with `asSelf`, so the node — not this process — decides whose identity the file is stored under; an upload that fails is named on the turn rather than dropped. No URL is stored: clients build it from the id against their own storage base. |
 | `spaceHistory.mjs` | The space's chat, read and written through the node's signal log: `readSpaceSignals` / `fetchSpaceConversation` (tag-filtered read → the annotated history turns `prompt.mjs` renders) and `postSpaceSignal` (one tagged signal per turn — recorded and fanned out live in one call). Owns the tag vocabulary (`KIND`, `SIGNAL_TAGS`), which is shared with the Expo client and the decillion creatures. |
 | `orchestrate.mjs` | **Server-side agent orchestration.** After a run marked `serverOrchestrate` posts its answer, the backbone resolves the teammates it @mentioned (roster + program index), mints a **delegated** billing quote for each against the payer's pool (`billing/quote` with an explicit `payerUserId`, honoured because this backbone IS the settlement meter; bounded by the project's autonomous budget), and signals each teammate's proxy to run — so the @mention chain (and routine-fired runs) complete with **no client present**. `visited`/`maxHops` carry on the task, so the chain can't loop or double-launch; only backbone-minted (`autonomousQuote`) runs settle against the autonomous budget. Wired into `runtime.mjs`'s `startDelivery` (ensure-auth → serve → settle → fan out). |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
