@@ -327,13 +327,20 @@ def _handle_invoke(bridge, packet: dict) -> None:
     # A caller's own arguments live under `payload`, so a guest could otherwise
     # forge an identity by adding e.g. `caller_id` to its args; we therefore strip
     # every caller-identity key the guest might have set and re-stamp `__caller_id`
-    # from the envelope's `reply_to`/`userId`, which the backend (Nest) sets from
-    # the authenticated user and a guest cannot influence. A tool that gates on the
-    # caller (e.g. github's per-member connection) reads `__caller_id`.
+    # from the envelope, which only the invoking creature sets and a guest cannot
+    # influence. A tool that gates on the caller (github's per-member connection,
+    # zapier's per-member Zapier account) reads `__caller_id`.
     if isinstance(payload, dict):
         for _k in ("__caller_id", "reply_to", "replyTo", "caller_id", "callerId", "user_id", "userId"):
             payload.pop(_k, None)
-        _caller = packet.get("reply_to") or packet.get("userId")
+        # `caller_id` is the HUMAN an invoker is acting for, set only by the
+        # trusted meter on the direct-tool path (from the billing quote's payer);
+        # `reply_to` is the invoking *creature*, which is what the reply routes
+        # back to. Prefer the person when one is named, so a tool that gates on
+        # "the member who connected this" sees them rather than the meter — and
+        # an agent's own tool call, which names no person, still resolves to the
+        # backbone, i.e. not the owner.
+        _caller = packet.get("caller_id") or packet.get("reply_to") or packet.get("userId")
         if isinstance(_caller, str) and _caller.strip():
             payload["__caller_id"] = _caller.strip()
         # A chat command delivers its argument as one free-text blob; spread it

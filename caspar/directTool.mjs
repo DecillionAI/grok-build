@@ -79,7 +79,16 @@ export async function runDirectTool(bridge, delivery, billingSession) {
     bridge,
     new Map([[name, catalogEntry]]),
     bridge.machineId || bridge.programId || "",
-    { authorizedToolIds: [resourceId] },
+    {
+      authorizedToolIds: [resourceId],
+      // A direct tool call is a PERSON pressing a button in a tool's mini-app.
+      // Take who they are from the signed quote (`payerUserId`, read back from
+      // the on-chain quote document) rather than from anything the client sent,
+      // so a tool that gates on the member who connected something — github's
+      // sharing toggle, zapier's per-member Zapier account — sees the real
+      // person instead of this meter.
+      callerId: String(billingSession.quote?.payerUserId || ""),
+    },
   );
   try {
     const invoked = await invoker.invoke(name, {
