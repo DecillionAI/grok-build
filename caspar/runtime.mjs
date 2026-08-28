@@ -1060,7 +1060,21 @@ export function createDeliveryQueue(bridge, idleWaitMs, onQueued) {
   let notify = null;
   const unsubscribe = bridge.onSignal((key, data) => {
     const delivery = decodeTaskSignal(key, data);
-    if (!delivery) return;
+    if (!delivery) {
+      // A push this creature cannot read as a task is dropped — but never in
+      // silence. "The prompt never arrived" and "the prompt arrived in a shape
+      // I discarded" look identical from the outside, and the difference is the
+      // whole diagnosis when agents stop answering. Bounded so an unrelated
+      // fan-out cannot flood the log.
+      log("GROK_DROPPED", {
+        key,
+        correlationId: String(data?.correlationId || ""),
+        from: String(data?.user?.id || ""),
+        store: String(data?.store?.id || data?.storeId || ""),
+        shape: Object.keys(data && typeof data === "object" ? data : {}).slice(0, 12),
+      });
+      return;
+    }
     queue.push(delivery);
     if (onQueued) onQueued(queue.length, delivery);
     if (notify) notify();
