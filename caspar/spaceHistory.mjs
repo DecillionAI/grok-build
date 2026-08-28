@@ -172,6 +172,13 @@ export async function postSpaceSignal(
     },
     { timeoutMs },
   );
+  // The host call answering at all is not the same as the signal landing. A
+  // refusal — no `signal` permission on this store, a log that cannot be
+  // written — comes back in the payload, and ignoring it is how a run posts a
+  // full trajectory and an answer into nothing while reporting success.
+  if (!res || res.ok === false) {
+    throw new Error(String(res?.error || "store refused the signal"));
+  }
   return res;
 }
 

@@ -203,6 +203,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   // call or model turn) from "the run went away", so the client's own idle
   // watchdog never kills a healthy-but-silent run.
   let lastStreamAt = Date.now();
+  let stepPostFailed = false;
   const stepAgentProgramId = task.proxyProgramId || task.agentProgramId || task.self?.programId || "";
   const stepAgentName = task.self?.name || task.agentName || "";
   /**
@@ -234,7 +235,20 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
           ...(stepAgentName ? { agentName: stepAgentName } : {}),
           ...(stepAgentProgramId ? { agentProgramId: stepAgentProgramId } : {}),
         },
-      }).catch(() => {});
+      }).catch((err) => {
+        // Reported ONCE per run: if the store is refusing this creature's
+        // signals, every step of every run fails the same way, and a line per
+        // step would bury the reason it is happening.
+        if (!stepPostFailed) {
+          stepPostFailed = true;
+          log("GROK_STEP_LOST", {
+            spaceId: stepSpaceId,
+            correlationId,
+            error: String(err?.message || err).slice(0, 300),
+            note: "this run's work trail is not being recorded",
+          });
+        }
+      });
       return;
     }
     bridge
@@ -829,7 +843,13 @@ async function persistAnswer(bridge, task, result) {
       attachments: attachments.length,
     });
   } catch (err) {
-    log("GROK_PERSIST", { error: String(err?.message || err).slice(0, 200) });
+    // The answer is the turn the user is waiting for and was billed for. If it
+    // could not be recorded, say so at full volume and mark the result, so the
+    // failure is visible in the run's own reply rather than only as a chat that
+    // never shows an answer.
+    const message = String(err?.message || err).slice(0, 300);
+    log("GROK_PERSIST", { error: message, note: "the answer was NOT recorded in the space" });
+    if (result && typeof result === "object") result.persistError = message;
   }
 }
 

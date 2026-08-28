@@ -507,6 +507,42 @@ async function main() {
     assert.match(failed[0].error, /file too large/);
   });
 
+  await check("a store that refuses a signal fails the post — it is never reported as landed", async () => {
+    // The exact shape that shipped broken: the host call answers, but the node
+    // refused the signal. Treating "the call returned" as "the turn landed" is
+    // how a whole run's trajectory and its answer go into nothing while the run
+    // reports success.
+    const refusing = { call: async () => ({ ok: false, error: "not allowed to signal in this store" }) };
+    await assert.rejects(
+      () => postSpaceSignal(refusing, { spaceId: "sp", kind: KIND.ANSWER, data: { text: "hi" } }),
+      /not allowed to signal in this store/,
+    );
+
+    // An empty or absent answer is not success either.
+    const mute = { call: async () => null };
+    await assert.rejects(
+      () => postSpaceSignal(mute, { spaceId: "sp", kind: KIND.STEP, data: {} }),
+      /refused the signal/,
+    );
+
+    // And the happy path still resolves.
+    const accepting = { call: async () => ({ ok: true, persisted: true, signalId: "row-1" }) };
+    const res = await postSpaceSignal(accepting, { spaceId: "sp", kind: KIND.ANSWER, data: { text: "hi" } });
+    assert.equal(res.signalId, "row-1");
+  });
+
+  await check("posting a turn never declares who the caller is", async () => {
+    // The node stamps the calling creature's identity on every host call and
+    // checks the store permission against it. A `userId` in the payload would be
+    // a creature naming itself, which the node must not honour — and which this
+    // backbone must therefore never send.
+    let sent = null;
+    const bridge = { call: async (op, input) => { sent = input; return { ok: true }; } };
+    await postSpaceSignal(bridge, { spaceId: "sp", kind: KIND.ANSWER, data: { text: "hi" } });
+    assert.equal(sent.userId, undefined, "the caller must not declare an identity");
+    assert.equal(sent.storeId, "sp");
+  });
+
   console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
   process.exit(failures.length ? 1 : 0);
 }
