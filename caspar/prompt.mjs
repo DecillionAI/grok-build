@@ -104,9 +104,10 @@ export function groupChatPreamble(task) {
     "it. So finish your turn by clearly stating what you need and @mentioning " +
     "whoever should act next, then stop; you (or they) can build on their reply " +
     "when it arrives as a following turn.\n" +
-    "  • Only @mention someone when you actually need something from them, and " +
-    "prefer to @mention one teammate at a time so the thread does not fan out " +
-    "into chaos.\n" +
+    "  • Only @mention someone when you actually need something from them. If " +
+    "several teammates should work from the same artifact you just produced, " +
+    "@mention all of them in this same final reply, each with a specific ask, so " +
+    "they can run in parallel from your context. Otherwise mention one at a time.\n" +
     "  • Your tool calls are shown to everyone in this chat as they happen (a " +
     "structured entry per call), so the team can already see the work — do not " +
     "narrate every tool call in your prose.\n" +
