@@ -1,260 +1,178 @@
 /**
- * Fetching the space's group-chat transcript — creature → creature.
+ * The space's group chat, read and written through the node's own signal log.
  *
- * A Decillion space is a shared group chat, and its transcript lives on-chain in
- * the space store, owned by the decillion `spaces/history` creature (written by
- * `spaces/signal` with `persist:true`). The prompting client no longer ships the
- * transcript in the task; it passes only the *address* of that creature
- * (`task.historyEndpoint`, resolved from the manifest). This backbone — the
- * creature that "handles prompts and messages to the agents" — fetches the
- * history itself before building the prompt, by signalling `spaces/history` and
- * awaiting its reply.
+ * A Decillion space is a Caspar store, and everything said in it — a person's
+ * message, an agent's answer, each tool call, each step of an agent's work — is
+ * one persisted signal on that store, labelled with tags. There is no second
+ * transcript: this backbone reads the same rows the app reads, with the same tag
+ * filter, through two host calls:
  *
- * How the round trip works (and why it is shaped the way it is):
+ *   • `readSignals` — a tag-filtered read of the store's log.
+ *   • `signal`      — post into the store; the node persists it (the space is
+ *                     `persHist`) and fans it out live to every participant.
  *
- *   • The `spaces/*` endpoints are WASM creatures that peel Nest's
- *     `/creatures/signal` envelope with a shared `unwrapSignal`. The node's pvp
- *     signal handler builds a `StoresSend` value and hands it to `signal_user`;
- *     the WASM `run` receives that value serialised. So to invoke the endpoint we
- *     reproduce the *same* `StoresSend` shape and push it with `signalUser` — an
- *     identical delivery to what the app's shell request produces.
- *       data = JSON.stringify({ programId, entity,
- *                payload: JSON.stringify({ action:"history", correlationId,
- *                                         payload:{ storeId } }) })
+ * Both are node host functions, so they are a direct request/response with the
+ * node rather than a creature→creature signal round trip. Nothing here matches
+ * correlation ids, listens on `creatures/signal`, or reads the store's key/value
+ * space: the log is the transcript.
  *
- *   • The reply. A WASM endpoint answers via `signalResult`, which emits on
- *     `creatures/signal/result`. But a docker creature (this backbone) only ever
- *     receives signals on `creatures/signal` — the node's machine listener drops
- *     every other key for a connected container. So `spaces/history` *also*
- *     emits its result on `creatures/signal` (see the decillion server's
- *     `SPACES["history"]`); that is the copy we listen for here, matched by
- *     `correlationId`.
- *
- * The reply target is this creature's own machine id (`selfId`): `signalResult`
- * addresses `p.RequesterID`, which is the `user.id` we stamp on the request, and
- * that id must be the one the node has this container registered under — the same
- * id `ToolInvoker` uses as `reply_to`.
+ * The tag vocabulary is shared with the client and the creatures — see
+ * `SIGNAL_TAGS` below. It is the whole filtering contract, so keep it in step
+ * with `new-decillion/src/caspar/signalTags.ts`.
  */
-
-import crypto from "node:crypto";
 
 import { creatureNumber } from "./env.mjs";
 
 const HISTORY_FETCH_TIMEOUT_MS = creatureNumber("HISTORY_FETCH_TIMEOUT_MS", 8000);
 const MAX_TURN_CHARS = creatureNumber("HISTORY_TURN_CHARS", 4000);
+/** How many of a thread's most recent conversational turns a prompt may carry. */
+const HISTORY_TURN_LIMIT = creatureNumber("HISTORY_TURN_LIMIT", 80);
+
+/** What a signal is. One `kind=` tag per signal, always present. */
+export const KIND = {
+  /** A person's chat message. */
+  MESSAGE: "message",
+  /** An agent's final answer — the only agent output rendered as a chat turn. */
+  ANSWER: "answer",
+  /** One step of an agent's work: a thought, a plan write, a tool result. */
+  STEP: "step",
+  /** A structured log entry for one tool call an agent made. */
+  TOOLCALL: "toolcall",
+  /** A tool's reply to a person's `@tool <command>`. */
+  TOOLREPLY: "toolreply",
+  /** A thread lifecycle marker (created / renamed / deleted). */
+  THREAD: "thread",
+};
+
+/** The tags this backbone builds and filters on. */
+export const SIGNAL_TAGS = {
+  kind: (k) => `kind=${k}`,
+  thread: (id) => `thread=${id || "main"}`,
+  agent: (programId) => `agent=${programId}`,
+  run: (correlationId) => `run=${correlationId}`,
+  mention: (programId) => `mention=${programId}`,
+};
+
+/** The kinds that are conversation — what an agent should read as the chat. */
+const CONVERSATION_KINDS = [KIND.MESSAGE, KIND.ANSWER];
 
 /**
- * The `spaces/history` endpoint address the client put on the task, normalised.
- * Returns `null` when the task carries none (no space, or an older client) — the
- * caller then simply runs without fetched history.
+ * Tags may only contain the characters the node accepts (see the node's
+ * `signal_tags.rs`), so an id carrying anything else would have its whole signal
+ * rejected. Ids are `<n>@<origin>` and thread ids are client-generated hex, both
+ * already within that set; anything else is a bug worth failing on rather than
+ * silently mangling, so this only strips whitespace.
  */
-export function historyEndpointFromTask(task) {
-  const raw = task && typeof task === "object" ? task.historyEndpoint || task.history_endpoint : null;
-  if (!raw || typeof raw !== "object") return null;
-  const programId = String(raw.programId || raw.program_id || "").trim();
-  if (!programId) return null;
-  const entityId = String(raw.entityId || raw.entity_id || "main").trim() || "main";
-  return {
-    programId,
-    creatureId: String(raw.creatureId || raw.creature_id || "").trim(),
-    entityId,
-  };
+function tagValue(raw) {
+  return String(raw ?? "").trim();
 }
 
 /**
- * Signal `spaces/history` and resolve with its raw persisted records (or `[]`).
- * Never throws — a failed or slow fetch just yields no history, so the run
- * proceeds rather than dying on a history hiccup.
+ * Read a slice of the store's signal log.
+ *
+ * Returns the raw packets, newest first, each `{ id, userId, data, tags, time }`
+ * with `data` parsed from its JSON string. Throws nothing — a failed read yields
+ * no history, and the run proceeds against an empty transcript rather than dying
+ * on a history hiccup.
  */
-export async function fetchSpaceHistoryRecords(
+export async function readSpaceSignals(
   bridge,
-  { endpoint, spaceId, selfId, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
+  { spaceId, threadId, kinds, count = HISTORY_TURN_LIMIT, timeoutMs = HISTORY_FETCH_TIMEOUT_MS } = {},
 ) {
-  if (!bridge || !endpoint || !spaceId) return [];
-  const correlationId = crypto.randomBytes(16).toString("hex");
-  const inner = JSON.stringify({
-    action: "history",
-    correlationId,
-    payload: { storeId: spaceId },
-  });
-  const packet = {
-    action: "single",
-    user: { id: String(selfId || "") },
-    store: { id: spaceId },
-    data: JSON.stringify({ programId: endpoint.programId, entity: endpoint.entityId, payload: inner }),
-    entityId: endpoint.entityId,
-    correlationId,
-  };
-
-  let unsub = null;
-  const settled = new Promise((resolve) => {
-    unsub = bridge.onSignal((key, raw) => {
-      if (key !== "creatures/signal" && key !== "creatures/signal/result") return;
-      // The reply may arrive as the result object itself, or wrapped in a
-      // StoresSend whose `data` is the object's JSON string.
-      let pkt = raw;
-      if (pkt && typeof pkt === "object" && typeof pkt.data === "string") {
-        try {
-          pkt = JSON.parse(pkt.data);
-        } catch {
-          return;
-        }
-      }
-      if (!pkt || typeof pkt !== "object") return;
-      if (String(pkt.correlationId || "") !== correlationId) return;
-      if (!Array.isArray(pkt.history)) return;
-      resolve(pkt.history);
-    });
-  });
-
+  if (!bridge || !spaceId) return [];
+  const tagsAll = [];
+  if (threadId) tagsAll.push(SIGNAL_TAGS.thread(tagValue(threadId)));
+  const tagsAny = (kinds || []).map((k) => SIGNAL_TAGS.kind(k));
+  let res;
   try {
-    await bridge.signalUser("creatures/signal", endpoint.programId, packet);
+    res = await bridge.call(
+      "readSignals",
+      { storeId: spaceId, tagsAll, tagsAny, count },
+      { timeoutMs },
+    );
   } catch {
-    if (unsub) unsub();
     return [];
   }
-
-  let timer;
-  const timedOut = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
-  });
-  try {
-    const records = await Promise.race([settled, timedOut]);
-    return Array.isArray(records) ? records : [];
-  } finally {
-    clearTimeout(timer);
-    if (unsub) unsub();
-  }
-}
-
-/**
- * Pull key strings out of a `getByPrefix` reply, whatever shape the node used:
- * a bare array, or `{data|keys|items: [...]}`, and entries that are either the
- * key string itself or an object carrying it under `key`/`id`/`name`. Mirrors
- * the decillion creature's `hostPrefixKeys`.
- */
-function extractPrefixKeys(res) {
+  const rows = res && Array.isArray(res.signals) ? res.signals : [];
   const out = [];
-  const seen = new Set();
-  const add = (s) => {
-    if (typeof s === "string" && s.trim() && !seen.has(s)) {
-      seen.add(s);
-      out.push(s);
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    let data = null;
+    if (typeof row.data === "string" && row.data) {
+      try {
+        data = JSON.parse(row.data);
+      } catch {
+        data = null;
+      }
+    } else if (row.data && typeof row.data === "object") {
+      data = row.data;
     }
-  };
-  const walk = (v) => {
-    if (typeof v === "string") add(v);
-    else if (Array.isArray(v)) v.forEach(walk);
-    else if (v && typeof v === "object") {
-      if (typeof v.key === "string") add(v.key);
-      else if (typeof v.id === "string") add(v.id);
-      else if (typeof v.name === "string") add(v.name);
-      else Object.values(v).forEach(walk);
-    }
-  };
-  if (res && typeof res === "object" && !Array.isArray(res)) {
-    walk(res.data);
-    walk(res.keys);
-    walk(res.items);
-  } else {
-    walk(res);
+    if (!data || typeof data !== "object") continue;
+    out.push({
+      id: String(row.id || ""),
+      userId: String(row.userId || ""),
+      time: Number(row.time || 0) || 0,
+      tags: Array.isArray(row.tags) ? row.tags.map(String) : [],
+      data,
+    });
   }
   return out;
 }
 
 /**
- * Read the space's transcript STRAIGHT from the store (`getByPrefix` on
- * `Json::StoreHistory::<space>::` + a `getJson` per record), exactly the way the
- * `spaces/history` creature's `readSpaceHistory` does. This never depends on the
- * creature→creature signal round-trip (which can be lost to a signal
- * delivery-shape mismatch), so an agent always gets its history. Bounded to the
- * most recent `limit` turns (ids are zero-padded, so lexicographic sort is
- * arrival order) to keep the per-record reads cheap on a long-lived space.
+ * The conversation an agent should see: this thread's human messages and agent
+ * answers, oldest first. Work steps and tool-call logs are persisted too, but
+ * they are not conversation and never enter a prompt.
  */
-export async function fetchSpaceHistoryDirect(bridge, spaceId, { limit = 80 } = {}) {
-  if (!bridge || !spaceId) return [];
-  const prefix = `Json::StoreHistory::${spaceId}::`;
-  let res;
-  try {
-    res = await bridge.call("getByPrefix", { prefix });
-  } catch {
-    return [];
-  }
-  const ids = new Set();
-  for (const key of extractPrefixKeys(res)) {
-    let id = key.startsWith(prefix) ? key.slice(prefix.length) : key;
-    const dc = id.indexOf("::");
-    if (dc >= 0) id = id.slice(0, dc);
-    if (id) ids.add(id);
-  }
-  const recent = [...ids].sort().slice(-Math.max(1, limit));
-  const records = [];
-  for (const id of recent) {
-    try {
-      const doc = await bridge.call("getJson", { key: prefix + id, path: "" });
-      const data = doc && doc.data && typeof doc.data === "object" && !Array.isArray(doc.data) ? doc.data : null;
-      if (data) records.push(data);
-    } catch {
-      /* one unreadable record must not sink the whole transcript */
-    }
-  }
-  return records;
-}
-
-/**
- * The `spaces/signal` endpoint address the client put on the task (mirrors
- * `historyEndpointFromTask`). Used to durably persist the agent's own final
- * answer creature→creature, so completion survives even if the app's socket
- * dropped before it could store the turn.
- */
-export function signalEndpointFromTask(task) {
-  const raw = task && typeof task === "object" ? task.signalEndpoint || task.signal_endpoint : null;
-  if (!raw || typeof raw !== "object") return null;
-  const programId = String(raw.programId || raw.program_id || "").trim();
-  if (!programId) return null;
-  const entityId = String(raw.entityId || raw.entity_id || "main").trim() || "main";
-  return {
-    programId,
-    creatureId: String(raw.creatureId || raw.creature_id || "").trim(),
-    entityId,
-  };
-}
-
-/**
- * Persist one chat message to the space, creature→creature, exactly the way the
- * app persists a user message: signal `spaces/signal` with `persist:true` and the
- * message `data`. Best-effort and non-throwing. When `data.msgId` is set (the
- * run's correlationId), the store upserts by it, so this write and the app's own
- * write of the same turn converge on ONE record instead of duplicating it.
- */
-export async function persistSpaceMessage(
-  bridge,
-  { endpoint, spaceId, selfId, data, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
-) {
-  if (!bridge || !endpoint || !spaceId || !data || typeof data !== "object") return false;
-  const correlationId = crypto.randomBytes(16).toString("hex");
-  const inner = JSON.stringify({
-    action: "signal",
-    correlationId,
-    payload: { storeId: spaceId, type: "message", persist: true, data },
+export async function fetchSpaceConversation(bridge, { spaceId, threadId, limit = HISTORY_TURN_LIMIT }) {
+  const packets = await readSpaceSignals(bridge, {
+    spaceId,
+    threadId,
+    kinds: CONVERSATION_KINDS,
+    count: limit,
   });
-  const packet = {
-    action: "single",
-    user: { id: String(selfId || "") },
-    store: { id: spaceId },
-    data: JSON.stringify({ programId: endpoint.programId, entity: endpoint.entityId, payload: inner }),
-    entityId: endpoint.entityId,
-    correlationId,
-  };
-  try {
-    await Promise.race([
-      bridge.signalUser("creatures/signal", endpoint.programId, packet),
-      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
-    ]);
-    return true;
-  } catch {
-    return false;
+  // The log reads newest-first; a transcript reads oldest-first.
+  return packets.slice().reverse();
+}
+
+/**
+ * Post one signal into the space. The node persists it in the store's log with
+ * these tags and fans it out live to every participant — one call, one record,
+ * one delivery.
+ *
+ * Throws on failure. A turn that cannot be recorded is a real failure of the
+ * run: swallowing it would leave the chat silently missing an answer the user
+ * was billed for.
+ */
+export async function postSpaceSignal(
+  bridge,
+  { spaceId, kind, threadId, data, agentProgramId, correlationId, mentions, temp = false, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
+) {
+  if (!bridge) throw new Error("postSpaceSignal: no bridge");
+  if (!spaceId) throw new Error("postSpaceSignal: no spaceId");
+  if (!kind) throw new Error("postSpaceSignal: no kind");
+  const tags = [SIGNAL_TAGS.kind(kind), SIGNAL_TAGS.thread(tagValue(threadId))];
+  if (agentProgramId) tags.push(SIGNAL_TAGS.agent(tagValue(agentProgramId)));
+  if (correlationId) tags.push(SIGNAL_TAGS.run(tagValue(correlationId)));
+  for (const m of mentions || []) {
+    const programId = tagValue(m && typeof m === "object" ? m.programId || m.id : m);
+    if (programId) tags.push(SIGNAL_TAGS.mention(programId));
   }
+  const res = await bridge.call(
+    "signal",
+    {
+      type: "all",
+      storeId: spaceId,
+      data: JSON.stringify(data ?? {}),
+      tags,
+      // `temp` delivers live without recording. Reserved for traffic that is
+      // meaningless once seen — the keep-alive heartbeat — so the log holds the
+      // work an agent did, not the pings proving it was still breathing.
+      ...(temp ? { temp: true } : {}),
+    },
+    { timeoutMs },
+  );
+  return res;
 }
 
 function firstString(...vals) {
@@ -264,26 +182,27 @@ function firstString(...vals) {
   return "";
 }
 
-/** Text of a persisted turn — the client stores it as `text` on the record. */
+/** Text of a persisted turn. */
 function recordText(record) {
-  const direct = firstString(record.text, record.message, record.content, record.answer);
-  return direct;
+  return firstString(record.text, record.message, record.content, record.answer);
 }
 
 /**
- * Turn the raw persisted records into the history shape `prompt.mjs` renders:
+ * Turn the signal packets into the history shape `prompt.mjs` renders:
  * `{ role, content, from, to, directedToMe }`. Every human message and every
  * agent's final answer is included — an agent sees the whole group chat — with
  * `role: "assistant"` only for the running agent's own past turns (rendered as
  * "you"), and `directedToMe` set when the turn `@mentioned` this agent.
  *
  * `self` is the running agent's identity (`task.self`: `{ id, name, handle }`).
- * `excludeText` drops the current message being answered (handed to the model
- * separately as the objective), mirroring the old
- * `HistoryStore.conversationFor(..., { excludeText })`.
+ * `excludeText` drops the current message being answered, which is handed to the
+ * model separately as the objective.
+ *
+ * Packets arrive oldest-first from `fetchSpaceConversation` (the log's own time
+ * order), so nothing is re-sorted here.
  */
-export function buildHistoryTurns(records, self, { excludeText } = {}) {
-  if (!Array.isArray(records) || !records.length) return [];
+export function buildHistoryTurns(packets, self, { excludeText } = {}) {
+  if (!Array.isArray(packets) || !packets.length) return [];
   const me = self && typeof self === "object" ? self : {};
   const myKeys = new Set(
     [me.id, me.name, me.handle]
@@ -292,20 +211,12 @@ export function buildHistoryTurns(records, self, { excludeText } = {}) {
   );
   const isMe = (v) => typeof v === "string" && myKeys.has(v.trim().toLowerCase());
 
-  // Sort by the node's zero-padded sequence (arrival order); fall back to `at`.
-  const sorted = [...records].sort((a, b) => {
-    const ai = firstString(a?.id, a?.seq);
-    const bi = firstString(b?.id, b?.seq);
-    if (ai && bi && ai !== bi) return ai < bi ? -1 : 1;
-    return firstString(a?.at).localeCompare(firstString(b?.at));
-  });
-
   const skip = typeof excludeText === "string" ? excludeText.trim() : "";
   // Drop only the *latest* record matching the current message.
   let skipped = false;
   const kept = [];
-  for (let i = sorted.length - 1; i >= 0; i--) {
-    const record = sorted[i];
+  for (let i = packets.length - 1; i >= 0; i--) {
+    const record = packets[i] && packets[i].data;
     if (!record || typeof record !== "object") continue;
     const content = recordText(record);
     if (!content) continue;
@@ -318,7 +229,8 @@ export function buildHistoryTurns(records, self, { excludeText } = {}) {
   kept.reverse();
 
   return kept.map((record) => {
-    const isAgent = firstString(record.from, record.senderRole).toLowerCase() === "agent" || Boolean(record.agentName);
+    const isAgent =
+      firstString(record.from, record.senderRole).toLowerCase() === "agent" || Boolean(record.agentName);
     const mentions = Array.isArray(record.mentions) ? record.mentions : [];
     const authoredByMe = isAgent && isMe(record.agentName);
     const directedToMe = mentions.some((m) => {
@@ -328,10 +240,15 @@ export function buildHistoryTurns(records, self, { excludeText } = {}) {
     return {
       role: authoredByMe ? "assistant" : "user",
       content: recordText(record).slice(0, MAX_TURN_CHARS),
-      from: isAgent ? firstString(record.agentName, "agent") : firstString(record.fromName, record.username, "user"),
+      from: isAgent
+        ? firstString(record.agentName, "agent")
+        : firstString(record.fromName, record.username, "user"),
       to: mentions
         .filter((m) => m && typeof m === "object")
-        .map((m) => ({ name: typeof m.name === "string" ? m.name : undefined, handle: typeof m.handle === "string" ? m.handle : undefined })),
+        .map((m) => ({
+          name: typeof m.name === "string" ? m.name : undefined,
+          handle: typeof m.handle === "string" ? m.handle : undefined,
+        })),
       directedToMe,
     };
   });

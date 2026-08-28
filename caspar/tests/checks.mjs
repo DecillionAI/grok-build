@@ -45,7 +45,7 @@ import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
 import { OutboundMediaCollector } from "../outboundMedia.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
 import { buildResult, normalizeUsage } from "../result.mjs";
-import { buildHistoryTurns, fetchSpaceHistoryDirect, fetchSpaceHistoryRecords } from "../spaceHistory.mjs";
+import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, readSpaceSignals, KIND } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
 import { ToolInvoker } from "../toolInvoker.mjs";
 import { ToolSocketServer } from "../toolSocket.mjs";
@@ -813,6 +813,7 @@ async function serveWithFakeCli({ scenario, delivery, envOverrides = {}, catalog
     return {
       result,
       signals: gateway.signals(),
+      storeSignals: gateway.storeSignals(),
       invocation: fs.existsSync(record) ? JSON.parse(fs.readFileSync(record, "utf-8")) : null,
       workspaceRoot,
     };
@@ -825,10 +826,13 @@ async function serveWithFakeCli({ scenario, delivery, envOverrides = {}, catalog
 }
 
 await check("a served prompt streams its trajectory and replies exactly once", async () => {
-  const { result, signals, invocation } = await serveWithFakeCli({ scenario: successScenario("The deploy is green.") });
+  const { result, signals, storeSignals, invocation } = await serveWithFakeCli({ scenario: successScenario("The deploy is green.") });
 
-  const steps = signals.filter((s) => s.packet.kind === "davinci/step");
   const finals = signals.filter((s) => s.packet.kind === "davinci/result");
+  // In a space, every step of the run is a signal ON that space: the node
+  // records it in the signal log and fans it out live in the same delivery.
+  const steps = storeSignals.filter((s) => s.tags.includes("kind=step") || s.tags.includes("kind=toolcall"));
+  const answers = storeSignals.filter((s) => s.tags.includes("kind=answer"));
 
   assert.equal(finals.length, 1, "exactly one terminal result");
   assert.equal(finals[0].userId, "8@global", "the terminal result goes back through the proxy (replyTo)");
@@ -836,15 +840,28 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.equal(finals[0].packet.stream, false);
   assert.equal(finals[0].packet.correlationId, "corr-1");
 
-  assert.ok(steps.length >= 6, `expected the whole trajectory to stream, saw ${steps.length}`);
-  assert.ok(
-    steps.every((s) => s.userId === "9@global"),
-    "steps go straight to the prompting user's creature (streamTo), so the proxy correlation carries only the result",
+  assert.equal(
+    signals.filter((s) => s.packet.kind === "davinci/step").length,
+    0,
+    "a run inside a space never pushes steps straight at a user — the store fan-out reaches every participant",
   );
-  assert.ok(steps.every((s) => s.packet.stream === true && s.packet.final === false));
-  assert.deepEqual(steps.map((s) => s.packet.seq), [1, 2, 3, 4, 5, 6, 7]);
-  assert.deepEqual(steps.map((s) => s.packet.channel), ["status", "thought", "plan", "observation", "action", "observation", "final"]);
-  assert.equal(steps[1].packet.event.message, "They want the deploy status.");
+  assert.ok(steps.length >= 6, `expected the whole trajectory to be recorded, saw ${steps.length}`);
+  assert.ok(steps.every((s) => s.storeId === "space-1"));
+  assert.ok(steps.every((s) => s.tags.includes("run=corr-1")), "every step carries its run tag");
+  assert.ok(steps.every((s) => s.tags.includes("thread=main")), "every step carries its thread tag");
+  assert.deepEqual(steps.map((s) => s.data.seq), [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(
+    steps.map((s) => s.data.channel),
+    ["status", "thought", "plan", "observation", "action", "observation", "final"],
+  );
+  // A tool call is labelled as one, so an agent's tool trail is filterable.
+  assert.deepEqual(
+    steps.filter((s) => s.tags.includes("kind=toolcall")).map((s) => s.data.channel),
+    ["action"],
+  );
+  assert.equal(steps[1].data.event.message, "They want the deploy status.");
+  assert.equal(answers.length, 1, "the final answer is recorded once, as a chat turn");
+  assert.equal(answers[0].data.text, "The deploy is green.");
 
   // The reply the backend bills and the client renders.
   assert.equal(result.success, true);
@@ -889,19 +906,19 @@ await check("a quiet run still streams heartbeats so the client does not time it
       ...successScenario("done").messages.slice(1),
     ],
   };
-  const { signals, result } = await serveWithFakeCli({
+  const { storeSignals, result } = await serveWithFakeCli({
     scenario: quietScenario,
     envOverrides: { GROK_CREATURE_STREAM_HEARTBEAT_MS: "80" },
   });
-  const heartbeats = signals.filter((s) => s.packet.kind === "davinci/step" && s.packet.channel === "heartbeat");
+  const heartbeats = storeSignals.filter((s) => s.data.channel === "heartbeat");
   assert.ok(heartbeats.length >= 1, `expected at least one heartbeat during the quiet stretch, saw ${heartbeats.length}`);
   assert.ok(
-    heartbeats.every((s) => s.userId === "9@global" && s.packet.stream === true && s.packet.final === false),
-    "heartbeats ride the same live stream (streamTo) as ordinary steps, non-terminal",
+    heartbeats.every((s) => s.temp === true),
+    "a heartbeat is delivered live but never recorded — it is not work",
   );
   assert.ok(
-    heartbeats.every((s) => s.packet.correlationId === "corr-1"),
-    "each heartbeat carries the run's correlation so the client can match it",
+    heartbeats.every((s) => s.tags.includes("run=corr-1")),
+    "each heartbeat carries the run's tag so the client can match it",
   );
   // The heartbeat is purely a keep-alive: the run still finishes and replies.
   assert.equal(result.success, true);
@@ -1266,15 +1283,31 @@ await check("a run that never finishes is ended by its wall-clock budget", async
   assert.equal(signals.filter((s) => s.packet.kind === "davinci/result").length, 1);
 });
 
-await check("with no streamTo, steps ride the proxy as non-terminal chunks", async () => {
+await check("a run with no space pushes its steps straight at the requester", async () => {
+  // A spaceless prompt (the market advisor staffing a brief) has no store to
+  // post to, so the steps go to the requester's own connection instead.
+  const { signals, storeSignals } = await serveWithFakeCli({
+    scenario: successScenario(),
+    delivery: proxyDelivery({ extra: { spaceId: "" } }),
+  });
+  assert.equal(storeSignals.length, 0, "no space, so nothing is posted to a store");
+  const steps = signals.filter((s) => s.packet.kind === "davinci/step");
+  assert.ok(steps.length > 0);
+  assert.ok(steps.every((s) => s.userId === "9@global"), "steps go to the prompting user (streamTo)");
+  assert.ok(
+    steps.every((s) => s.packet.stream === true && s.packet.final === false),
+    "the node keeps the correlation open only for chunks marked non-terminal",
+  );
+});
+
+await check("with no space and no streamTo, steps ride the proxy as non-terminal chunks", async () => {
   const { signals } = await serveWithFakeCli({
     scenario: successScenario(),
-    delivery: proxyDelivery({ streamTo: "" }),
+    delivery: proxyDelivery({ streamTo: "", extra: { spaceId: "" } }),
   });
   const steps = signals.filter((s) => s.packet.kind === "davinci/step");
   assert.ok(steps.length > 0);
-  assert.ok(steps.every((s) => s.userId === "8@global"), "steps fall back to the proxy reply path");
-  assert.ok(steps.every((s) => s.packet.stream === true && s.packet.final === false), "the node keeps the correlation open only for chunks marked non-terminal");
+  assert.ok(steps.every((s) => s.userId === "8@global"), "steps address the proxy reply path");
 });
 
 for (const cleanup of cleanups) {
@@ -1288,13 +1321,14 @@ for (const cleanup of cleanups) {
 await check("space history records become annotated group-chat turns for the running agent", () => {
   const self = { id: "res-a", name: "Ada", handle: "ada" };
   const meMention = [{ id: "res-a", kind: "agent", name: "Ada", handle: "ada" }];
-  const records = [
-    { id: "00000000000000000001", from: "user", fromName: "Grace", text: "hi @ada", mentions: meMention, at: "2026-01-01T00:00:00Z" },
-    { id: "00000000000000000002", from: "agent", agentName: "Ada", text: "hello Grace", mentions: [], at: "2026-01-01T00:00:01Z" },
-    { id: "00000000000000000003", from: "agent", agentName: "Babbage", text: "@ada take a look", mentions: meMention, at: "2026-01-01T00:00:02Z" },
-    { id: "00000000000000000004", from: "user", fromName: "Grace", text: "current message", mentions: [], at: "2026-01-01T00:00:03Z" },
+  // Signal packets as `readSpaceSignals` yields them, oldest first.
+  const packets = [
+    { id: "s1", time: 1, tags: ["kind=message"], data: { from: "user", fromName: "Grace", text: "hi @ada", mentions: meMention } },
+    { id: "s2", time: 2, tags: ["kind=answer"], data: { from: "agent", agentName: "Ada", text: "hello Grace", mentions: [] } },
+    { id: "s3", time: 3, tags: ["kind=answer"], data: { from: "agent", agentName: "Babbage", text: "@ada take a look", mentions: meMention } },
+    { id: "s4", time: 4, tags: ["kind=message"], data: { from: "user", fromName: "Grace", text: "current message", mentions: [] } },
   ];
-  const turns = buildHistoryTurns(records, self, { excludeText: "current message" });
+  const turns = buildHistoryTurns(packets, self, { excludeText: "current message" });
   assert.equal(turns.length, 3, "the current message is excluded; the rest are kept oldest-first");
   // A human turn addressed to me.
   assert.deepEqual(turns[0], { role: "user", content: "hi @ada", from: "Grace", to: [{ name: "Ada", handle: "ada" }], directedToMe: true });
@@ -1308,86 +1342,67 @@ await check("space history records become annotated group-chat turns for the run
   assert.equal(turns[2].directedToMe, true);
 });
 
-await check("the backbone fetches space history by signalling the spaces/history creature", async () => {
-  const endpoint = { creatureId: "9@global", programId: "90@global", entityId: "main" };
-  const gateway = await new FakeGateway({
-    onCall: (op, input, gw) => {
-      if (op !== "signalUser" || input.key !== "creatures/signal") return { ok: true };
-      if (input.userId !== endpoint.programId) return { ok: true };
-      const packet = JSON.parse(input.packet);
-      // The endpoint peels data → payload(json) → { action, correlationId, payload:{storeId} },
-      // exactly as the app's shell signal does — assert we reproduced that envelope.
-      const layer1 = JSON.parse(packet.data);
-      const inner = JSON.parse(layer1.payload);
-      assert.equal(inner.action, "history");
-      assert.equal(inner.payload.storeId, "space-9");
-      // Reply the way the patched history creature does: on `creatures/signal`
-      // (a docker creature never receives `creatures/signal/result`).
-      setTimeout(() => {
-        gw.pushSignal("creatures/signal", {
-          ok: true,
-          namespace: "spaces",
-          action: "history",
-          correlationId: packet.correlationId,
-          history: [{ id: "00000000000000000001", from: "user", fromName: "Grace", text: "hi team", mentions: [] }],
-        });
-      }, 5);
-      return { ok: true };
+await check("the backbone reads the space's conversation from the node's tag-filtered signal log", async () => {
+  // The log reads newest-first; a conversation reads oldest-first.
+  const rows = [
+    { id: "s3", userId: "1@global", time: 3, tags: ["kind=answer", "thread=main"], data: JSON.stringify({ from: "agent", agentName: "Lead", text: "third" }) },
+    { id: "s2", userId: "1@global", time: 2, tags: ["kind=answer", "thread=main"], data: JSON.stringify({ from: "agent", agentName: "Lead", text: "second" }) },
+    { id: "s1", userId: "1@global", time: 1, tags: ["kind=message", "thread=main"], data: JSON.stringify({ from: "user", fromName: "Sam", text: "first" }) },
+  ];
+  let seen = null;
+  const bridge = {
+    async call(op, input) {
+      if (op !== "readSignals") return {};
+      seen = input;
+      return { ok: true, storeId: input.storeId, signals: rows };
     },
-  }).listen();
-  const bridge = await bridgeFromEnv({ env: { CASPAR_GATEWAY_HOST: "127.0.0.1", CASPAR_GATEWAY_PORT: String(gateway.port) }, timeoutMs: 5000 });
-  try {
-    const records = await fetchSpaceHistoryRecords(bridge, { endpoint, spaceId: "space-9", selfId: bridge.machineId, timeoutMs: 2000 });
-    assert.equal(records.length, 1, "the signalled history reply is received and returned");
-    assert.equal(records[0].text, "hi team");
-    const sent = gateway.signals().find((s) => s.userId === endpoint.programId);
-    assert.ok(sent, "a signal was sent to the history program");
-    assert.equal(sent.packet.store.id, "space-9", "the originating store is stamped on the envelope");
-    assert.equal(sent.packet.user.id, bridge.machineId, "the reply is addressed back to this creature's machine id");
-  } finally {
-    bridge.close();
-    await gateway.close();
-  }
+  };
+  const packets = await fetchSpaceConversation(bridge, { spaceId: "sp", threadId: "main" });
+  assert.equal(seen.storeId, "sp");
+  assert.deepEqual(seen.tagsAll, ["thread=main"], "the read is scoped to the run's thread");
+  assert.deepEqual(seen.tagsAny, ["kind=message", "kind=answer"], "only conversation kinds — never steps or tool calls");
+  const turns = buildHistoryTurns(packets, { name: "Writer" }, {});
+  assert.deepEqual(turns.map((t) => t.content), ["first", "second", "third"], "turns run oldest→newest");
 });
 
-await check("the backbone reads history straight from the store (getByPrefix fallback), any key shape", async () => {
-  // Canonical docs live at the base key (no trailing "::…"), exactly as
-  // writeSpaceHistory stores them.
-  const store = {
-    "Json::StoreHistory::sp::00000000000000000002": { text: "second", from: "agent", agentName: "Lead", threadId: "main" },
-    "Json::StoreHistory::sp::00000000000000000001": { text: "first", from: "user", fromName: "Sam", threadId: "main" },
-    "Json::StoreHistory::sp::00000000000000000003": { text: "third", from: "user", fromName: "Sam", threadId: "main" },
-  };
-  // getByPrefix may hand back a sub-key (a "::…" suffix) for a record; the reader
-  // must trim it back to the base id and dedupe, then read the base doc.
-  const prefixKeys = (prefix) => [
-    ...Object.keys(store).filter((k) => k.startsWith(prefix)),
-    `${prefix}00000000000000000003::sub`,
-  ];
-  const mkBridge = (prefixShape) => ({
-    async call(op, input) {
-      if (op === "getByPrefix") return prefixShape(prefixKeys(input.prefix));
-      if (op === "getJson") return { data: store[input.key] };
-      return {};
+await check("an unreadable signal log leaves the run with no history instead of failing it", async () => {
+  const throwing = { async call() { throw new Error("boom"); } };
+  assert.deepEqual(await readSpaceSignals(throwing, { spaceId: "sp" }), []);
+  assert.deepEqual(await readSpaceSignals(null, { spaceId: "sp" }), []);
+  // A row whose data is not JSON is skipped, not fatal.
+  const garbled = {
+    async call() {
+      return { signals: [{ id: "s1", data: "not json", tags: [], time: 1 }, { id: "s2", data: JSON.stringify({ text: "ok" }), tags: [], time: 2 }] };
     },
+  };
+  const rows = await readSpaceSignals(garbled, { spaceId: "sp" });
+  assert.equal(rows.length, 1, "the readable row survives its garbled neighbour");
+  assert.equal(rows[0].data.text, "ok");
+});
+
+await check("posting a turn tags it with kind, thread, agent, run and each mention", async () => {
+  let sent = null;
+  const bridge = { async call(op, input) { if (op === "signal") sent = input; return { ok: true }; } };
+  await postSpaceSignal(bridge, {
+    spaceId: "sp",
+    kind: KIND.ANSWER,
+    threadId: "t-7",
+    agentProgramId: "90@global",
+    correlationId: "abc123",
+    mentions: [{ programId: "91@global" }],
+    data: { text: "done" },
   });
-  const asBareArray = (keys) => ({ data: keys });
-  const asKeyObjects = (keys) => ({ keys: keys.map((k) => ({ key: k })) });
-  const asFullKeyStrings = (keys) => keys; // getByPrefix returned a raw array
+  assert.equal(sent.storeId, "sp");
+  assert.deepEqual(sent.tags, ["kind=answer", "thread=t-7", "agent=90@global", "run=abc123", "mention=91@global"]);
+  assert.equal(JSON.parse(sent.data).text, "done");
+  assert.equal(sent.temp, undefined, "a turn is persisted, never temp");
 
-  for (const shape of [asBareArray, asKeyObjects, asFullKeyStrings]) {
-    const recs = await fetchSpaceHistoryDirect(mkBridge(shape), "sp");
-    // Three keys, but the "::x" suffix collapses onto id 3 → 3 distinct records,
-    // newest last by zero-padded id.
-    assert.equal(recs.length, 3, "all distinct records read regardless of key shape");
-    const turns = buildHistoryTurns(recs, { name: "Writer" }, {});
-    assert.deepEqual(turns.map((t) => t.content), ["first", "second", "third"], "records ordered oldest→newest");
-  }
+  // A heartbeat is delivered but never recorded.
+  await postSpaceSignal(bridge, { spaceId: "sp", kind: KIND.STEP, threadId: "t-7", temp: true, data: {} });
+  assert.equal(sent.temp, true);
 
-  // A getByPrefix that throws yields no history rather than crashing the run.
-  const throwing = { async call(op) { if (op === "getByPrefix") throw new Error("boom"); return {}; } };
-  assert.deepEqual(await fetchSpaceHistoryDirect(throwing, "sp"), []);
-  assert.deepEqual(await fetchSpaceHistoryDirect(null, "sp"), []);
+  // A turn with no space is a programming error, not a silent no-op.
+  await assert.rejects(() => postSpaceSignal(bridge, { spaceId: "", kind: KIND.ANSWER, data: {} }));
 });
 
 await check("the serve loop processes prompts in parallel — a slow prompt does not block others", async () => {

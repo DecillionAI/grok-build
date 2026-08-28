@@ -20,7 +20,7 @@
  */
 import crypto from "node:crypto";
 
-import { persistSpaceMessage, signalEndpointFromTask } from "./spaceHistory.mjs";
+import { postSpaceSignal, KIND } from "./spaceHistory.mjs";
 
 const DEFAULT_MAX_HOPS = 8;
 
@@ -32,18 +32,21 @@ const ORCH_NOTES = String(process.env.GROK_ORCH_NOTES ?? "").trim().toLowerCase(
 async function noteStall(bridge, task, reason) {
   if (!ORCH_NOTES || !bridge) return;
   try {
-    const endpoint = signalEndpointFromTask(task);
     const spaceId = String((task && (task.spaceId || task.storeId || task.space_id)) || "");
-    if (!endpoint || !spaceId) return;
-    await persistSpaceMessage(bridge, {
-      endpoint,
+    if (!spaceId) return;
+    const threadId = String((task && task.threadId) || "main") || "main";
+    await postSpaceSignal(bridge, {
       spaceId,
-      selfId: bridge.machineId || bridge.programId || "",
+      // A stalled hand-off is part of the run's work trail, not a chat turn, so
+      // it is a step: visible in the work view, never a bubble in the chat.
+      kind: KIND.STEP,
+      threadId,
+      correlationId: String((task && task.correlationId) || ""),
       data: {
         role: "system",
         kind: "orch-stall",
         text: `⚠️ Hand-off didn't continue: ${reason}`,
-        threadId: String((task && task.threadId) || "main") || "main",
+        threadId,
         at: new Date().toISOString(),
       },
     });
@@ -390,8 +393,6 @@ function forwardContext(task) {
   for (const k of [
     "billingEndpoint",
     "adminEndpoint",
-    "signalEndpoint",
-    "historyEndpoint",
     "routinesEndpoint",
     "schedulerProgramId",
     "projectBrief",

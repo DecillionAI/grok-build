@@ -74,6 +74,17 @@ export class FakeGateway {
     return this.calls.filter((c) => c.op === "signalUser").map((c) => ({ ...c.input, packet: JSON.parse(c.input.packet) }));
   }
 
+  /**
+   * The store signals posted through the `signal` host call, with `data` parsed
+   * and `tags` as sent. This is how a turn reaches a space: the node records it
+   * in the store's signal log and fans it out live in one delivery.
+   */
+  storeSignals() {
+    return this.calls
+      .filter((c) => c.op === "signal")
+      .map((c) => ({ ...c.input, data: JSON.parse(c.input.data || "{}") }));
+  }
+
   _onConnection(socket) {
     this.sockets.add(socket);
     socket.on("close", () => this.sockets.delete(socket));

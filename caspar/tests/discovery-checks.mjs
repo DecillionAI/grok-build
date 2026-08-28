@@ -25,7 +25,8 @@ import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSp
 import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
-import { persistSpaceMessage, signalEndpointFromTask } from "../spaceHistory.mjs";
+import { postSpaceSignal, KIND } from "../spaceHistory.mjs";
+import { uploadOutboundMedia } from "../mediaUpload.mjs";
 import { FakeGateway } from "./fakeGateway.mjs";
 
 const GREEN = "\x1b[0;32m";
@@ -437,50 +438,73 @@ async function main() {
     });
   });
 
-  await check("signalEndpointFromTask reads the spaces/signal address, null when absent", () => {
-    assert.equal(signalEndpointFromTask({}), null);
-    assert.equal(signalEndpointFromTask({ signalEndpoint: {} }), null); // no programId
-    const ep = signalEndpointFromTask({ signalEndpoint: { programId: "p-sig", entityId: "main", creatureId: "c-sig" } });
-    assert.deepEqual(ep, { programId: "p-sig", entityId: "main", creatureId: "c-sig" });
-    // snake_case + default entity
-    const ep2 = signalEndpointFromTask({ signal_endpoint: { program_id: "p2" } });
-    assert.equal(ep2.programId, "p2");
-    assert.equal(ep2.entityId, "main");
-  });
-
-  await check("persistSpaceMessage signals spaces/signal with persist:true and the message data", async () => {
+  await check("an agent's answer is posted as one persistent signal on the space", async () => {
     const calls = [];
     const bridge = {
       machineId: "self-1",
-      signalUser: async (key, target, packet) => {
-        calls.push({ key, target, packet });
-        return { ok: true };
+      call: async (op, input) => {
+        calls.push({ op, input });
+        return { ok: true, persisted: true, signalId: "row-1" };
       },
     };
-    const data = { text: "done", from: "agent", msgId: "cid-1", threadId: "main" };
-    const ok = await persistSpaceMessage(bridge, {
-      endpoint: { programId: "p-sig", entityId: "main" },
+    const data = { text: "done", from: "agent", runId: "cid-1", threadId: "main" };
+    await postSpaceSignal(bridge, {
       spaceId: "space-1",
-      selfId: "self-1",
+      kind: KIND.ANSWER,
+      threadId: "main",
+      agentProgramId: "p-agent",
+      correlationId: "cid-1",
       data,
     });
-    assert.equal(ok, true);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].key, "creatures/signal");
-    assert.equal(calls[0].target, "p-sig");
-    // The outer StoresSend carries the store + a JSON `data` envelope whose inner
-    // payload is the persist:true spaces/signal call with our message data.
-    assert.equal(calls[0].packet.store.id, "space-1");
-    const env = JSON.parse(calls[0].packet.data);
-    assert.equal(env.programId, "p-sig");
-    const inner = JSON.parse(env.payload);
-    assert.equal(inner.action, "signal");
-    assert.equal(inner.payload.persist, true);
-    assert.equal(inner.payload.storeId, "space-1");
-    assert.deepEqual(inner.payload.data, data);
-    // Missing endpoint / space / bridge is a no-op, never a throw.
-    assert.equal(await persistSpaceMessage(null, { endpoint: {}, spaceId: "s", data }), false);
-    assert.equal(await persistSpaceMessage(bridge, { endpoint: null, spaceId: "s", data }), false);
+    assert.equal(calls.length, 1, "one host call — no creature round trip");
+    assert.equal(calls[0].op, "signal");
+    assert.equal(calls[0].input.storeId, "space-1");
+    assert.deepEqual(JSON.parse(calls[0].input.data), data);
+    assert.deepEqual(calls[0].input.tags, ["kind=answer", "thread=main", "agent=p-agent", "run=cid-1"]);
+  });
+
+  await check("agent media is uploaded as this creature and recorded as a reference", async () => {
+    const calls = [];
+    const bridge = {
+      call: async (op, input) => {
+        calls.push({ op, input });
+        return { ok: true, result: { ok: true, id: `file-${calls.length}`, contentType: input.payload.contentType } };
+      },
+    };
+    const { refs, failed } = await uploadOutboundMedia(bridge, [
+      { name: "chart.png", mimeType: "image/png", kind: "image", size: 12, dataBase64: "YmFzZTY0" },
+      // Already stored: passed through without a second upload.
+      { name: "prior.pdf", mimeType: "application/pdf", kind: "file", storageId: "file-existing" },
+    ]);
+    assert.equal(failed.length, 0);
+    assert.equal(calls.length, 1, "only the attachment carrying bytes is uploaded");
+    assert.equal(calls[0].op, "execShellAction");
+    assert.equal(calls[0].input.path, "/storage/upload");
+    assert.equal(calls[0].input.asSelf, true, "the upload runs as this creature, not a named identity");
+    assert.equal(calls[0].input.payload.dataBase64, "YmFzZTY0");
+    assert.deepEqual(refs[0], {
+      name: "chart.png",
+      mimeType: "image/png",
+      kind: "image",
+      size: 12,
+      storageId: "file-1",
+    });
+    assert.equal(refs[1].storageId, "file-existing");
+    // Bytes never survive into the record.
+    for (const ref of refs) assert.equal(ref.dataBase64, undefined);
+    // And no URL is baked in — a client builds it from the id against its own base.
+    for (const ref of refs) assert.equal(ref.url, undefined);
+  });
+
+  await check("an upload that fails is reported, not silently dropped", async () => {
+    const bridge = { call: async () => ({ ok: false, error: "file too large (max 10485760 bytes)" }) };
+    const { refs, failed } = await uploadOutboundMedia(bridge, [
+      { name: "huge.mov", mimeType: "video/quicktime", kind: "video", dataBase64: "YmFzZTY0" },
+    ]);
+    assert.equal(refs.length, 0);
+    assert.equal(failed.length, 1);
+    assert.equal(failed[0].name, "huge.mov");
+    assert.match(failed[0].error, /file too large/);
   });
 
   console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
