@@ -1382,7 +1382,15 @@ await check("an unreadable signal log leaves the run with no history instead of 
 
 await check("posting a turn tags it with kind, thread, agent, run and each mention", async () => {
   let sent = null;
-  const bridge = { async call(op, input) { if (op === "signal") sent = input; return { ok: true }; } };
+  // The node answers with what it DID: a recorded signal comes back
+  // `persisted: true`; a temp one is delivered and deliberately not recorded.
+  const bridge = {
+    async call(op, input) {
+      if (op !== "signal") return { ok: true };
+      sent = input;
+      return { ok: true, persisted: !input.temp, signalId: "sig-1", time: 5 };
+    },
+  };
   await postSpaceSignal(bridge, {
     spaceId: "sp",
     kind: KIND.ANSWER,
@@ -1403,6 +1411,17 @@ await check("posting a turn tags it with kind, thread, agent, run and each menti
 
   // A turn with no space is a programming error, not a silent no-op.
   await assert.rejects(() => postSpaceSignal(bridge, { spaceId: "", kind: KIND.ANSWER, data: {} }));
+
+  // A store that accepted the signal but did NOT record it has lost the turn:
+  // it was shown to whoever was connected and is gone by the next read. That
+  // must fail the post, not pass as a success.
+  const unrecorded = { async call() { return { ok: true, persisted: false }; } };
+  await assert.rejects(
+    () => postSpaceSignal(unrecorded, { spaceId: "sp", kind: KIND.ANSWER, data: { text: "lost" } }),
+    /did not record/,
+  );
+  // A heartbeat is the one thing allowed to go unrecorded.
+  await postSpaceSignal(unrecorded, { spaceId: "sp", kind: KIND.STEP, temp: true, data: {} });
 });
 
 await check("the serve loop processes prompts in parallel — a slow prompt does not block others", async () => {

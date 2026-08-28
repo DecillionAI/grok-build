@@ -143,6 +143,18 @@ export class FakeGateway {
         result = { ok: false, error: err?.message || String(err) };
       }
     }
+    // The node answers `signal` with what it did, not just that it heard: a
+    // recorded signal comes back `persisted: true` with its log row's id, and
+    // callers reject a non-temp signal that was not recorded. Model that here so
+    // a test exercises the same contract production does.
+    if (op === "signal" && result.ok !== false && result.persisted === undefined) {
+      result = {
+        ...result,
+        persisted: !input?.temp,
+        signalId: result.signalId ?? `sig-${this.calls.length}`,
+        time: result.time ?? Date.now(),
+      };
+    }
     for (const frame of encode(OP_RESPONSE, corr, result)) socket.write(frame);
   }
 }

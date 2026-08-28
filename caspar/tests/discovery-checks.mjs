@@ -537,7 +537,12 @@ async function main() {
     // a creature naming itself, which the node must not honour — and which this
     // backbone must therefore never send.
     let sent = null;
-    const bridge = { call: async (op, input) => { sent = input; return { ok: true }; } };
+    const bridge = {
+      call: async (op, input) => {
+        sent = input;
+        return { ok: true, persisted: true, signalId: "sig-1", time: 5 };
+      },
+    };
     await postSpaceSignal(bridge, { spaceId: "sp", kind: KIND.ANSWER, data: { text: "hi" } });
     assert.equal(sent.userId, undefined, "the caller must not declare an identity");
     assert.equal(sent.storeId, "sp");
