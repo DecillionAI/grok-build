@@ -55,11 +55,19 @@ export class ToolInvoker {
    * @param bridge   connected `CasparBridgeClient`
    * @param byName   MCP tool name → catalog entry (from `buildToolDefinitions`)
    * @param selfId   this creature's node-assigned id, used as `reply_to`
+   * @param options.callerId  the HUMAN this call is made for, when there is one
+   *   (the direct-tool path: the billing quote's payer). `reply_to` has to stay
+   *   this creature's id — it is how the tool's answer routes back — so the
+   *   person travels alongside it as `caller_id`, which the tool runtime stamps
+   *   as `__caller_id`. Left unset for an agent's own tool calls, so a tool that
+   *   gates on its owner (github's sharing, zapier's connections) sees an agent
+   *   as an agent rather than as the person who is paying for the run.
    */
   constructor(bridge, byName, selfId, options = {}) {
     this.bridge = bridge;
     this.byName = byName;
     this.selfId = selfId;
+    this.callerId = options.callerId ? String(options.callerId) : "";
     this.waiters = new Map(); // correlationId -> resolve
     this.usage = [];
     this.authorizedToolIds = options.authorizedToolIds
@@ -126,6 +134,7 @@ export class ToolInvoker {
       tool_id: entry.tool_id || entry.programId || target,
       function: String(fn),
       payload,
+      ...(this.callerId ? { caller_id: this.callerId } : {}),
     };
 
     const timeoutMs = Number(entry.max_exec_seconds || entry.maxExecSeconds || DEFAULT_TIMEOUT_SECONDS) * 1000;

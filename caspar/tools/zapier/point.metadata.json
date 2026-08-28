@@ -1,0 +1,235 @@
+{
+  "isMcp": true,
+  "kind": "tool",
+  "tool_id": "zapier",
+  "name": "zapier",
+  "vm_name": "zapier-vm",
+  "machine_id": "zapier-machine",
+  "image_name": "zapier-tool:latest",
+  "container_name": "tool-zapier",
+  "category": "automation",
+  "description": "Act in every app a person connected to Zapier — Gmail, Slack, Google Calendar, Sheets, Notion, HubSpot, Jira, Trello and thousands more. A member connects their Zapier account and authorizes each app once from the tool's Connect screen; after that this tool lists the apps and actions their account exposes and runs any of them on their behalf. Zapier holds the app credentials, so no third-party token ever reaches an agent.",
+  "usecases": [
+    "you need to send an email, a Slack/Teams message, or an SMS on the user's behalf",
+    "you need to create, find or update something in the user's calendar, spreadsheet, CRM, docs, notes or issue tracker",
+    "the user asks you to \"put this in\" / \"send this to\" / \"add this to\" a named app (Gmail, Slack, Notion, HubSpot, Sheets, Jira, Trello, …)",
+    "you need to know which apps and accounts this user has actually connected before promising to act in one",
+    "a piece of work has to leave Decillion and land in the user's real tools"
+  ],
+  "howToTalk": "Signal it with `function` naming the operation. Work in three steps and it stays cheap: `apps` lists the connected apps; `actions` searches the available actions (`query` for words, `app` to scope, `limit` to size — returns compact rows, never schemas); `describe` returns one action's parameters (`tool` = its exact name); `run` executes one (`tool` = the exact action name, `params` = an object of its fields, and/or `instructions` = a plain-English brief Zapier uses to fill anything you left out). Never pass a Zapier action name in `action` — that key selects this creature's own operation; use `tool`. Connection: `status` (default), `connect`, `disconnect`, `set_shared`, `refresh`. No tokens or credentials are ever passed in — the connection is stored server-side.",
+  "prompt": "Use this to actually do things in the user's own apps. The user connected their Zapier account, so every app they authorized there is reachable here, and Zapier holds those credentials — you never see an app's token. Discover before acting: `apps` to see what is connected, `actions` (with `query`/`app`) to find the right action, `describe` for its parameters, then `run` with `tool` = the exact action name plus `params` and/or a plain-English `instructions`. Prefer one `run` with good arguments over guessing repeatedly. If a run comes back with `needs_auth`, that app's account is not authorized in Zapier — tell the person to open the Zapier tool and reauthorize it rather than retrying. If nothing is connected, say so and point them at the tool's Connect screen instead of pretending the action happened.",
+  "request_point": "tool::zapier::request",
+  "response_point": "tool::zapier::response",
+  "risk_level": "high",
+  "risk": "high",
+  "requires_network": true,
+  "requiresNetwork": true,
+  "bindSpace": true,
+  "autoAttach": false,
+  "function": "status",
+  "requiredArgs": [
+    "function"
+  ],
+  "categories": [
+    "automation",
+    "integration",
+    "communication"
+  ],
+  "routes": {
+    "automation": "run",
+    "integration": "actions",
+    "communication": "run"
+  },
+  "argSchema": {
+    "function": {
+      "type": "string",
+      "description": "operation: status (default) | apps | actions | describe | run | connect | connect_wait | disconnect | set_shared | refresh"
+    },
+    "tool": {
+      "type": "string",
+      "description": "for describe/run: the exact Zapier action name, e.g. gmail_send_email or google_calendar_create_detailed_event"
+    },
+    "params": {
+      "type": "object",
+      "description": "for run: the action's fields as an object (see describe). Anything omitted is filled by Zapier from instructions."
+    },
+    "instructions": {
+      "type": "string",
+      "description": "for run: a plain-English brief of what to do; Zapier uses it to fill any field you did not pass"
+    },
+    "query": {
+      "type": "string",
+      "description": "for actions: words to search the available actions for"
+    },
+    "app": {
+      "type": "string",
+      "description": "for actions: scope the list to one app, e.g. gmail, slack, google_calendar"
+    },
+    "limit": {
+      "type": "number",
+      "description": "for actions: how many rows to return (1-200, default 40)"
+    },
+    "refresh": {
+      "type": "boolean",
+      "description": "for apps/actions: re-read the action list from Zapier instead of using the cache"
+    },
+    "token": {
+      "type": "string",
+      "description": "for connect (front-end only): the Zapier MCP connection token the person pasted"
+    },
+    "scope": {
+      "type": "string",
+      "description": "for connect/disconnect: space (default — the project's agents may use it) or personal"
+    },
+    "shared": {
+      "type": "boolean",
+      "description": "for set_shared: may the space's members and agents use this connection"
+    }
+  },
+  "tools": [
+    {
+      "name": "status",
+      "desc": "which Zapier account this space uses, who connected it, and how many apps and actions it exposes; the default operation",
+      "args": {},
+      "widget": {
+        "heading": "Zapier",
+        "sub": ["label"],
+        "details": ["connected", "app_count", "action_count"]
+      }
+    },
+    {
+      "name": "apps",
+      "desc": "list the apps reachable through the connected Zapier account, with how many actions each exposes",
+      "args": {
+        "refresh": {
+          "type": "BOOLEAN",
+          "desc": "re-read the list from Zapier instead of using the cache"
+        }
+      },
+      "widget": {
+        "heading": "Connected apps",
+        "list": ["apps"],
+        "row": {
+          "title": ["label", "app"],
+          "subtitle": ["summary"]
+        },
+        "sub": ["action_count"]
+      }
+    },
+    {
+      "name": "actions",
+      "desc": "search or list the actions the connected Zapier account can run; returns compact rows, never full schemas",
+      "args": {
+        "query": {
+          "type": "STRING",
+          "desc": "words to search for, e.g. \"send email\" or \"create calendar event\""
+        },
+        "app": {
+          "type": "STRING",
+          "desc": "scope to one app, e.g. gmail, slack, google_calendar"
+        },
+        "limit": {
+          "type": "NUMBER",
+          "desc": "how many rows to return (1-200, default 40)"
+        }
+      },
+      "widget": {
+        "heading": "Zapier actions",
+        "list": ["actions"],
+        "row": {
+          "title": ["title", "name"],
+          "subtitle": ["summary"]
+        },
+        "sub": ["query"]
+      }
+    },
+    {
+      "name": "describe",
+      "desc": "show one action's parameters — what run accepts in params",
+      "args": {
+        "tool": {
+          "type": "STRING",
+          "desc": "the exact action name, e.g. gmail_send_email"
+        }
+      },
+      "widget": {
+        "heading": "Action",
+        "sub": ["name"],
+        "text": ["description"],
+        "list": ["params"],
+        "row": {
+          "title": ["name"],
+          "subtitle": ["description"]
+        }
+      }
+    },
+    {
+      "name": "run",
+      "desc": "execute one Zapier action against the user's connected accounts — send the email, post the message, create the row",
+      "args": {
+        "tool": {
+          "type": "STRING",
+          "desc": "the exact action name to run, e.g. slack_send_channel_message"
+        },
+        "params": {
+          "type": "OBJECT",
+          "desc": "the action's fields as an object (see describe)"
+        },
+        "instructions": {
+          "type": "STRING",
+          "desc": "a plain-English brief; Zapier fills any field you did not pass from it"
+        }
+      },
+      "widget": {
+        "heading": "Zapier",
+        "sub": ["title"],
+        "text": ["text"],
+        "details": ["tool", "app_label"]
+      }
+    },
+    {
+      "name": "connect",
+      "desc": "connect a Zapier account to this space (or return how to), so its apps become available",
+      "args": {
+        "scope": {
+          "type": "STRING",
+          "desc": "space (default) or personal"
+        }
+      },
+      "widget": {
+        "heading": "Connect Zapier",
+        "text": ["instructions"],
+        "list": ["steps"],
+        "row": {
+          "title": ["text"],
+          "url": ["url"]
+        }
+      }
+    },
+    {
+      "name": "refresh",
+      "desc": "re-read the action list from Zapier after adding or removing apps and actions there",
+      "args": {}
+    },
+    {
+      "name": "disconnect",
+      "desc": "drop the stored Zapier connection (only the member who connected it may)",
+      "args": {
+        "scope": {
+          "type": "STRING",
+          "desc": "space (default) or personal"
+        }
+      }
+    },
+    {
+      "name": "set_shared",
+      "desc": "owner-only: choose whether the space's members and agents may use this Zapier connection",
+      "args": {
+        "shared": {
+          "type": "BOOLEAN",
+          "desc": "true to let the space and its agents use it, false to keep it to yourself"
+        }
+      }
+    }
+  ]
+}
