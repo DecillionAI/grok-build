@@ -146,7 +146,8 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
   // tools (see the module comment and the group-chat preamble). Drop any that
   // leak in so this section only ever lists real, synchronously-callable tools.
   const tools = list.filter((c) => c.kind !== "agent");
-  if (!tools.length) return "";
+  const attachedMcp = Array.isArray(opts.mcpServers) ? opts.mcpServers.filter((m) => m && m.name) : [];
+  if (!tools.length && !attachedMcp.length) return "";
 
   /**
    * Render one capability with its inline schema so the model can call it
@@ -227,6 +228,37 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
 
   const sections = [];
   if (tools.length) sections.push(`Tools & creatures you can call:\n${tools.map(render).join("\n")}`);
+
+  /**
+   * MCP servers the project attached (`opts.mcpServers`, from
+   * `mcpAttach.mcpServerSummaries`). These are NOT Caspar creatures: the engine
+   * connects to each one itself and exposes its tools as
+   * `<server>__<tool>` — so the names cannot be listed up front, and the agent
+   * has to look them up. Naming the servers is what makes it look: without this
+   * the section above reads as the complete list of what it can do, and a
+   * server the project deliberately added never gets used.
+   */
+  const mcpServers = Array.isArray(opts.mcpServers) ? opts.mcpServers.filter((m) => m && m.name) : [];
+  if (mcpServers.length) {
+    const lines = mcpServers.map((m) => {
+      const bits = [`  • ${m.name}`];
+      if (m.label && m.label !== m.name) bits.push(`(${m.label})`);
+      if (m.description) bits.push(`— ${m.description}`);
+      else if (m.host) bits.push(`— ${m.host}`);
+      return bits.join(" ");
+    });
+    sections.push(
+      "MCP servers connected to this space — external services this project added, " +
+        "each with its own tools:\n" +
+        lines.join("\n") +
+        "\nTheir tools are named `<server>__<tool>` (e.g. `" +
+        mcpServers[0].name +
+        "__…`) and are called with `use_tool` exactly like the ones above. They are " +
+        "part of what you can do here: when a request matches one of these services, " +
+        "list its tools (`search_tool`, or your engine's tool list) and use them " +
+        "instead of saying you have no access to that service.",
+    );
+  }
 
   return (
     "=== WHAT YOU CAN DO IN THIS SPACE ===\n" +
@@ -320,14 +352,20 @@ export function projectRoutinesPreamble(task) {
  * final assistant message is what the user in the chat receives.
  *
  * `opts.capabilities` (from the merged tool catalog) enumerates the space's
- * tools/creatures/sub-agents for the model to plan over.
+ * tools/creatures/sub-agents for the model to plan over; `opts.mcpServers`
+ * names the remote MCP servers the project attached, whose tools the engine
+ * reaches directly.
  */
 export function buildSystemPrompt(task, opts = {}) {
   const parts = [];
   const group = groupChatPreamble(task);
   if (group) parts.push(group);
 
-  const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv, disabledBuiltins: opts.disabledBuiltins });
+  const capabilities = capabilitiesPreamble(opts.capabilities, {
+    sharedEnv: opts.sharedEnv,
+    disabledBuiltins: opts.disabledBuiltins,
+    mcpServers: opts.mcpServers,
+  });
   if (capabilities) parts.push(capabilities);
 
   const outcome = projectOutcomePreamble(task);

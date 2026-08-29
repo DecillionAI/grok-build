@@ -142,6 +142,7 @@ which the node relays while keeping the correlation open.
 | `orchestrate.mjs` | **Server-side agent orchestration.** After a run marked `serverOrchestrate` posts its answer, the backbone resolves the teammates it @mentioned (roster + program index), mints a **delegated** billing quote for each against the payer's pool (`billing/quote` with an explicit `payerUserId`, honoured because this backbone IS the settlement meter; bounded by the project's autonomous budget), and signals each teammate's proxy to run — so the @mention chain (and routine-fired runs) complete with **no client present**. `visited`/`maxHops` carry on the task, so the chain can't loop or double-launch; only backbone-minted (`autonomousQuote`) runs settle against the autonomous budget. Wired into `runtime.mjs`'s `startDelivery` (ensure-auth → serve → settle → fan out). |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
 | `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time — the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`) — and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
+| `mcpAttach.mjs` | The **MCP servers a project attached** (catalog entries of kind `mcp`): turns each into a native `[mcp_servers.<name>]` url entry for the CLI (bearer token / extra headers / SSE transport), and summarises them for the prompt. They are never callable Caspar creatures — the CLI dials them itself. |
 | `toolInvoker.mjs` | Employs a tool creature over the gateway and awaits its correlated `tools/result`. |
 | `toolSocket.mjs` / `mcpStdioServer.mjs` | The `caspar` MCP server Grok talks to, and its unix-socket link back to this process (which owns the single gateway connection). |
 | `grokRunner.mjs` | Runs the CLI headless: flags, per-agent LLM override, privilege drop, wall-clock kill. |
@@ -186,6 +187,20 @@ is `caspar__project_sandbox`. That qualified name is what the system prompt list
 reports: `events.mjs` unwraps a `use_tool` call so a step reads as the creature
 that was employed, not as the meta-tool it went through. The meta-tools are never
 put in a deny list — they are the agent's only route to the space.
+
+**MCP servers the project added.** A space can also carry remote **MCP servers**
+(Decillion lists them in the market; a project adds one from its tool manager).
+These are not creatures: `spaces/addProgram` copies the listing's endpoint and
+credentials onto the space's program index, `discovery.mjs` reads them like any
+other attached program, and `mcpAttach.mjs` writes each one into the run's
+`config.toml` as a native `[mcp_servers.*]` url entry — so the CLI speaks
+Streamable HTTP (or SSE) to it directly and its tools show up as
+`<server>__<tool>`, callable through the same `use_tool`. They are deliberately
+kept OUT of the `caspar` server's tool list (`catalog.buildToolDefinitions` drops
+`kind: "mcp"`): signalling one as a creature would wait for a `tools/result` that
+never comes. The capabilities preamble names each attached server, because the
+tool names come from the server itself and the agent has to look them up.
+Credentials reach only the run's config file — never the prompt, never a client.
 
 When the space has a **shared cloud sandbox** (the per-space machine Decillion
 publishes as a `category: "execution"` tool), the prompt names it as the space's

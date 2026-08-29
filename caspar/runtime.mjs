@@ -47,7 +47,7 @@ import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
 import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
-import { httpMcpServersFromCatalog } from "./mcpAttach.mjs";
+import { httpMcpServersFromCatalog, mcpServerSummaries } from "./mcpAttach.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.mjs";
 import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
@@ -427,7 +427,13 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     log("GROK_BOOT", { tool_bridge_error: String(err?.message || err) });
     socketServer = null;
   }
+  // MCP servers the project attached (catalog entries of kind `mcp`). The CLI
+  // speaks Streamable HTTP to them itself, so they are config entries, not
+  // creatures to signal — and the prompt names them so the agent knows they are
+  // part of what it can do here.
   mcpServers = { ...(mcpServers || {}), ...httpMcpServersFromCatalog(catalog) };
+  const attachedMcpServers = mcpServerSummaries(catalog);
+  if (attachedMcpServers.length) log("GROK_BOOT", { mcp_servers: attachedMcpServers.map((m) => m.name) });
 
   // If the space has a sandbox creature attached, also swap Grok's built-in
   // filesystem and shell over to that shared machine.
@@ -536,7 +542,12 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     }
   }
 
-  const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
+  const systemPrompt = buildSystemPrompt(task, {
+    capabilities,
+    sharedEnv,
+    disabledBuiltins: disallowedTools,
+    mcpServers: attachedMcpServers,
+  });
   const prompt = buildUserPrompt(task, { objective, attachments, extractedTexts, workspace });
   // With inline media, the turn becomes ACP content blocks: the composed text
   // first, then each image/audio block. Without any, `promptBlocks` stays null and

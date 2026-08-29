@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 
 import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
+import { httpMcpServersFromCatalog } from "../mcpAttach.mjs";
 import { DEFAULT_BUILTIN_FS_TOOLS, SANDBOX_LOCAL_FS_READERS, disallowedBuiltinTools } from "../grokRunner.mjs";
 import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
 import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
@@ -355,6 +356,45 @@ async function main() {
       // The index carries descriptors inline — no per-member getCreature needed.
       assert.equal(gw.calls.filter((c) => c.op === "getCreature").length, 0, "no getCreature round-trips");
       assert.ok(gw.calls.some((c) => c.op === "getJson"), "read the program index over the gateway");
+    });
+  });
+
+  await check("an attached MCP server becomes a config server, never a callable creature", async () => {
+    // A project attaches an MCP listing; `spaces/addProgram` copies the market
+    // listing's connection onto the index record (hydrateMcpAttach). That is
+    // where the backbone reads it from — the app never holds the credentials.
+    const programIndex = {
+      "px-linear": {
+        programId: "px-linear", creatureId: "cx-linear", entityId: "mcp",
+        metadata: {
+          kind: "mcp",
+          name: "Linear",
+          descriptor: {
+            kind: "mcp",
+            name: "Linear",
+            description: "issues and projects",
+            mcpUrl: "https://mcp.linear.app/mcp",
+            mcpToken: "lin_tok",
+          },
+        },
+      },
+      "px-sandbox": {
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "sandbox",
+        metadata: { name: "sandbox", descriptor: SANDBOX_META.public.decillion },
+      },
+    };
+    await withBridge(nodeBehaviour({ members: [], metaById: {}, programIndex }), async (bridge) => {
+      const entries = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
+      const linear = entries.find((e) => e.program_id === "px-linear");
+      assert.equal(linear.kind, "mcp");
+      assert.equal(linear.mcp_url, "https://mcp.linear.app/mcp", "the connection reaches the run");
+      // Signalling an MCP listing as a creature would hang on a tools/result
+      // that never comes: it is a config entry for the CLI, not a target.
+      const { tools } = buildToolDefinitions(entries);
+      assert.deepEqual(tools.map((t) => t.name), ["sandbox"]);
+      const servers = httpMcpServersFromCatalog(entries);
+      assert.equal(servers.Linear.url, "https://mcp.linear.app/mcp");
+      assert.match(servers.Linear.headers.Authorization, /Bearer lin_tok/);
     });
   });
 
