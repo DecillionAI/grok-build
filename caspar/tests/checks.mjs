@@ -1141,6 +1141,51 @@ await check("attached HTTP MCP servers are written as [mcp_servers.*] url entrie
   assert.match(toml, /\[mcp_servers\.caspar\]/);
 });
 
+await check("an MCP listing with no reachable url is not written as a server", async () => {
+  const { httpMcpServersFromCatalog, mcpServerSummaries } = await import("../mcpAttach.mjs");
+  // An attach the market creature never hydrated (or a redacted read) carries a
+  // host but no url — dialling it would fail at CLI startup, so it is dropped.
+  const catalog = [{ name: "Half", kind: "mcp", mcpHost: "mcp.half.dev", program_id: "mcp-2" }];
+  assert.deepEqual(httpMcpServersFromCatalog(catalog), {});
+  assert.deepEqual(mcpServerSummaries(catalog), []);
+});
+
+await check("an SSE MCP server declares its transport", async () => {
+  const { renderConfigToml } = await import("../grokConfig.mjs");
+  const { httpMcpServersFromCatalog } = await import("../mcpAttach.mjs");
+  const servers = httpMcpServersFromCatalog([
+    { name: "Notion", kind: "mcp", mcp_url: "https://mcp.notion.com/stream", mcp_transport: "sse", program_id: "mcp-3" },
+  ]);
+  assert.equal(servers.Notion.type, "sse");
+  assert.match(renderConfigToml({ mcpServers: servers }), /type = "sse"/);
+});
+
+await check("the prompt names the space's MCP servers as things the agent can use", async () => {
+  const { capabilitiesPreamble } = await import("../prompt.mjs");
+  const { mcpServerSummaries } = await import("../mcpAttach.mjs");
+  const mcpServers = mcpServerSummaries([
+    {
+      name: "Linear",
+      kind: "mcp",
+      description: "issues and projects",
+      mcpUrl: "https://mcp.linear.app/mcp",
+      program_id: "mcp-1",
+    },
+  ]);
+  const withTools = capabilitiesPreamble(
+    [{ name: "caspar__sandbox", description: "the shared machine", kind: "tool" }],
+    { mcpServers },
+  );
+  assert.match(withTools, /caspar__sandbox/, "the space's own creatures are still listed");
+  assert.match(withTools, /Linear/, "an attached MCP server must be named");
+  assert.match(withTools, /Linear__/, "the agent must be told how its tools are named");
+  assert.doesNotMatch(withTools, /mcp\.linear\.app\/mcp/, "no credential-bearing url in the prompt");
+  // A space whose only capability is an MCP server still gets the section.
+  const mcpOnly = capabilitiesPreamble([], { mcpServers });
+  assert.match(mcpOnly, /Linear/);
+  assert.equal(capabilitiesPreamble([], {}), "", "no tools and no MCP servers = no section");
+});
+
 await check("a native/default-backbone run still gets a bounded idle timeout + retries", async () => {
   // The prior stall fix only wrote resilience knobs into the per-agent
   // `[model.<id>]` block, so an agent on the creature's own backbone (no

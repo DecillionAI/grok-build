@@ -40,6 +40,7 @@ function tomlInlineTable(record) {
  * Render `config.toml`.
  *
  * @param opts.mcpServers `{ [name]: { command, args, env, startupTimeoutSec, toolTimeoutSec } }`
+ *   or, for a remote server, `{ [name]: { url, type, headers, … } }`.
  * @param opts.model      `{ name, model, baseUrl, apiKey, apiBackend, authScheme, headers, contextWindow }`
  * @param opts.defaultModel model name for `[models].default`
  * @param opts.modelDefaults run-wide `[models]` scalar defaults
@@ -110,6 +111,11 @@ export function renderConfigToml({ mcpServers = {}, model, defaultModel, modelDe
     if (url) {
       lines.push(`[mcp_servers.${tomlKey(name)}]`);
       lines.push(`url = ${tomlString(url)}`);
+      // The CLI infers SSE from a `/sse` url; a server that speaks SSE on some
+      // other path has to say so, which is what `type` is for.
+      if (typeof server.type === "string" && server.type.trim()) {
+        lines.push(`type = ${tomlString(server.type.trim())}`);
+      }
       const headers = tomlInlineTable(server.headers);
       if (headers) lines.push(`headers = ${headers}`);
       if (Number.isFinite(server.startupTimeoutSec)) lines.push(`startup_timeout_sec = ${Math.floor(server.startupTimeoutSec)}`);

@@ -134,7 +134,10 @@ export function extractDescriptor(resp) {
 function describeDescriptor(d) {
   const uses = Array.isArray(d.usecases) && d.usecases.length ? `Use when: ${d.usecases.join("; ")}.` : "";
   const how = d.howToTalk ? ` How to talk to it: ${d.howToTalk}` : "";
-  return `${uses}${how}`.trim() || String(d.name || "creature");
+  // An MCP server is described by its listing copy — it has no arg schema and
+  // no "how to talk": its own tools are named by the server once connected.
+  const desc = typeof d.description === "string" ? d.description.trim() : "";
+  return `${uses}${how}`.trim() || desc || String(d.name || "creature");
 }
 
 /**
@@ -151,6 +154,7 @@ export function entryFromDescriptor(d, routing) {
   const entityId = routing.entityId || (kind === "agent" ? "agent" : kind === "mcp" ? "mcp" : "main");
   const mcpUrl = String(d.mcpUrl || d.mcp_url || "").trim();
   const mcpToken = String(d.mcpToken || d.mcp_token || "").trim();
+  const mcpTransport = String(d.mcpTransport || d.mcp_transport || "").trim().toLowerCase();
   return {
     name: String(d.name || routing.programId || routing.creatureId || "creature"),
     kind,
@@ -174,6 +178,7 @@ export function entryFromDescriptor(d, routing) {
     ...(mcpUrl ? { mcp_url: mcpUrl, mcpUrl } : {}),
     ...(mcpToken ? { mcp_token: mcpToken, mcpToken } : {}),
     ...(d.mcpHeaders && typeof d.mcpHeaders === "object" ? { mcp_headers: d.mcpHeaders, mcpHeaders: d.mcpHeaders } : {}),
+    ...(mcpTransport ? { mcp_transport: mcpTransport, mcpTransport } : {}),
   };
 }
 
