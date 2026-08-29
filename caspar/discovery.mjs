@@ -179,6 +179,9 @@ export function entryFromDescriptor(d, routing) {
     ...(mcpToken ? { mcp_token: mcpToken, mcpToken } : {}),
     ...(d.mcpHeaders && typeof d.mcpHeaders === "object" ? { mcp_headers: d.mcpHeaders, mcpHeaders: d.mcpHeaders } : {}),
     ...(mcpTransport ? { mcp_transport: mcpTransport, mcpTransport } : {}),
+    ...(d.mcpCommand ? { mcp_command: String(d.mcpCommand), mcpCommand: String(d.mcpCommand) } : {}),
+    ...(Array.isArray(d.mcpArgs) ? { mcp_args: d.mcpArgs, mcpArgs: d.mcpArgs } : {}),
+    ...(d.mcpEnv && typeof d.mcpEnv === "object" ? { mcp_env: d.mcpEnv, mcpEnv: d.mcpEnv } : {}),
   };
 }
 

@@ -1150,6 +1150,25 @@ await check("an MCP listing with no reachable url is not written as a server", a
   assert.deepEqual(mcpServerSummaries(catalog), []);
 });
 
+await check("attached stdio MCP servers are written as command entries", async () => {
+  const { renderConfigToml } = await import("../grokConfig.mjs");
+  const { httpMcpServersFromCatalog } = await import("../mcpAttach.mjs");
+  const servers = httpMcpServersFromCatalog([
+    {
+      name: "playwright",
+      kind: "mcp",
+      mcpCommand: "npx",
+      mcpArgs: ["-y", "@playwright/mcp@latest"],
+      program_id: "mcp-pw",
+    },
+  ]);
+  assert.equal(servers.playwright.command, "npx");
+  assert.deepEqual(servers.playwright.args, ["-y", "@playwright/mcp@latest"]);
+  const toml = renderConfigToml({ mcpServers: servers });
+  assert.match(toml, /\[mcp_servers\.playwright\]/);
+  assert.match(toml, /command = "npx"/);
+});
+
 await check("an SSE MCP server declares its transport", async () => {
   const { renderConfigToml } = await import("../grokConfig.mjs");
   const { httpMcpServersFromCatalog } = await import("../mcpAttach.mjs");

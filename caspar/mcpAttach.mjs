@@ -1,6 +1,7 @@
 /**
- * HTTP MCP servers attached to a space (kind: mcp), handed to Grok as native
- * `[mcp_servers.*]` URL entries so the CLI speaks Streamable HTTP itself.
+ * HTTP / stdio MCP servers attached to a space (kind: mcp), handed to Grok as
+ * native `[mcp_servers.*]` entries so the CLI speaks Streamable HTTP or spawns
+ * the command itself.
  */
 
 function slug(name) {
@@ -17,6 +18,19 @@ function bearerHeader(token) {
   return /^bearer\s+/i.test(t) ? t : `Bearer ${t}`;
 }
 
+function stringList(value) {
+  return (Array.isArray(value) ? value : []).map((x) => String(x)).filter(Boolean);
+}
+
+function stringMap(value) {
+  if (!value || typeof value !== "object") return {};
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k && v != null && String(v).trim()) out[String(k)] = String(v);
+  }
+  return out;
+}
+
 /** Every attached MCP listing, in catalog order, with its config-file name. */
 function attachedMcpEntries(catalog) {
   const out = [];
@@ -25,38 +39,40 @@ function attachedMcpEntries(catalog) {
     if (!entry || typeof entry !== "object") continue;
     if (String(entry.kind || "").toLowerCase() !== "mcp") continue;
     const url = String(entry.mcp_url || entry.mcpUrl || "").trim();
-    // A listing whose connection did not reach us (an unhydrated attach, a
-    // redacted read) is not something the CLI can dial — skip it rather than
-    // writing a server entry that fails at startup.
-    if (!/^https?:\/\//i.test(url)) continue;
+    const command = String(entry.mcp_command || entry.mcpCommand || "").trim();
+    // HTTP needs a real url; stdio needs a command. A redacted/unhydrated
+    // attach has neither the CLI can use — skip it.
+    if (!/^https?:\/\//i.test(url) && !command) continue;
     const base = slug(entry.name || entry.tool_id || "mcp");
     let name = base;
     let n = 2;
     while (taken.has(name)) name = `${base}_${n++}`;
     taken.add(name);
-    out.push({ name, url, entry });
+    out.push({ name, url, command, entry });
   }
   return out;
 }
 
-/** Catalog entries with kind mcp + an http(s) URL → grokConfig mcpServers map. */
+/** Catalog entries with kind mcp → grokConfig mcpServers map. */
 export function httpMcpServersFromCatalog(catalog) {
   const out = {};
-  for (const { name, url, entry } of attachedMcpEntries(catalog)) {
-    const headers = {};
-    const extra = entry.mcp_headers || entry.mcpHeaders;
-    if (extra && typeof extra === "object") {
-      for (const [k, v] of Object.entries(extra)) {
-        if (k && v != null && String(v).trim()) headers[String(k)] = String(v);
-      }
+  for (const { name, url, command, entry } of attachedMcpEntries(catalog)) {
+    if (url) {
+      const headers = stringMap(entry.mcp_headers || entry.mcpHeaders);
+      const auth = bearerHeader(entry.mcp_token || entry.mcpToken);
+      if (auth && !headers.Authorization && !headers.authorization) headers.Authorization = auth;
+      const transport = String(entry.mcp_transport || entry.mcpTransport || "").trim().toLowerCase();
+      out[name] = {
+        url,
+        ...(transport === "sse" ? { type: "sse" } : {}),
+        ...(Object.keys(headers).length ? { headers } : {}),
+      };
+      continue;
     }
-    const auth = bearerHeader(entry.mcp_token || entry.mcpToken);
-    if (auth && !headers.Authorization && !headers.authorization) headers.Authorization = auth;
-    const transport = String(entry.mcp_transport || entry.mcpTransport || "").trim().toLowerCase();
     out[name] = {
-      url,
-      ...(transport === "sse" ? { type: "sse" } : {}),
-      ...(Object.keys(headers).length ? { headers } : {}),
+      command,
+      args: stringList(entry.mcp_args || entry.mcpArgs),
+      env: stringMap(entry.mcp_env || entry.mcpEnv),
     };
   }
   return out;
@@ -72,16 +88,19 @@ export function httpMcpServersFromCatalog(catalog) {
  * project deliberately added. One line per server, no credentials.
  */
 export function mcpServerSummaries(catalog) {
-  return attachedMcpEntries(catalog).map(({ name, url, entry }) => ({
+  return attachedMcpEntries(catalog).map(({ name, url, command, entry }) => ({
     name,
     label: String(entry.name || name),
     description: String(entry.description || "").slice(0, 300),
     host: (() => {
-      try {
-        return new URL(url).host;
-      } catch {
-        return "";
+      if (url) {
+        try {
+          return new URL(url).host;
+        } catch {
+          return "";
+        }
       }
+      return command ? "local" : "";
     })(),
   }));
 }
