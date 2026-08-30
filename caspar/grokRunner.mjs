@@ -548,6 +548,27 @@ export function newSessionId() {
   return crypto.randomUUID();
 }
 
+const CASPAR_SESSION_FILE = "caspar-conversation.json";
+
+/** Load the Grok session that owns this thread's native transcript. */
+export function persistedConversationSession(grokHome) {
+  if (!grokHome) return "";
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(grokHome, CASPAR_SESSION_FILE), "utf-8"));
+    return typeof value?.sessionId === "string" && /^[0-9a-f-]{36}$/i.test(value.sessionId) ? value.sessionId : "";
+  } catch {
+    return "";
+  }
+}
+
+function persistConversationSession(grokHome, sessionId) {
+  if (!grokHome || !sessionId) return;
+  const target = path.join(grokHome, CASPAR_SESSION_FILE);
+  const temporary = `${target}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify({ sessionId }), { mode: 0o600 });
+  fs.renameSync(temporary, target);
+}
+
 /**
  * Run one prompt to completion.
  *
@@ -696,17 +717,23 @@ export async function runGrok(opts) {
     // answer a folder-trust prompt for it.
     "--trust",
     "--no-auto-update",
-    // The persona and the whole conversation are composed by the platform; the
-    // prompt is already final.
+    // Preserve the current turn verbatim. Persona/capabilities arrive separately
+    // as system rules, while prior turns live in the resumed Grok session.
     "--verbatim",
   ];
   if (chosenModel) args.push("--model", chosenModel);
-  // Resume the paused session by id, or mint a fresh one. `--resume` finds the
-  // session in this thread's GROK_HOME (persisted across the pause).
-  const resuming = typeof resumeSessionId === "string" && /^[0-9a-f-]{36}$/i.test(resumeSessionId);
-  const sessionId = resuming ? resumeSessionId : newSessionId();
-  args.push("--session-id", sessionId);
+  // Every turn in a thread resumes the same native Grok session. This lets the
+  // backbone own transcript storage, context-window trimming and compaction;
+  // Caspar must not flatten the backend's full history into each user prompt.
+  const requestedResume = typeof resumeSessionId === "string" && /^[0-9a-f-]{36}$/i.test(resumeSessionId) ? resumeSessionId : "";
+  const persistedSession = requestedResume || persistedConversationSession(grokHome);
+  const resuming = Boolean(persistedSession);
+  const sessionId = persistedSession || newSessionId();
+  // `--session-id` names a brand-new session only. Grok deliberately rejects it
+  // alongside `--resume` unless `--fork-session` is also present; a continuation
+  // is not a fork, so resume with only the existing id.
   if (resuming) args.push("--resume", sessionId);
+  else args.push("--session-id", sessionId);
   if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
   if (disallowedTools?.length) args.push("--disallowed-tools", disallowedTools.join(","));
   if (systemPrompt) args.push("--rules", systemPrompt);
@@ -844,6 +871,17 @@ export async function runGrok(opts) {
   }
 
   const argv = [command, ...args];
+  // An emitted init/result means the CLI accepted/created the session. Remember
+  // it for the next turn even when this run was interrupted for billing; that is
+  // exactly the state `--resume` is designed to continue.
+  if (grokHome && messages.length) {
+    try {
+      persistConversationSession(grokHome, sessionId);
+    } catch (err) {
+      warnings.push(`could not persist conversation session (${err?.message || err})`);
+    }
+  }
+
   if (outcome instanceof Error) {
     return { result: null, messages, exitCode: null, timedOut, aborted, stderr: `${outcome.message}\n${stderr}`, argv, warnings, stdoutTail, backbone, sessionId, grokHome };
   }

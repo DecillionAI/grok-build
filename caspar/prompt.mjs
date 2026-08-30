@@ -11,21 +11,14 @@
  *                    several agents and people; the agent has to know who it is,
  *                    who else is present, and the @mention protocol that decides
  *                    who gets triggered next.
- *   • `history`    — the thread's prior turns, each annotated with who it was
- *                    `from`, who it was directed `to`, and whether it was
- *                    `directedToMe`. Every agent sees every turn (it stays aware
- *                    of the whole team) but only replies to what is aimed at it.
+ *   • `history`    — retained on the delivery envelope for compatibility, but
+ *                    not flattened into the next user message. Grok's persisted
+ *                    session owns conversation history and context compaction.
  *   • `attachments`— files materialised into the workspace.
  *
- * The rendering mirrors the davinci agent's group-chat preamble and `[From → To]`
- * turn annotations, so an agent's behaviour in a Decillion space is unchanged
- * when this creature replaces davinci as the backbone.
+ * Stable identity/capability information belongs in Grok's system rules. The
+ * user turn contains only the current message and its current attachments.
  */
-
-import { creatureNumber } from "./env.mjs";
-
-const MAX_HISTORY_TURNS = creatureNumber("HISTORY_TURNS", 30);
-const MAX_TURN_CHARS = creatureNumber("HISTORY_TURN_CHARS", 4000);
 
 /** The agent's own identity, as sent by the backend. */
 function selfIdentity(task) {
@@ -374,6 +367,15 @@ export function buildSystemPrompt(task, opts = {}) {
   const routines = projectRoutinesPreamble(task);
   if (routines) parts.push(routines);
 
+  if (opts.workspace) {
+    parts.push(
+      "=== WORKSPACE ===\n" +
+        `Your private working directory for this conversation is ${opts.workspace}. ` +
+        "It persists between turns; shared project artifacts still belong in the space's shared machine when one is available.\n" +
+        "=== END WORKSPACE ===\n",
+    );
+  }
+
   // When the shell/filesystem built-ins are disabled but the capabilities section
   // did not already explain it (no shared sandbox named there), state it plainly so
   // the model does not try — and get denied by — a local command or file edit.
@@ -424,39 +426,14 @@ export function buildSystemPrompt(task, opts = {}) {
   return parts.join("\n");
 }
 
-/** Render one history turn with its `[From → To]` annotation. */
-function renderTurn(turn, index) {
-  const role = typeof turn.role === "string" && turn.role.trim() ? turn.role.trim() : "user";
-  const content = String(turn.content ?? "").slice(0, MAX_TURN_CHARS);
-  const from = typeof turn.from === "string" ? turn.from.trim() : "";
-  const to = Array.isArray(turn.to) ? turn.to : [];
-  const targets = to.map((t) => (t && typeof t === "object" ? String(t.name || t.handle || "").trim() : "")).filter(Boolean);
-  let prefix = "";
-  if (from) prefix = `[${from} → ${targets.length ? targets.join(", ") : "everyone"}]`;
-  if (turn.directedToMe) prefix = prefix ? `${prefix} (directed at you)` : "(directed at you)";
-  const speaker = role === "assistant" ? "you" : role;
-  return `${index}. (${speaker}) ${prefix ? `${prefix} ` : ""}${content}`;
-}
-
-/** The prior turns of this thread, size-bounded, newest last. */
-export function renderHistory(task) {
-  const raw = task.history || task.messages || task.conversation;
-  if (!Array.isArray(raw)) return "";
-  const turns = raw.filter((t) => t && typeof t === "object" && String(t.content ?? "").trim());
-  if (!turns.length) return "";
-  const kept = turns.slice(-MAX_HISTORY_TURNS);
-  const lines = kept.map((t, i) => renderTurn(t, i + 1));
-  return `=== CONVERSATION SO FAR (oldest first) ===\n${lines.join("\n")}\n=== END CONVERSATION ===\n`;
-}
-
 /**
- * The user turn handed to Grok: the thread's history, the files that came
- * with the prompt, and the current message to answer.
+ * The user turn handed to Grok: only the current message and material that is
+ * part of that message. Conversation history is deliberately absent: Grok owns
+ * it through its persisted/resumed session and applies its native context
+ * management instead of receiving a synthetic transcript on every turn.
  */
 export function buildUserPrompt(task, { objective, attachments = [], extractedTexts = [], workspace }) {
   const parts = [];
-  const history = renderHistory(task);
-  if (history) parts.push(history);
   if (attachments.length) {
     parts.push(
       "=== FILES ATTACHED TO THIS MESSAGE ===\n" +
@@ -477,9 +454,6 @@ export function buildUserPrompt(task, { objective, attachments = [], extractedTe
       parts.push(`=== ${label} ${doc.name} ===\n${doc.text}\n=== END ${doc.name} ===\n`);
     }
   }
-  if (workspace) {
-    parts.push(`Your working directory for this conversation is ${workspace} (it persists between turns).`);
-  }
-  parts.push(`=== CURRENT MESSAGE TO ANSWER ===\n${objective}`);
+  parts.push(String(objective ?? ""));
   return parts.join("\n");
 }
