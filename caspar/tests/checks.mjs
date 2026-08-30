@@ -279,7 +279,7 @@ await check("the system prompt carries the persona and the group-chat protocol",
   assert.equal(/• Tina/.test(system), false, "the agent should not be in its own roster");
 });
 
-await check("history reaches the prompt with [From → To] annotations", () => {
+await check("history is owned by Grok and is not flattened into the current user turn", () => {
   const history = [
     { role: "user", content: "hey team", from: "Shayan", to: [] },
     { role: "assistant", content: "on it", from: "Bob", to: [{ name: "Shayan" }] },
@@ -287,11 +287,8 @@ await check("history reaches the prompt with [From → To] annotations", () => {
   ];
   const { task } = decodeTaskSignal(...Object.values(proxyDelivery({ history })));
   const prompt = buildUserPrompt(task, { objective: "what's the status?", attachments: [], workspace: "/w" });
-  assert.match(prompt, /CONVERSATION SO FAR/);
-  assert.match(prompt, /\[Shayan → everyone\] hey team/);
-  assert.match(prompt, /\[Bob → Shayan\] on it/);
-  assert.match(prompt, /\(directed at you\)/);
-  assert.match(prompt, /CURRENT MESSAGE TO ANSWER ===\nwhat's the status\?/);
+  assert.equal(prompt, "what's the status?");
+  assert.doesNotMatch(prompt, /hey team|on it|CONVERSATION SO FAR/);
 });
 
 await check("OpenAI GPT-family image generation uses the Responses image tool and attaches its bytes", async () => {
@@ -883,8 +880,14 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.ok(invocation.argv.includes("--trust"), "a creature's own workspace has nobody to answer a trust prompt");
   assert.equal(invocation.permissionMode, "bypassPermissions");
   assert.match(invocation.rules, /Tina, the release manager/);
-  assert.match(invocation.prompt, /CURRENT MESSAGE TO ANSWER/);
+  assert.equal(invocation.prompt, "What is the status of the deploy?");
   assert.ok(invocation.grokHome, "the run gets its own GROK_HOME");
+  assert.equal(invocation.argv.includes("--resume"), false, "the first turn creates the native Grok session");
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(invocation.grokHome, "caspar-conversation.json"), "utf-8")),
+    { sessionId: invocation.sessionId },
+    "the thread records the native session id for subsequent --resume turns",
+  );
   assert.equal(/\[mcp_servers/.test(invocation.config), true, "platform media tools keep the MCP server available without space creatures");
   assert.match(invocation.rules, /caspar__generate_media/, "the provider-neutral generation tool is explained to the agent");
   assert.match(invocation.rules, /caspar__share_media/, "the outbound sharing tool is explained to the agent");
@@ -968,7 +971,7 @@ await check("an image/audio attachment reaches the model inline as ACP content b
   const blocks = JSON.parse(invocation.prompt);
   assert.ok(Array.isArray(blocks), "the prompt file is a content-block array");
   assert.equal(blocks[0].type, "text", "the composed text turn comes first");
-  assert.match(blocks[0].text, /CURRENT MESSAGE TO ANSWER/);
+  assert.match(blocks[0].text, /what is this\?/);
 
   const image = blocks.find((b) => b.type === "image");
   assert.ok(image, "the image is inlined as an image content block");

@@ -547,6 +547,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     sharedEnv,
     disabledBuiltins: disallowedTools,
     mcpServers: attachedMcpServers,
+    workspace,
   });
   const prompt = buildUserPrompt(task, { objective, attachments, extractedTexts, workspace });
   // With inline media, the turn becomes ACP content blocks: the composed text
