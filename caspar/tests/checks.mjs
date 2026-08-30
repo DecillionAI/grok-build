@@ -897,6 +897,25 @@ await check("a served prompt streams its trajectory and replies exactly once", a
   assert.ok(promptPath.endsWith("prompt.txt"), "a text-only turn is a .txt prompt file, not content blocks");
 });
 
+await check("a later turn resumes its Grok session without the new-session flag", async () => {
+  const configRoot = tempDir("caspar-resume-config-");
+  const threadHome = path.join(configRoot, "space-space-1-res-tina");
+  const sessionId = "12345678-1234-4234-8234-123456789abc";
+  fs.mkdirSync(threadHome, { recursive: true });
+  fs.writeFileSync(path.join(threadHome, "caspar-conversation.json"), JSON.stringify({ sessionId }));
+
+  const { result, invocation } = await serveWithFakeCli({
+    scenario: successScenario("Continuing."),
+    envOverrides: { GROK_CREATURE_CONFIG_DIR: configRoot },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(invocation.argv.includes("--session-id"), false, "resume must not also identify a new session");
+  const resumeAt = invocation.argv.indexOf("--resume");
+  assert.notEqual(resumeAt, -1, "the persisted conversation is resumed");
+  assert.equal(invocation.argv[resumeAt + 1], sessionId);
+});
+
 await check("a quiet run still streams heartbeats so the client does not time it out", async () => {
   // The CLI stays silent (no stream-json) for a stretch that dwarfs the heartbeat
   // interval, standing in for a long tool call or model turn. The run must keep

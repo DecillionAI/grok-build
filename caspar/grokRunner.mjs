@@ -729,8 +729,11 @@ export async function runGrok(opts) {
   const persistedSession = requestedResume || persistedConversationSession(grokHome);
   const resuming = Boolean(persistedSession);
   const sessionId = persistedSession || newSessionId();
-  args.push("--session-id", sessionId);
+  // `--session-id` names a brand-new session only. Grok deliberately rejects it
+  // alongside `--resume` unless `--fork-session` is also present; a continuation
+  // is not a fork, so resume with only the existing id.
   if (resuming) args.push("--resume", sessionId);
+  else args.push("--session-id", sessionId);
   if (allowedTools?.length) args.push("--tools", allowedTools.join(","));
   if (disallowedTools?.length) args.push("--disallowed-tools", disallowedTools.join(","));
   if (systemPrompt) args.push("--rules", systemPrompt);
