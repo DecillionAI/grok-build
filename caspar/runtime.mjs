@@ -1278,6 +1278,7 @@ export async function main() {
           status: result && result.success === false ? "error" : "ok",
           endedAt: Date.now(),
           ...(result && result.success === false && result.error ? { error: String(result.error).slice(0, 300) } : {}),
+          ...(result && result.answer ? { lastStep: String(result.answer).replace(/\s+/g, " ").trim().slice(0, 280) } : {}),
         });
         // Record autonomous spend and drive the @mention chain forward — the
         // backbone launches whichever teammates this answer named, so the chain

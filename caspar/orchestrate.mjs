@@ -23,6 +23,8 @@ import crypto from "node:crypto";
 import { postSpaceSignal, KIND } from "./spaceHistory.mjs";
 
 const DEFAULT_MAX_HOPS = 8;
+/** Same agent may be handed work twice (e.g. lead reviews after a specialist). */
+const VISIT_CAP = 2;
 
 // Surface a stalled @mention chain IN THE CHAT (not just the VM log) so the exact
 // blocker is visible in-app. On by default while stabilising server-side
@@ -346,11 +348,13 @@ function parseAnswerMentions(answer) {
 function mentionedTeammates(answer, agents, { visited, selfProgram }) {
   const mentions = parseAnswerMentions(answer);
   if (!mentions.size) return [];
+  const visitedList = Array.isArray(visited) ? visited.map(String) : [...(visited || [])].map(String);
+  const visitCount = (id) => visitedList.filter((v) => v === id).length;
   const out = [];
   const seen = new Set();
   for (const a of agents) {
     if (!a.programId) continue;
-    if (a.programId === selfProgram || visited.has(a.programId) || seen.has(a.programId)) continue;
+    if (a.programId === selfProgram || visitCount(a.programId) >= VISIT_CAP || seen.has(a.programId)) continue;
     const forms = new Set(
       [a.handle, toHandle(a.handle), toHandle(a.name)].filter((v) => v && typeof v === "string").map((v) => v.toLowerCase()),
     );
@@ -445,9 +449,9 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
     log("GROK_ORCH", { followups: "hop-cap", depth, maxHops });
     return 0;
   }
-  const visited = new Set((Array.isArray(orch.visited) ? orch.visited : []).map(String));
+  const visitedList = (Array.isArray(orch.visited) ? orch.visited : []).map(String);
   const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
-  if (selfProgram) visited.add(selfProgram);
+  if (selfProgram && !visitedList.includes(selfProgram)) visitedList.push(selfProgram);
 
   // The @handles this answer actually mentioned, minus the ones that name a
   // PERSON in the roster (a human @mention is not a fan-out target, so it must
@@ -479,7 +483,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const teammates = mentionedTeammates(answer, agents, { visited, selfProgram });
+  const teammates = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
   if (!teammates.length) {
     const known = agents.map((a) => a.handle).filter(Boolean);
     log("GROK_ORCH", { followups: "no-teammates", agents: known, rosterSize: Array.isArray(task.roster) ? task.roster.length : 0, answerMentions: answerHandles });
@@ -495,7 +499,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
 
   // Claim the whole batch in the visited set up front so two concurrent branches
   // of the chain can never launch the same agent twice.
-  const nextVisited = [...visited, ...teammates.map((t) => t.programId)];
+  const nextVisited = [...visitedList, ...teammates.map((t) => t.programId)];
   const threadId = String(task.threadId || "main") || "main";
   const base = forwardContext(task);
   let launched = 0;

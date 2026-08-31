@@ -242,12 +242,20 @@ await check("the hop cap halts the chain", async () => {
   assert.equal(launched.length, 0);
 });
 
-await check("a visited teammate is never relaunched", async () => {
+await check("a teammate already visited twice is not relaunched", async () => {
   const { bridge, launched } = makeBridge();
-  const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
+  const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
   const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer once more" });
   assert.equal(n, 0);
   assert.equal(launched.length, 0);
+});
+
+await check("a teammate may be handed a second turn after finishing the first", async () => {
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer please review the files" });
+  assert.equal(n, 1);
+  assert.equal(launched.length, 1);
 });
 
 await check("a refused delegated quote (budget reached) stops that branch", async () => {
