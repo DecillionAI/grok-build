@@ -98,6 +98,8 @@ DEFAULT_TIMEOUT_MS = int(os.environ.get("SANDBOX_TIMEOUT_MS",
                                         os.environ.get("VERCEL_SANDBOX_TIMEOUT_MS", str(45 * 60 * 1000))))
 DEFAULT_VCPUS = int(os.environ.get("SANDBOX_VCPUS",
                                    os.environ.get("VERCEL_SANDBOX_VCPUS", "2")))
+# Ports always tunneled so a person's browser can open a site the agents started.
+DEFAULT_PREVIEW_PORTS = [3000, 3001, 4173, 5173, 8000, 8080]
 
 _UNSAFE = re.compile(r"[^a-zA-Z0-9_-]+")
 
@@ -638,6 +640,77 @@ def _file_entries(payload: Dict[str, Any]) -> List[Tuple[str, bytes]]:
     return entries
 
 
+def _preview_ports(payload: Dict[str, Any]) -> List[int]:
+    raw = payload.get("ports")
+    if raw is None and payload.get("port") is not None:
+        raw = [payload.get("port")]
+    ports: List[int] = []
+    if isinstance(raw, list):
+        for item in raw:
+            try:
+                ports.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    elif raw is not None:
+        try:
+            ports.append(int(raw))
+        except (TypeError, ValueError):
+            pass
+    for port in DEFAULT_PREVIEW_PORTS:
+        if port not in ports:
+            ports.append(port)
+    return [p for p in ports if 1 <= p <= 65535]
+
+
+def _restart_preview_server(space_id: str) -> Optional[str]:
+    listing = _list_dir(space_id, {"path": "."})
+    names = {str(e.get("name") or "") for e in (listing.get("entries") or []) if isinstance(e, dict)}
+    command = None
+    if "server.py" in names:
+        command = "python3 server.py"
+    elif "package.json" in names:
+        command = "npm start"
+    if not command:
+        return None
+    _exec_background(space_id, {"command": command})
+    return command
+
+
+def _expose(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-open the sandbox with public tunnels and restart a common web server.
+
+    Modal/Vercel only bind tunnels at create time. Agents often start
+    ``python3 server.py`` on localhost without those ports declared — this is
+    how a person in the app gets a URL they can actually open.
+    """
+    ports = _preview_ports(payload)
+    b = backend()
+    try:
+        b.stop(space_id, payload)
+    except Exception:  # noqa: BLE001
+        pass
+    created = b.create(space_id, {**payload, "ports": ports})
+    restarted = _restart_preview_server(space_id)
+    time.sleep(2)
+    try:
+        info = b.info(space_id, {"resume": True})
+    except Exception:  # noqa: BLE001
+        info = created if isinstance(created, dict) else {}
+    routes = info.get("routes") if isinstance(info, dict) else None
+    if not routes and isinstance(created, dict):
+        routes = created.get("routes")
+    out = dict(info) if isinstance(info, dict) else {"ok": True}
+    out.update({
+        "ok": True,
+        "action": "expose",
+        "space_id": space_id,
+        "ports": ports,
+        "routes": routes or [],
+        "restarted": restarted,
+    })
+    return out
+
+
 # =========================================================================== #
 # Backend abstraction
 # =========================================================================== #
@@ -813,6 +886,8 @@ class VercelBackend(Backend):
         project = payload.get("project_id") or self._project_id()
         if project:
             body["projectId"] = project
+        if payload.get("ports") is None:
+            body["ports"] = list(DEFAULT_PREVIEW_PORTS)
         for key, field in (("ports", "ports"), ("env", "env"), ("source", "source"),
                            ("network_policy", "networkPolicy"), ("mounts", "mounts")):
             if payload.get(key) is not None:
@@ -1271,7 +1346,7 @@ class ModalBackend(Backend):
         modal = self._modal
         app = self._get_app()
         res = self._resources(payload)
-        ports = payload.get("ports") or []
+        ports = payload.get("ports") or DEFAULT_PREVIEW_PORTS
         encrypted_ports = [int(p) for p in ports if str(p).strip().isdigit()]
         kwargs: Dict[str, Any] = {
             "app": app,
@@ -1622,6 +1697,9 @@ _SHARED_ACTIONS = {
     "listdir": _list_dir,
     "ls": _list_dir,
     "readdir": _list_dir,
+    "expose": _expose,
+    "expose_port": _expose,
+    "tunnel": _expose,
 }
 
 # Actions that map onto a backend method name (resolved on the active backend).

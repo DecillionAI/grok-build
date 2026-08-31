@@ -279,7 +279,9 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "of them is built for. Only call a capability when it actually helps the " +
     "current request. A chat-only plan or review memo is not a substitute for using " +
     "these tools. If the outcome needs a live page or service, write it on the shared " +
-    "machine, start it, expose a port, and tell the people the public URL. To bring " +
+    "machine, start it, and expose a public URL (sandbox `expose` / tunneled ports) " +
+    "so people in the project can open it in a browser. Do not leave the only URL as " +
+    "localhost — that is the sandbox VM, not their laptop. To bring " +
     "in another agent for part of the work, do NOT look " +
     "for it here — @mention them in your reply (see the group chat section); that " +
     "hand-off happens asynchronously as its own chat turn, it is not a tool call.\n" +
