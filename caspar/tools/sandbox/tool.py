@@ -662,14 +662,34 @@ def _preview_ports(payload: Dict[str, Any]) -> List[int]:
     return [p for p in ports if 1 <= p <= 65535]
 
 
+def _preview_start_command(names: set[str], prefix: str = "") -> Optional[str]:
+    cwd = f"cd {prefix} && " if prefix else ""
+    if "server.py" in names:
+        return f"{cwd}python3 server.py"
+    if "app.py" in names:
+        return f"{cwd}python3 app.py"
+    if "package.json" in names:
+        return f"{cwd}npm start"
+    if "index.html" in names and not prefix:
+        return "python3 -m http.server 8000"
+    return None
+
+
 def _restart_preview_server(space_id: str) -> Optional[str]:
     listing = _list_dir(space_id, {"path": "."})
-    names = {str(e.get("name") or "") for e in (listing.get("entries") or []) if isinstance(e, dict)}
-    command = None
-    if "server.py" in names:
-        command = "python3 server.py"
-    elif "package.json" in names:
-        command = "npm start"
+    entries = [e for e in (listing.get("entries") or []) if isinstance(e, dict)]
+    names = {str(e.get("name") or "") for e in entries}
+    command = _preview_start_command(names)
+    if not command:
+        dirs = [str(e.get("name") or "") for e in entries if e.get("type") == "dir"]
+        for folder in dirs[:12]:
+            if folder in {".", "..", ".git", "node_modules", "__pycache__", ".venv"}:
+                continue
+            nested = _list_dir(space_id, {"path": folder})
+            nested_names = {str(e.get("name") or "") for e in (nested.get("entries") or []) if isinstance(e, dict)}
+            command = _preview_start_command(nested_names, folder)
+            if command:
+                break
     if not command:
         return None
     _exec_background(space_id, {"command": command})
