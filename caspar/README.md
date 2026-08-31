@@ -459,6 +459,7 @@ and the Anthropic Messages API itself, so a provider override is a generated
 | `anthropic` | `api.anthropic.com/v1` | messages (`x-api-key`) | `claude-opus-5` |
 | `gemini` (`google`) | Gemini's OpenAI-compatible endpoint | chat completions | `gemini-2.5-pro` |
 | `openrouter` | `openrouter.ai/api/v1` | chat completions | `openai/gpt-4o` |
+| `agentrouter` | `agentrouter.org/v1` | chat completions | `gpt-5.5` |
 | `groq` · `deepseek` · `mistral` · `together` | each provider's OpenAI-compatible endpoint | chat completions | provider model id |
 | anything else **with** `llm.base_url` | that URL | chat completions (or `llm.api_backend`) | provider model id |
 

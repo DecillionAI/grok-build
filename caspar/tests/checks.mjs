@@ -494,6 +494,7 @@ await check("a per-agent LLM override becomes a native endpoint entry, per provi
     ["openai", "api.openai.com", "responses"],
     ["gemini", "generativelanguage.googleapis.com", "chat_completions"],
     ["openrouter", "openrouter.ai", "chat_completions"],
+    ["agentrouter", "agentrouter.org", "chat_completions"],
   ]) {
     const built = buildChildEnv({ env, llm: { provider, models: ["some-model"], api_key: "k" } });
     assert.ok(built.modelConfig.baseUrl.includes(host), `${provider} → ${host}`);

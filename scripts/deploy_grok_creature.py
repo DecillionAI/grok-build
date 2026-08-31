@@ -405,7 +405,7 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
         info(f"baking backbone credentials/knobs into the image: {', '.join(sorted(baked))}")
     else:
         info("no default backbone credentials baked into the image. This is fine when every agent "
-             "brings its own LLM provider + key (config.llm: xai/openai/anthropic/gemini/openrouter) — "
+             "brings its own LLM provider + key (config.llm: xai/openai/anthropic/gemini/openrouter/agentrouter) — "
              "those runs carry their own endpoint. Only agents with NO per-agent LLM override need a "
              "default backbone here (XAI_API_KEY, or the GROK_CREATURE_LLM_* trio).")
     dockerfile = dockerfile + b"\n" + bake_snippet(baked).encode()

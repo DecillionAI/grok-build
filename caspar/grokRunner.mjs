@@ -233,7 +233,7 @@ export function platformKeyFor(providerId, env = process.env) {
 }
 
 /** Providers whose admin-configured platform key we hydrate from the secret store. */
-export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "mistral", "together"];
+export const PLATFORM_KEY_PROVIDERS = ["xai", "openai", "anthropic", "gemini", "openrouter", "agentrouter", "groq", "deepseek", "mistral", "together"];
 
 /**
  * Hydrate the admin-configured platform LLM keys from the on-chain **secret

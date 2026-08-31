@@ -82,6 +82,15 @@ const PROVIDERS = [
     apiBackend: "chat_completions",
   },
   {
+    id: "agentrouter",
+    aliases: ["agent-router"],
+    label: "AgentRouter",
+    // AgentRouter exposes an OpenAI-compatible API and authenticates with the
+    // token as a standard bearer credential.
+    baseUrl: "https://agentrouter.org/v1",
+    apiBackend: "chat_completions",
+  },
+  {
     id: "groq",
     aliases: [],
     label: "Groq",
