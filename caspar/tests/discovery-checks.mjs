@@ -160,6 +160,7 @@ async function main() {
     // it steers cross-agent work to @mention instead
     assert.ok(/@mention/i.test(text), "it points cross-agent work to @mention");
     assert.ok(/expose/i.test(text), "it tells agents to expose a public URL");
+    assert.ok(/graphical `computer` desktop/i.test(text), "it tells agents the GUI is costly");
     // it tells the model to answer capability questions with THESE, not built-ins
     assert.ok(/not the generic editor\/shell built-ins/i.test(text));
     // it is included in the full system prompt

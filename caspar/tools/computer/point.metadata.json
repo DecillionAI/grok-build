@@ -15,8 +15,8 @@
     "you need to hand a live, interactive browser session to the people in the space",
     "a task mixes agent automation and human steps on the same browser (logins, captchas, review)"
   ],
-  "howToTalk": "Signal it with `function` naming the operation. `open` provisions or reuses the space's desktop and returns its phase and, once ready, the public VNC `url` (the front-end opens that in Victor's webview). Poll `status` (pass a `cursor` to page new install-log lines). `url` returns just the ready URL. Drive the desktop with `screenshot` (base64 `image`; `format`=png|jpeg), `click` (`x`,`y`,`button`=left|right|middle, `double`), `move` (`x`,`y`), `type` (`text`), `key` (`key`, e.g. Return, ctrl+l, alt+Tab), `scroll` (`to`=up|down or `dy`), and `navigate` (`url`). `stop` tears the desktop down; `restart` rebuilds it.",
-  "prompt": "This is a real graphical computer with a visible web browser for the space, running on the space's cloud sandbox and streamed over VNC. Call `open` first — it installs and starts the desktop on the sandbox on first use (streaming an install log) or returns instantly if it is already up, giving you a `url` the people in the space open to watch and control the browser. To act yourself, `screenshot` to see the screen, then `click`/`move` by pixel coordinates, `type` text, press `key` combos (Return, ctrl+l, …), `scroll`, or `navigate` to a URL. You and the humans share the same desktop, so coordinate: take a screenshot before acting.",
+  "howToTalk": "Signal it with `function` naming the operation. `status` never starts the GUI. `open` provisions or reuses the space's desktop and returns its phase and, once ready, the public VNC `url`. Agent screenshot/click/type also start it if it is off. Poll `status` (pass a `cursor` for new install-log lines; `keep_alive` while a person is watching). Drive with `screenshot`, `click`, `move`, `type`, `key`, `scroll`, `navigate`. `stop` tears the GUI down (sandbox files stay); idle GUIs stop themselves.",
+  "prompt": "This is a real graphical computer with a visible web browser for the space, running on the space's cloud sandbox and streamed over VNC. It is costly while the GUI is up — do not use it for ordinary files, shell, search, or headless browsing. Use it only when a person must see a live desktop or you must click a real GUI page. `status` never starts it. `open` starts it (first time installs). Agent `screenshot`/`click`/`type` also start it if it is off. Drive with `screenshot` then `click`/`move`/`type`/`key`/`scroll`/`navigate`. Call `stop` when finished; idle GUIs stop themselves after a few minutes. You and humans share the same desktop.",
   "request_point": "tool::computer::request",
   "response_point": "tool::computer::response",
   "risk_level": "medium",
@@ -24,8 +24,8 @@
   "requires_network": true,
   "requiresNetwork": true,
   "bindSpace": true,
-  "autoAttach": false,
-  "function": "open",
+  "autoAttach": true,
+  "function": "status",
   "requiredArgs": [
     "function"
   ],
@@ -34,17 +34,21 @@
     "web"
   ],
   "routes": {
-    "automation": "open",
-    "web": "open"
+    "automation": "status",
+    "web": "status"
   },
   "argSchema": {
     "function": {
       "type": "string",
-      "description": "operation: open (default) | status | url | screenshot | click | move | type | key | scroll | navigate | stop | restart"
+      "description": "operation: status (default, does not start the GUI) | open | url | screenshot | click | move | type | key | scroll | navigate | stop | restart"
     },
     "cursor": {
       "type": "number",
       "description": "for open/status: the log cursor from the previous reply, to fetch only new install-log lines"
+    },
+    "keep_alive": {
+      "type": "bool",
+      "description": "for status: reset the idle timer because a person is watching; omit on peeks so idle stop still fires"
     },
     "url": {
       "type": "string",
@@ -109,6 +113,10 @@
         "cursor": {
           "type": "NUMBER",
           "desc": "the log cursor from a previous reply"
+        },
+        "keep_alive": {
+          "type": "BOOL",
+          "desc": "true when a person is watching — resets idle stop; omit on cheap peeks"
         }
       },
       "widget": {

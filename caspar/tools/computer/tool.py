@@ -99,6 +99,9 @@ PROVISION_TIMEOUT_S = _int_env("COMPUTER_PROVISION_TIMEOUT_S", 480)
 TUNNEL_WAIT_S = _int_env("COMPUTER_TUNNEL_TIMEOUT_S", 90)
 MAX_SHOT_BYTES = _int_env("COMPUTER_MAX_SHOT_BYTES", 3_500_000)
 MAX_LOG_LINES = _int_env("COMPUTER_MAX_LOG_LINES", 400)
+# Stop the GUI after this many seconds with no human keep-alive and no agent
+# actions — the Linux sandbox stays up; only Xvfb/VNC/tunnel are torn down.
+IDLE_STOP_S = _int_env("COMPUTER_IDLE_STOP_S", 480)
 
 # Phases a desktop moves through; the front-end drives its UI off these.
 PHASE_IDLE = "idle"
@@ -302,6 +305,10 @@ class Desktop:
         self._log: List[str] = []
         self._provisioning = False
         self._remote_log_off = 0  # bytes of the sandbox install.log already mirrored
+        self.last_used = time.time()
+
+    def touch(self) -> None:
+        self.last_used = time.time()
 
     def log(self, line: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -352,6 +359,7 @@ def _get_desktop(space_id: str, create: bool = True) -> Optional[Desktop]:
         if desk is None and create:
             desk = Desktop(space_id)
             _DESKTOPS[space_id] = desk
+            _ensure_idle_watch()
         return desk
 
 
@@ -565,11 +573,55 @@ def _begin_provision(desk: Desktop) -> None:
 # Agent control surface (xdotool / scrot on the sandbox, over exec/read)
 # --------------------------------------------------------------------------- #
 
-def _require_ready(space_id: str) -> Desktop:
-    desk = _get_desktop(space_id, create=False)
-    if desk is None or desk.phase != PHASE_READY or not desk.url:
-        raise SandboxError("the computer is not running for this space — open it first")
-    return desk
+_IDLE_WATCH_STARTED = False
+
+
+def _idle_watch_loop() -> None:
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with _REGISTRY_LOCK:
+            items = list(_DESKTOPS.items())
+        for sid, desk in items:
+            if desk.phase != PHASE_READY:
+                continue
+            if now - desk.last_used < IDLE_STOP_S:
+                continue
+            try:
+                desk.log("idle — stopping the GUI to save sandbox time (files stay)")
+                _act_stop(sid, {})
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _ensure_idle_watch() -> None:
+    global _IDLE_WATCH_STARTED
+    if _IDLE_WATCH_STARTED:
+        return
+    _IDLE_WATCH_STARTED = True
+    threading.Thread(target=_idle_watch_loop, daemon=True, name="computer-idle").start()
+
+
+def _ensure_ready(space_id: str) -> Desktop:
+    """Start the GUI if needed, then wait until it is ready. Used by agent
+    actions (screenshot/click/…) so they do not require a person to tap Open
+    first — but a bare `status` never takes this path."""
+    desk = _get_desktop(space_id, create=True)
+    assert desk is not None
+    desk.touch()
+    if desk.phase == PHASE_READY and desk.url:
+        return desk
+    if not desk._provisioning and desk.phase in (PHASE_IDLE, PHASE_ERROR):
+        _begin_provision(desk)
+    deadline = time.time() + PROVISION_TIMEOUT_S
+    while time.time() < deadline:
+        if desk.phase == PHASE_READY and desk.url:
+            desk.touch()
+            return desk
+        if desk.phase == PHASE_ERROR:
+            raise SandboxError(desk.error or "the computer failed to start")
+        time.sleep(0.4)
+    raise SandboxError("the computer did not become ready in time")
 
 
 def _xdotool(space_id: str, args: str) -> Dict[str, Any]:
@@ -577,7 +629,7 @@ def _xdotool(space_id: str, args: str) -> Dict[str, Any]:
 
 
 def _act_screenshot(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    desk = _require_ready(space_id)
+    desk = _ensure_ready(space_id)
     home = _get_home(desk)
     fmt = str(payload.get("format") or "png").lower()
     remote = REMOTE_DIR + "/shot.png"
@@ -608,7 +660,7 @@ def _act_screenshot(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_click(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     button = str(payload.get("button") or "1")
     button = {"left": "1", "middle": "2", "right": "3"}.get(button, button)
     x = payload.get("x")
@@ -622,7 +674,7 @@ def _act_click(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_move(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     x = int(payload.get("x") or 0)
     y = int(payload.get("y") or 0)
     _xdotool(space_id, "mousemove --sync " + str(x) + " " + str(y))
@@ -630,7 +682,7 @@ def _act_move(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_type(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     text = str(payload.get("text") or payload.get("value") or "")
     if not text:
         raise SandboxError("text is required")
@@ -643,7 +695,7 @@ def _act_type(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_key(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     key = str(payload.get("key") or payload.get("keys") or "")
     if not key:
         raise SandboxError("key is required (e.g. Return, ctrl+l, alt+Tab)")
@@ -655,7 +707,7 @@ def _act_key(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_scroll(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     direction = str(payload.get("to") or payload.get("direction") or "").lower()
     amount = int(payload.get("amount") or payload.get("clicks") or 3)
     dy = payload.get("dy")
@@ -669,7 +721,7 @@ def _act_scroll(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _act_navigate(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _require_ready(space_id)
+    _ensure_ready(space_id)
     url = str(payload.get("url") or payload.get("text") or "").strip()
     if not url:
         raise SandboxError("url is required")
@@ -695,6 +747,7 @@ def _act_open(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     desk = _get_desktop(space_id, create=True)
     assert desk is not None
     cursor = int(payload.get("cursor") or 0)
+    desk.touch()
     if desk.phase == PHASE_READY and desk.url:
         snap = desk.snapshot(cursor)
         snap["action"] = "open"
@@ -722,6 +775,9 @@ def _act_status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         wait = min(float(payload.get("wait") or 0.0), 8.0)
     except (TypeError, ValueError):
         wait = 0.0
+    keep_alive = bool(payload.get("keep_alive"))
+    if keep_alive or wait > 0:
+        desk.touch()
     if wait > 0 and desk.phase == PHASE_INSTALLING:
         deadline = time.time() + wait
         while time.time() < deadline:
@@ -810,7 +866,7 @@ def _normalize_action(function_name: str, payload: Dict[str, Any]) -> str:
     for candidate in (payload.get("action"), payload.get("function"), function_name):
         if isinstance(candidate, str) and candidate.strip() and candidate.strip().lower() != "invoke":
             return candidate.strip().lower()
-    return "open"
+    return "status"
 
 
 def _space_id(payload: Dict[str, Any]) -> str:

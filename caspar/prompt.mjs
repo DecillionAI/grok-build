@@ -286,7 +286,12 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "with the listening port so people get a public URL they can Open in the app. " +
     "Do not leave the only URL as localhost — that is the sandbox VM, not their " +
     "laptop. Serve the actual app (index.html or the running process), never a " +
-    "directory listing. To bring " +
+    "directory listing. The graphical `computer` desktop (VNC GUI on that same " +
+    "sandbox) is expensive while it runs. Prefer sandbox exec, files, `expose`, " +
+    "`web_search`, and headless browser tools. Call computer only when a visible " +
+    "GUI page must be seen or clicked (login walls, captchas, a person watching). " +
+    "A screenshot/click starts it if it is off; call `stop` when you are done. " +
+    "Idle desktops shut themselves off. To bring " +
     "in another agent for part of the work, do NOT look " +
     "for it here — @mention them in your reply (see the group chat section); that " +
     "hand-off happens asynchronously as its own chat turn, it is not a tool call.\n" +
