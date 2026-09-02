@@ -670,8 +670,8 @@ def _preview_start_command(names: set[str], prefix: str = "") -> Optional[str]:
         return f"{cwd}python3 app.py"
     if "package.json" in names:
         return f"{cwd}npm start"
-    if "index.html" in names and not prefix:
-        return "python3 -m http.server 8000"
+    if "index.html" in names:
+        return f"{cwd}python3 -m http.server 8000"
     return None
 
 

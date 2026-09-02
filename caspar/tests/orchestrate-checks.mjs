@@ -64,8 +64,11 @@ async function check(name, fn) {
 
 const BILLING_PROG = "billing-prog";
 const PROGRAM_INDEX = {
-  "self-prog": { programId: "self-prog", creatureId: "self-cr", entityId: "agent", metadata: { kind: "agent", name: "Lead", handle: "lead" } },
+  "self-prog": { programId: "self-prog", creatureId: "self-cr", entityId: "agent", metadata: { kind: "agent", name: "Orbit Lead", handle: "lead" } },
   "mate-prog": { programId: "mate-prog", creatureId: "mate-cr", entityId: "agent", metadata: { kind: "agent", name: "Writer", handle: "writer" } },
+  "builder-prog": { programId: "builder-prog", creatureId: "builder-cr", entityId: "agent", metadata: { kind: "agent", name: "Builder", handle: "builder" } },
+  "growth-prog": { programId: "growth-prog", creatureId: "growth-cr", entityId: "agent", metadata: { kind: "agent", name: "Growth", handle: "growth" } },
+  "research-prog": { programId: "research-prog", creatureId: "research-cr", entityId: "agent", metadata: { kind: "agent", name: "Researcher", handle: "researcher" } },
   "tool-prog": { programId: "tool-prog", creatureId: "tool-cr", entityId: "main", metadata: { kind: "tool", name: "sandbox" } },
 };
 
@@ -219,6 +222,8 @@ await check("an answer's @mentioned teammate is launched with a delegated quote"
   assert.equal(t.orchestration.depth, 1);
   assert.ok(t.orchestration.visited.includes("self-prog"));
   assert.ok(t.orchestration.visited.includes("mate-prog"));
+  assert.equal(t.orchestration.visited.filter((id) => id === "mate-prog").length, 1);
+  assert.equal(t.orchestration.visited.length, 2);
   // Context carried forward for the next hop. The teammate reads and writes the
   // space's signal log through the node's own host calls, so the only address it
   // still needs handed to it is billing.
@@ -256,6 +261,75 @@ await check("a teammate may be handed a second turn after finishing the first", 
   const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer please review the files" });
   assert.equal(n, 1);
   assert.equal(launched.length, 1);
+});
+
+await check("parallel launches do not pre-claim siblings on each child branch", async () => {
+  const { bridge, launched } = makeBridge();
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "@builder ship the site. @growth draft the posts. @researcher cite sources.",
+  });
+  assert.equal(n, 3);
+  const byTarget = Object.fromEntries(launched.map((row) => [row.target, row.task]));
+  assert.deepEqual(byTarget["builder-prog"].orchestration.visited, ["self-prog", "builder-prog"]);
+  assert.deepEqual(byTarget["growth-prog"].orchestration.visited, ["self-prog", "growth-prog"]);
+  assert.ok(!byTarget["builder-prog"].orchestration.visited.includes("growth-prog"));
+});
+
+await check("a specialist can hand off to a sibling after the lead's parallel wave", async () => {
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({
+    proxyProgramId: "research-prog",
+    self: { programId: "research-prog", name: "Researcher", handle: "researcher" },
+    orchestration: {
+      depth: 1,
+      maxHops: 8,
+      visited: ["self-prog", "research-prog"],
+      poolId: "pool-1",
+      payerUserId: "user-1",
+    },
+  });
+  const n = await planAndLaunchFollowups(bridge, delivery, {
+    success: true,
+    answer: "@lead use the unknowns checklist. @builder align campaign params. @growth keep UTM lowercase.",
+  });
+  assert.equal(n, 3, "lead + builder + growth should run a follow-up turn");
+  const targets = launched.map((row) => row.target).sort();
+  assert.deepEqual(targets, ["builder-prog", "growth-prog", "self-prog"]);
+});
+
+await check("legacy packed visited still allows a second sibling turn (VISIT_CAP=2)", async () => {
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({
+    proxyProgramId: "research-prog",
+    self: { programId: "research-prog", name: "Researcher", handle: "researcher" },
+    orchestration: {
+      depth: 1,
+      maxHops: 8,
+      visited: ["self-prog", "builder-prog", "research-prog", "growth-prog"],
+      poolId: "pool-1",
+      payerUserId: "user-1",
+    },
+  });
+  const n = await planAndLaunchFollowups(bridge, delivery, {
+    success: true,
+    answer: "@builder Please align the site with research.md.",
+  });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "builder-prog");
+});
+
+await check("@lead still resolves when a second agent is named Orbit Lead", async () => {
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({
+    proxyProgramId: "research-prog",
+    self: { programId: "research-prog", name: "Researcher", handle: "researcher" },
+    orchestration: { depth: 0, maxHops: 8, visited: ["research-prog"], poolId: "pool-1", payerUserId: "user-1" },
+    roster: [{ programId: "orbit-prog", name: "Orbit Lead", handle: "orbit-lead", kind: "agent", entityId: "agent" }],
+  });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "Ready. @lead please review." });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "self-prog");
 });
 
 await check("a refused delegated quote (budget reached) stops that branch", async () => {

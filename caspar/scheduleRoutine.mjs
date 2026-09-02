@@ -24,10 +24,10 @@ export const SCHEDULE_ROUTINE_TOOL = {
   name: "schedule_routine",
   description:
     "Schedule your OWN follow-up work in this project for later. Use this whenever the " +
-    "user asks you to do something after a delay or on a recurring cadence (e.g. \"remind " +
-    "me in an hour\", \"every morning post a digest\", \"check the deploy in 30 minutes\"). " +
-    "You become the responsible agent: at the scheduled time the platform posts `prompt` " +
-    "into this chat mentioning you, and you run it. Do NOT use this for work to do right now.",
+    "user or the project brief asks for work after a delay or on a recurring cadence " +
+    "(including \"every day at 9am\" posts). You become the responsible agent: at the " +
+    "scheduled time the platform posts `prompt` into this chat mentioning you, and you run it. " +
+    "Do NOT use this for work to do right now.",
   inputSchema: {
     type: "object",
     properties: {
@@ -46,16 +46,33 @@ export const SCHEDULE_ROUTINE_TOOL = {
         type: "number",
         description:
           'Minutes. For "once": how long from now until it runs. For "repeat": the ' +
-          "interval between runs. Minimum 1.",
+          "interval between runs. Minimum 1. Optional when `hour` is set.",
+      },
+      hour: {
+        type: "number",
+        description:
+          "Clock hour 0–23 UTC for daily work (e.g. 9 for 09:00 UTC). With " +
+          'schedule="repeat", the first run is the next time this hour occurs, then every 24h. ' +
+          "Prefer this over minutes=1440 when the user named a time of day.",
       },
       title: {
         type: "string",
         description: "Short human-readable name for this routine (optional).",
       },
     },
-    required: ["prompt", "schedule", "minutes"],
+    required: ["prompt", "schedule"],
   },
 };
+
+/** Seconds until the next occurrence of `hour` (0–23) in UTC. */
+export function secondsUntilNextUtcHour(hour, now = Date.now()) {
+  const h = Math.floor(Number(hour));
+  if (!Number.isFinite(h) || h < 0 || h > 23) return 0;
+  const d = new Date(now);
+  const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), h, 0, 0, 0);
+  const target = next <= now ? next + 24 * 60 * 60 * 1000 : next;
+  return Math.max(60, Math.round((target - now) / 1000));
+}
 
 /** The `routines/manage` endpoint address the client put on the task. */
 export function routinesEndpointFromTask(task) {
@@ -98,11 +115,23 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
   if (!prompt) return { ok: false, error: "prompt is required" };
   const schedule = String(args?.schedule || "").trim().toLowerCase();
   const mode = schedule === "repeat" || schedule === "loop" ? "loop" : "delay";
-  const minutes = Number(args?.minutes);
-  if (!Number.isFinite(minutes) || minutes < 1) {
-    return { ok: false, error: "minutes must be a number >= 1" };
+  const hourRaw = args?.hour;
+  const hourSet = hourRaw !== undefined && hourRaw !== null && hourRaw !== "";
+  const hour = hourSet ? Math.floor(Number(hourRaw)) : NaN;
+  if (hourSet && (!Number.isFinite(hour) || hour < 0 || hour > 23)) {
+    return { ok: false, error: "hour must be an integer 0–23 (UTC)" };
   }
-  const seconds = Math.round(minutes * 60);
+  const minutes = Number(args?.minutes);
+  let seconds;
+  let delaySeconds = 0;
+  if (hourSet) {
+    delaySeconds = secondsUntilNextUtcHour(hour);
+    seconds = mode === "loop" ? 86400 : delaySeconds;
+  } else if (Number.isFinite(minutes) && minutes >= 1) {
+    seconds = Math.round(minutes * 60);
+  } else {
+    return { ok: false, error: "minutes must be a number >= 1 (or pass hour for a clock time)" };
+  }
 
   const self = task.self && typeof task.self === "object" ? task.self : {};
   const agentProgramId = String(task.agentProgramId || self.id || "").trim();
@@ -138,7 +167,12 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
     title: String(args?.title || "").trim(),
     prompt,
     mode,
-    ...(mode === "loop" ? { intervalSeconds: Math.max(60, seconds) } : { delaySeconds: seconds }),
+    ...(mode === "loop"
+      ? {
+          intervalSeconds: Math.max(60, seconds),
+          ...(hourSet || delaySeconds > 0 ? { delaySeconds: Math.max(1, delaySeconds || seconds) } : {}),
+        }
+      : { delaySeconds: seconds }),
     ...(agentProgramId ? { agentProgramId } : {}),
     ...(agentCreatureId ? { agentCreatureId } : {}),
     ...(agentEntityId ? { agentEntityId } : {}),
@@ -199,9 +233,11 @@ export async function scheduleRoutine(bridge, task, ownerUserId, args, { log } =
   }
 
   const when =
-    mode === "loop"
-      ? `every ${Math.max(1, Math.round(seconds / 60))} min`
-      : `in ${Math.max(1, Math.round(seconds / 60))} min`;
+    hourSet
+      ? `next ${String(hour).padStart(2, "0")}:00 UTC${mode === "loop" ? ", then daily" : ""}`
+      : mode === "loop"
+        ? `every ${Math.max(1, Math.round(seconds / 60))} min`
+        : `in ${Math.max(1, Math.round(seconds / 60))} min`;
   if (!reply) {
     // Fire-and-forget fallback: the creature is idempotent enough that a missed
     // ack does not mean it failed, but report the uncertainty honestly.

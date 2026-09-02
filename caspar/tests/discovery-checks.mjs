@@ -26,6 +26,7 @@ import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSp
 import { WARM_FUNCTION, prewarmToolContainers } from "../prewarm.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
+import { secondsUntilNextUtcHour } from "../scheduleRoutine.mjs";
 import { postSpaceSignal, KIND } from "../spaceHistory.mjs";
 import { uploadOutboundMedia } from "../mediaUpload.mjs";
 import { FakeGateway } from "./fakeGateway.mjs";
@@ -158,6 +159,7 @@ async function main() {
     assert.ok(!text.includes("Researcher"), "another agent is never listed as a callable capability");
     // it steers cross-agent work to @mention instead
     assert.ok(/@mention/i.test(text), "it points cross-agent work to @mention");
+    assert.ok(/expose/i.test(text), "it tells agents to expose a public URL");
     // it tells the model to answer capability questions with THESE, not built-ins
     assert.ok(/not the generic editor\/shell built-ins/i.test(text));
     // it is included in the full system prompt
@@ -198,6 +200,23 @@ async function main() {
     });
     assert.ok(/ROUTINES/i.test(withRoutines));
     assert.ok(/schedule_routine/.test(withRoutines));
+    assert.ok(/hour/i.test(withRoutines), "clock-time scheduling is advertised");
+    assert.ok(/every day at 9am/i.test(withRoutines));
+    const withOutcome = buildSystemPrompt({
+      spaceId: "space-1",
+      projectBrief: "Daily Instagram posts at 9am.",
+      routinesEndpoint: { programId: "routines-prog" },
+    });
+    assert.ok(/file on disk is not a schedule/i.test(withOutcome));
+  });
+
+  await check("secondsUntilNextUtcHour lands on the next clock hour UTC", () => {
+    const now = Date.UTC(2026, 8, 2, 12, 30, 0); // 12:30 UTC
+    const secs = secondsUntilNextUtcHour(9, now);
+    // next 09:00 is tomorrow
+    assert.equal(secs, 20.5 * 3600);
+    const later = secondsUntilNextUtcHour(13, now);
+    assert.equal(later, 30 * 60);
   });
 
   await check("built-in shell/fs tools are denied unconditionally (never a fallback)", () => {

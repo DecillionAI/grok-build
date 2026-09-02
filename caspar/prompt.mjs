@@ -98,9 +98,12 @@ export function groupChatPreamble(task) {
     "whoever should act next, then stop; you (or they) can build on their reply " +
     "when it arrives as a following turn.\n" +
     "  • Only @mention someone when you actually need something from them. If " +
-    "several teammates should work from the same artifact you just produced, " +
-    "@mention all of them in this same final reply, each with a specific ask, so " +
-    "they can run in parallel from your context. Otherwise mention one at a time.\n" +
+    "several teammates can start from the same artifact you just produced and none " +
+    "is blocked on another, @mention all of them in this same final reply, each " +
+    "with a specific ask, so they run in parallel. If B needs A's files, URL, or " +
+    "findings, @mention A only; A @mentions B when that artifact is ready. Do not " +
+    "mention a blocked teammate early. After you finish independent work, do not " +
+    "courtesy-ping the whole roster — @mention only who must do the next blocked step.\n" +
     "  • Your tool calls are shown to everyone in this chat as they happen (a " +
     "structured entry per call), so the team can already see the work — do not " +
     "narrate every tool call in your prose.\n" +
@@ -279,9 +282,11 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "of them is built for. Only call a capability when it actually helps the " +
     "current request. A chat-only plan or review memo is not a substitute for using " +
     "these tools. If the outcome needs a live page or service, write it on the shared " +
-    "machine, start it, and expose a public URL (sandbox `expose` / tunneled ports) " +
-    "so people in the project can open it in a browser. Do not leave the only URL as " +
-    "localhost — that is the sandbox VM, not their laptop. To bring " +
+    "machine, start it, keep it running, and call sandbox `expose` (or `tunnel`) " +
+    "with the listening port so people get a public URL they can Open in the app. " +
+    "Do not leave the only URL as localhost — that is the sandbox VM, not their " +
+    "laptop. Serve the actual app (index.html or the running process), never a " +
+    "directory listing. To bring " +
     "in another agent for part of the work, do NOT look " +
     "for it here — @mention them in your reply (see the group chat section); that " +
     "hand-off happens asynchronously as its own chat turn, it is not a tool call.\n" +
@@ -302,7 +307,9 @@ export function projectOutcomePreamble(task) {
     "not a one-off chatbot prompt. Keep working toward it on every turn unless the " +
     "latest message clearly changes course. Do not stop at a plan, review memo, or " +
     "essay if tools can produce a real artifact (files on the shared machine, a " +
-    "running preview URL, sourced research, an operated system).\n\n" +
+    "running public preview URL, sourced research, an operated system). Recurring " +
+    "work named in the brief (daily posts, a weekly digest, a reminder) is part of " +
+    "the outcome — schedule it with `schedule_routine`; a file on disk is not a schedule.\n\n" +
     brief +
     "\n=== END PROJECT OUTCOME ===\n"
   );
@@ -327,14 +334,19 @@ export function projectRoutinesPreamble(task) {
   return (
     "=== ROUTINES ===\n" +
     "You can schedule your OWN follow-up work in this project with the `schedule_routine` " +
-    "tool. Call it whenever the user asks you to do something after a delay (once) or on a " +
-    "recurring cadence (repeat) — e.g. \"remind me in an hour\", \"post a digest every " +
-    "morning\", \"check the deploy in 30 minutes\". When it runs, the platform posts your " +
-    "`prompt` into this chat mentioning you, and you handle it then — so you become the " +
+    "tool. Call it whenever the user (or the living project brief) asks for work after a " +
+    "delay or on a recurring cadence — including outcome language like \"posts I can put " +
+    "on Google and Instagram every day at 9am\", not only the words \"schedule\" or " +
+    "\"remind me\". Examples: \"remind me in an hour\", \"post a digest every morning\", " +
+    "\"check the deploy in 30 minutes\". When it runs, the platform posts your `prompt` " +
+    "into this chat mentioning you, and you handle it then — so you become the " +
     "responsible agent automatically; do not ask a person to click around.\n" +
-    "Use it ONLY for genuinely deferred or recurring work the user asked for. Never schedule " +
-    "a routine for a one-shot question you can answer now, and don't re-create a routine you " +
-    "already scheduled in this conversation.\n" +
+    "For a clock time (9:00 am daily), pass `schedule=repeat` and `hour` (0–23 UTC, " +
+    "convert from the user's local time if you know it) so the first fire is the next " +
+    "occurrence, then every 24 hours. Use `minutes=1440` only when there is no clock time.\n" +
+    "Use it ONLY for genuinely deferred or recurring work. Never schedule a routine for a " +
+    "one-shot question you can answer now, and don't re-create a routine you already " +
+    "scheduled in this conversation.\n" +
     "=== END ROUTINES ===\n"
   );
 }

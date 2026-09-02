@@ -95,6 +95,29 @@ function toHandle(name) {
     .replace(/^-+|-+$/g, "");
 }
 
+function normHandle(value) {
+  return toHandle(String(value || "").replace(/^@/, "").replace(/_/g, "-"));
+}
+
+/** Handles an answer may use for one agent (roster slug, name, last token). */
+function agentHandleForms(a) {
+  const forms = new Set();
+  const add = (v) => {
+    const h = normHandle(v);
+    if (h) forms.add(h);
+  };
+  add(a && a.handle);
+  add(a && a.name);
+  const name = String((a && a.name) || "").trim();
+  const parts = name.toLowerCase().split(/[^a-z0-9]+/).filter((p) => p.length >= 3);
+  for (const p of parts) forms.add(p);
+  for (const h of [...forms]) {
+    const last = h.split("-").filter(Boolean).pop();
+    if (last && last.length >= 3) forms.add(last);
+  }
+  return forms;
+}
+
 function spaceIdOf(task) {
   return String((task && (task.spaceId || task.storeId || task.space_id)) || "").trim();
 }
@@ -345,32 +368,41 @@ function parseAnswerMentions(answer) {
  * and the handle was derived from the program-index name). Only a handle/name +
  * program id are required — the launch signals the proxy by program id + entity,
  * so a missing creatureId must NOT drop a teammate. */
+function mentionExactHit(a, mention) {
+  const m = normHandle(mention);
+  if (!m) return false;
+  return normHandle(a.handle) === m || toHandle(a.name) === m;
+}
+
 function mentionedTeammates(answer, agents, { visited, selfProgram }) {
   const mentions = parseAnswerMentions(answer);
-  if (!mentions.size) return [];
+  if (!mentions.size) return { teammates: [], capped: [] };
   const visitedList = Array.isArray(visited) ? visited.map(String) : [...(visited || [])].map(String);
   const visitCount = (id) => visitedList.filter((v) => v === id).length;
   const out = [];
   const seen = new Set();
+  const capped = [];
+  const take = (a) => {
+    if (!a.programId || a.programId === selfProgram || seen.has(a.programId)) return false;
+    if (visitCount(a.programId) >= VISIT_CAP) {
+      if (!capped.some((x) => x.programId === a.programId)) capped.push(a);
+      return false;
+    }
+    seen.add(a.programId);
+    out.push(a);
+    return true;
+  };
+  const used = new Set();
   for (const a of agents) {
-    if (!a.programId) continue;
-    if (a.programId === selfProgram || visitCount(a.programId) >= VISIT_CAP || seen.has(a.programId)) continue;
-    const forms = new Set(
-      [a.handle, toHandle(a.handle), toHandle(a.name)].filter((v) => v && typeof v === "string").map((v) => v.toLowerCase()),
-    );
-    let hit = false;
-    for (const f of forms) {
-      if (mentions.has(f)) {
-        hit = true;
-        break;
-      }
-    }
-    if (hit) {
-      seen.add(a.programId);
-      out.push(a);
-    }
+    const hit = [...mentions].find((m) => mentionExactHit(a, m));
+    if (!hit) continue;
+    if (take(a)) used.add(normHandle(hit));
   }
-  return out;
+  for (const a of agents) {
+    const hit = [...mentions].find((m) => !used.has(normHandle(m)) && agentHandleForms(a).has(normHandle(m)));
+    if (hit) take(a);
+  }
+  return { teammates: out, capped };
 }
 
 /** Signal a teammate's proxy to run one turn; the proxy injects its skill/LLM
@@ -483,23 +515,25 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const teammates = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
+  const { teammates, capped } = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
   if (!teammates.length) {
     const known = agents.map((a) => a.handle).filter(Boolean);
-    log("GROK_ORCH", { followups: "no-teammates", agents: known, rosterSize: Array.isArray(task.roster) ? task.roster.length : 0, answerMentions: answerHandles });
+    log("GROK_ORCH", {
+      followups: "no-teammates",
+      agents: known,
+      capped: capped.map((a) => a.handle),
+      rosterSize: Array.isArray(task.roster) ? task.roster.length : 0,
+      answerMentions: answerHandles,
+    });
     if (answerHandles.length) {
-      await noteStall(
-        bridge,
-        task,
-        `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`,
-      );
+      const reason = capped.length
+        ? `those teammates already used their ${VISIT_CAP} turns this chain (${capped.map((a) => "@" + a.handle).join(", ")}).`
+        : `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`;
+      await noteStall(bridge, task, reason);
     }
     return 0;
   }
 
-  // Claim the whole batch in the visited set up front so two concurrent branches
-  // of the chain can never launch the same agent twice.
-  const nextVisited = [...visitedList, ...teammates.map((t) => t.programId)];
   const threadId = String(task.threadId || "main") || "main";
   const base = forwardContext(task);
   let launched = 0;
@@ -537,7 +571,16 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       autonomousQuote: true,
       correlationId,
       serverOrchestrate: true,
-      orchestration: { depth: depth + 1, maxHops, visited: nextVisited, poolId, payerUserId: payer },
+      // Only mark THIS teammate visited on their branch. Pre-claiming every
+      // sibling blocked later hand-offs ("@builder please wire the tracking
+      // the researcher just found") even when handles matched.
+      orchestration: {
+        depth: depth + 1,
+        maxHops,
+        visited: [...visitedList, teammate.programId],
+        poolId,
+        payerUserId: payer,
+      },
     };
     try {
       await signalProxyRun(bridge, teammate, childTask, { spaceId, correlationId, streamTo: payer });
