@@ -1,4 +1,5 @@
 import { releaseBillingRun } from "./finance.mjs";
+import { isUnmeteredToolFunction } from "./meterPolicy.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 
 function object(value) {
@@ -96,6 +97,15 @@ export async function runDirectTool(bridge, delivery, billingSession) {
       function: fn,
       space_id: String(task.spaceId || ""),
     });
+    if (isUnmeteredToolFunction(entry, fn)) {
+      await releaseBillingRun(bridge, billingSession, "unmetered tool peek");
+      return {
+        settled: false,
+        result: invoked.ok
+          ? invoked.response
+          : { ok: false, error: String(invoked?.error || "tool execution failed") },
+      };
+    }
     const usage = invoker.usageSnapshot()[0];
     if (!usage || usage.outcome === "timeout") {
       await releaseBillingRun(

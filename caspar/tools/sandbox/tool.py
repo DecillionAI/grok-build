@@ -96,12 +96,101 @@ NAME_PREFIX = os.environ.get("SANDBOX_PREFIX",
                              os.environ.get("VERCEL_SANDBOX_PREFIX", "decillion"))
 DEFAULT_TIMEOUT_MS = int(os.environ.get("SANDBOX_TIMEOUT_MS",
                                         os.environ.get("VERCEL_SANDBOX_TIMEOUT_MS", str(45 * 60 * 1000))))
+# Modal bills per second while a Sandbox is alive, including idle. Stop it after
+# this many ms with no exec and no open tunnel (preview URL / computer VNC).
+# Files stay on the Volume. Default 5 minutes.
+DEFAULT_IDLE_TIMEOUT_MS = int(os.environ.get("SANDBOX_IDLE_TIMEOUT_MS", str(5 * 60 * 1000)))
 DEFAULT_VCPUS = int(os.environ.get("SANDBOX_VCPUS",
                                    os.environ.get("VERCEL_SANDBOX_VCPUS", "2")))
 # Ports always tunneled so a person's browser can open a site the agents started.
 DEFAULT_PREVIEW_PORTS = [3000, 3001, 4173, 5173, 8000, 8080]
 
 _UNSAFE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+# Gateway bridge (set by tool_runtime). Used to read Admin Settings so idle
+# stop and max lifetime can change without baking new env into the image.
+_BRIDGE = None
+_SETTINGS_AT = 0.0
+_SETTINGS: Dict[str, Any] = {}
+_SETTINGS_TTL_S = 45.0
+
+
+def set_bridge(bridge) -> None:  # noqa: ANN001 — runtime hook
+    global _BRIDGE
+    _BRIDGE = bridge
+
+
+def _host_json_data(resp: Any) -> Any:
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    if isinstance(data, dict):
+        return data
+    for k in ("obj", "result"):
+        v = resp.get(k)
+        if isinstance(v, dict) and isinstance(v.get("data"), dict):
+            return v.get("data")
+    return None
+
+
+def _platform_settings() -> Dict[str, Any]:
+    """Admin Settings `config` blob (`Json::CreatureNamespace::settings`)."""
+    global _SETTINGS_AT, _SETTINGS
+    now = time.time()
+    if _SETTINGS and (now - _SETTINGS_AT) < _SETTINGS_TTL_S:
+        return _SETTINGS
+    if _BRIDGE is None:
+        return _SETTINGS
+    try:
+        resp = _BRIDGE.call(
+            "getJson",
+            {"key": "Json::CreatureNamespace::settings", "path": "config"},
+            timeout=10,
+        )
+        data = _host_json_data(resp)
+        if isinstance(data, dict):
+            _SETTINGS = data
+            _SETTINGS_AT = now
+    except Exception:  # noqa: BLE001 — env defaults still work
+        pass
+    return _SETTINGS
+
+
+def _cfg_number(cfg: Dict[str, Any], key: str, default: float) -> float:
+    raw = cfg.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if n != n:  # NaN
+        return default
+    return n
+
+
+def machine_timeouts_ms() -> Tuple[int, int]:
+    """Idle-stop and max-lifetime from Settings, else env defaults.
+
+    Historically there was *no* idle timeout — only ``SANDBOX_TIMEOUT_MS``
+    (45 minutes) as a hard session cap.
+    """
+    cfg = _platform_settings()
+    idle_min = _cfg_number(cfg, "sandboxIdleTimeoutMinutes", DEFAULT_IDLE_TIMEOUT_MS / 60_000)
+    max_min = _cfg_number(cfg, "sandboxMaxLifetimeMinutes", DEFAULT_TIMEOUT_MS / 60_000)
+    idle_min = max(1.0, min(120.0, idle_min))
+    max_min = max(5.0, min(24 * 60.0, max_min))
+    if idle_min >= max_min:
+        idle_min = max(1.0, max_min - 1.0)
+    return int(idle_min * 60_000), int(max_min * 60_000)
+
+
+def apply_machine_policy(payload: Dict[str, Any]) -> Dict[str, Any]:
+    idle_ms, max_ms = machine_timeouts_ms()
+    out = dict(payload)
+    out["timeout_ms"] = max_ms
+    out["idle_timeout_ms"] = idle_ms
+    return out
 
 
 class SandboxError(RuntimeError):
@@ -1328,7 +1417,8 @@ class ModalBackend(Backend):
         memory_mb = int(payload.get("memory_mb") or vcpus * 2048)
         # Modal timeouts are in seconds.
         timeout_s = max(60, int(int(payload.get("timeout_ms") or DEFAULT_TIMEOUT_MS) / 1000))
-        return {"cpu": vcpus, "memory": memory_mb, "timeout": timeout_s}
+        idle_timeout_s = max(60, int(int(payload.get("idle_timeout_ms") or DEFAULT_IDLE_TIMEOUT_MS) / 1000))
+        return {"cpu": vcpus, "memory": memory_mb, "timeout": timeout_s, "idle_timeout": idle_timeout_s}
 
     # -------------------------------------------------------------- discovery #
 
@@ -1376,10 +1466,15 @@ class ModalBackend(Backend):
             "cpu": res["cpu"],
             "memory": res["memory"],
             "timeout": res["timeout"],
+            "idle_timeout": res["idle_timeout"],
         }
         if encrypted_ports:
             kwargs["encrypted_ports"] = encrypted_ports
-        sb = modal.Sandbox.create(**kwargs)
+        try:
+            sb = modal.Sandbox.create(**kwargs)
+        except TypeError:
+            kwargs.pop("idle_timeout", None)
+            sb = modal.Sandbox.create(**kwargs)
         try:
             sb.set_tags({MODAL_SPACE_TAG: sandbox_name(space_id),
                          "origin": "decillion", "spaceId": str(space_id)[:256]})
@@ -1771,12 +1866,17 @@ def _space_id(payload: Dict[str, Any]) -> str:
     raise SandboxError("space_id is required — the sandbox is bound to a Decillion space")
 
 
+_LIFECYCLE_TIMEOUT_ACTIONS = {"create", "provision", "start", "resume"}
+
+
 def invoke(function_name: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = dict(payload or {})
     action = _normalize_action(function_name, payload)
     if action not in _SHARED_ACTIONS and action not in _BACKEND_ACTIONS:
         return {"ok": False, "error": f"unknown action '{action}'", "actions": _ALL_ACTIONS}
     try:
+        if action in _LIFECYCLE_TIMEOUT_ACTIONS:
+            payload = apply_machine_policy(payload)
         if action in _SPACELESS:
             return backend().list(payload)
         space_id = _space_id(payload)

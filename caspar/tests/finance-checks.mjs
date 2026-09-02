@@ -183,7 +183,7 @@ async function expectReject(label, fn, pattern) {
   const paidNodes = new Set(
     settle.input.lines.filter((line) => line.role === "node_owner").map((line) => line.userId),
   );
-  assert.deepEqual(paidNodes, new Set(["node", "tool-node"]), "agent and remote tool hosts are both paid");
+  assert.deepEqual(paidNodes, new Set(["tool-node"]), "remote tool hosts are paid for measured runtime; agent think-time is not billed as sandbox minutes");
 }
 
 {
@@ -429,6 +429,41 @@ const directToolTask = {
     "no platform floor line is charged when the quote reserved no platform cap",
   );
   assert.ok(receipt.chargedMinor < 10_000, "the run settles below the minimum rather than failing");
+}
+
+{
+  // Think-time with the sandbox attached must not bill node_owner wall-clock.
+  // Machine time is the sandbox/computer tool runtime lines only.
+  const thinkQuote = {
+    quoteId: "quote-think", requestId: "run-think", payerUserId: "payer",
+    kind: "agent", resourceId: "agent-program", projectId: "project-1",
+    maxAmount: 100_000,
+    beneficiaries: [
+      { userId: "provider", role: "provider_clearing", maxAmount: 100_000 },
+      { userId: "creator", role: "agent_creator", maxAmount: 100_000 },
+      { userId: "platform", role: "platform", maxAmount: 100_000 },
+      { userId: "node", role: "node_owner", maxAmount: 100_000 },
+    ],
+    priceSnapshot: {
+      kind: "agent",
+      inputPerMillionMinor: 1_000_000, outputPerMillionMinor: 1_000_000,
+      providerInputPerMillionMinor: 1_000_000, providerOutputPerMillionMinor: 1_000_000,
+      sandboxPerMinuteMinor: 600_000, minChargeMinor: 10, platformCommissionBps: 0,
+      platformAccountId: "platform", providerClearingAccountId: "provider",
+      nodeOwnerAccountId: "node", creatorAccountId: "creator", tools: [],
+    },
+  };
+  const bridge = new Bridge();
+  const session = {
+    runId: "run-think", quoteId: "quote-think", payerUserId: "payer",
+    holdId: "hold-think", quote: thinkQuote,
+  };
+  const receipt = await settleBillingRun(bridge, session, {
+    promptTokens: 1_000, completionTokens: 0, sandboxActive: true, durationMs: 300_000, tools: [],
+  });
+  const settle = bridge.calls.find((c) => c.op === "settleHold");
+  assert.ok(!settle.input.lines.some((l) => l.role === "node_owner"), "think-time is not billed as sandbox minutes");
+  assert.ok(receipt.chargedMinor > 0, "tokens still settle");
 }
 
 // ── agent run billing lifecycle (serveAgent) ────────────────────────────────

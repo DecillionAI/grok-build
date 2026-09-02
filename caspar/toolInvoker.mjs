@@ -22,6 +22,7 @@
 import crypto from "node:crypto";
 
 import { mergeArgs } from "./catalog.mjs";
+import { isUnmeteredToolFunction } from "./meterPolicy.mjs";
 
 /** Default reply window: a cold spawn under gVisor routinely takes >1 min. */
 import { creatureNumber } from "./env.mjs";
@@ -125,6 +126,7 @@ export class ToolInvoker {
     // The model may name a function for a multi-function creature; the catalog's
     // routing function is the default.
     const fn = payload.function || entry.function || "invoke";
+    const billable = options.billable !== false && !isUnmeteredToolFunction(entry, fn);
     const correlationId = crypto.randomBytes(16).toString("hex");
     const packet = {
       kind: "invoke",
@@ -166,7 +168,7 @@ export class ToolInvoker {
     try {
       const result = await Promise.race([settled, timedOut]);
       if (result === TIMED_OUT) {
-        if (options.billable !== false) {
+        if (billable) {
           this.usage.push({
             resourceId: String(target),
             calls: 1,
@@ -178,7 +180,7 @@ export class ToolInvoker {
         traceToolCall({ phase: "timeout", tool: name, function: String(fn), correlationId, ms: Date.now() - startedAt });
         return { ok: false, error: `tool creature ${name} did not reply within ${timeoutMs / 1000}s` };
       }
-      if (options.billable !== false) {
+      if (billable) {
         this.usage.push({
           resourceId: String(target),
           calls: 1,

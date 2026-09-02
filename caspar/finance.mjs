@@ -205,7 +205,9 @@ function agentSettlement(quote, observed, sourceRef) {
   if (price.kind !== "agent") throw new Error("quote price snapshot is not agent pricing");
   const promptTokens = integer(observed.promptTokens, "promptTokens");
   const completionTokens = integer(observed.completionTokens, "completionTokens");
-  const sandboxMs = observed.sandboxActive ? integer(observed.durationMs, "sandboxMs") : 0;
+  // LLM think-time is not a computer. Machine cost is measured tool runtime
+  // (sandbox exec, computer screenshot/click) on the quote's tool lines.
+  const sandboxMs = 0;
   const grossInput = ceilMulDiv(promptTokens, price.inputPerMillionMinor, 1_000_000, "input");
   const grossOutput = ceilMulDiv(completionTokens, price.outputPerMillionMinor, 1_000_000, "output");
   const gross = add(grossInput, grossOutput, "gross");
@@ -484,7 +486,7 @@ function agentCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
   const payer = String(quote.payerUserId || "");
   const promptTokens = integer(observed.promptTokens, "promptTokens");
   const completionTokens = integer(observed.completionTokens, "completionTokens");
-  const sandboxMs = observed.sandboxActive ? integer(observed.durationMs, "sandboxMs") : 0;
+  const sandboxMs = 0;
   const grossInput = ceilMulDiv(promptTokens, price.inputPerMillionMinor, 1_000_000, "input");
   const grossOutput = ceilMulDiv(completionTokens, price.outputPerMillionMinor, 1_000_000, "output");
   const gross = add(grossInput, grossOutput, "gross");

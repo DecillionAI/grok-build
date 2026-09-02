@@ -138,7 +138,8 @@ account.
 
 | env | meaning |
 |---|---|
-| `SANDBOX_TIMEOUT_MS` | session lifetime before auto-stop (45 min) |
+| `SANDBOX_TIMEOUT_MS` | max sandbox lifetime before hard stop (45 min) |
+| `SANDBOX_IDLE_TIMEOUT_MS` | Modal: stop the VM after this idle (no exec, no open tunnel). Default 5 min. Files stay on the Volume. |
 | `SANDBOX_VCPUS` | vCPUs, memory defaults to `vcpus * 2048` MB (2) |
 | `SANDBOX_PREFIX` | sandbox name prefix (`decillion`) |
 | `SANDBOX_MAX_OUTPUT` | chars of command output returned (60000) |
