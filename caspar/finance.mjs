@@ -791,6 +791,20 @@ export async function settleDirectToolRun(bridge, session, observed) {
   return { chargedMinor: settlement.total, usageHash: hash, lines: settlement.lines };
 }
 
+/** Split a settled charge into computer (node_owner) vs agent tokens. */
+export function splitSettledCharge(settlement) {
+  const total = Math.max(0, Math.round(Number(settlement?.chargedMinor ?? settlement?.total) || 0));
+  const lines = Array.isArray(settlement?.lines) ? settlement.lines : [];
+  let sandbox = 0;
+  for (const line of lines) {
+    if (String(line?.role || "") === "node_owner") {
+      sandbox += Math.max(0, Math.round(Number(line.amount) || 0));
+    }
+  }
+  sandbox = Math.min(total, Math.max(0, sandbox));
+  return { sandboxMinor: sandbox, llmMinor: Math.max(0, total - sandbox) };
+}
+
 export async function releaseBillingRun(bridge, session, reason) {
   // A live run reserved nothing up front — it only debited what it actually used —
   // so there is nothing to release/refund when it stops or fails. What it consumed

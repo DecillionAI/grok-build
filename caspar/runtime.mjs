@@ -65,6 +65,7 @@ import {
   releaseBillingRun,
   settleBillingRun,
   settleDirectToolRun,
+  splitSettledCharge,
 } from "./finance.mjs";
 import { runDirectTool } from "./directTool.mjs";
 import {
@@ -1027,6 +1028,9 @@ export async function serveAgent(bridge, delivery, runTask = handleTask) {
   }
   result.chargedMinor = settlement.chargedMinor;
   result.billingUsageHash = settlement.usageHash;
+  const split = splitSettledCharge(settlement);
+  result.sandboxMinor = split.sandboxMinor;
+  result.llmMinor = split.llmMinor;
   return result;
 }
 

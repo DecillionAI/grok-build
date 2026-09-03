@@ -8,6 +8,7 @@ import {
   releaseBillingRun,
   settleBillingRun,
   settleDirectToolRun,
+  splitSettledCharge,
 } from "../finance.mjs";
 import { serveAgent } from "../runtime.mjs";
 
@@ -584,6 +585,19 @@ const agentDelivery = { task, correlationId: "run-1" };
     () => authorizeBillingRun(bridge, { task: poolTask, correlationId: "run-1" }),
     /pool is not open/,
   );
+}
+
+{
+  const split = splitSettledCharge({
+    chargedMinor: 1000,
+    lines: [
+      { role: "provider_clearing", amount: 400 },
+      { role: "node_owner", amount: 250 },
+      { role: "platform", amount: 350 },
+    ],
+  });
+  assert.equal(split.sandboxMinor, 250, "computer spend is the node_owner lines");
+  assert.equal(split.llmMinor, 750, "the rest of the charge is agent tokens");
 }
 
 console.log("finance checks passed");
