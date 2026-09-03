@@ -102,7 +102,8 @@ DEFAULT_TIMEOUT_MS = int(os.environ.get("SANDBOX_TIMEOUT_MS",
 DEFAULT_IDLE_TIMEOUT_MS = int(os.environ.get("SANDBOX_IDLE_TIMEOUT_MS", str(5 * 60 * 1000)))
 DEFAULT_VCPUS = int(os.environ.get("SANDBOX_VCPUS",
                                    os.environ.get("VERCEL_SANDBOX_VCPUS", "2")))
-# Ports always tunneled so a person's browser can open a site the agents started.
+# Ports tunneled only when expose/preview asks — always-open tunnels prevent
+# Modal idle-stop (5 min unused) because they count as activity.
 DEFAULT_PREVIEW_PORTS = [3000, 3001, 4173, 5173, 8000, 8080]
 
 _UNSAFE = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -995,9 +996,9 @@ class VercelBackend(Backend):
         project = payload.get("project_id") or self._project_id()
         if project:
             body["projectId"] = project
-        if payload.get("ports") is None:
-            body["ports"] = list(DEFAULT_PREVIEW_PORTS)
-        for key, field in (("ports", "ports"), ("env", "env"), ("source", "source"),
+        if payload.get("ports") is not None:
+            body["ports"] = payload.get("ports")
+        for key, field in (("env", "env"), ("source", "source"),
                            ("network_policy", "networkPolicy"), ("mounts", "mounts")):
             if payload.get(key) is not None:
                 body[field] = payload[key]
@@ -1456,8 +1457,8 @@ class ModalBackend(Backend):
         modal = self._modal
         app = self._get_app()
         res = self._resources(payload)
-        ports = payload.get("ports") or DEFAULT_PREVIEW_PORTS
-        encrypted_ports = [int(p) for p in ports if str(p).strip().isdigit()]
+        ports = payload.get("ports")
+        encrypted_ports = [int(p) for p in (ports or []) if str(p).strip().isdigit()]
         kwargs: Dict[str, Any] = {
             "app": app,
             "image": self._image(payload),
@@ -1677,11 +1678,14 @@ class ModalBackend(Backend):
         if sb is not None:
             session_id = getattr(sb, "object_id", None)
             status = "running" if self._is_running(sb) else "stopped"
-            try:
-                for port, tunnel in (sb.tunnels() or {}).items():
-                    routes.append({"url": getattr(tunnel, "url", None), "port": port})
-            except Exception:  # noqa: BLE001 — no exposed ports / not supported
-                pass
+            # Do not call tunnels() on idle peeks — opening tunnels resets
+            # Modal's idle timer and keeps a unused VM billed.
+            if action not in ("info", "create", "status"):
+                try:
+                    for port, tunnel in (sb.tunnels() or {}).items():
+                        routes.append({"url": getattr(tunnel, "url", None), "port": port})
+                except Exception:  # noqa: BLE001 — no exposed ports / not supported
+                    pass
         return {
             "ok": True,
             "action": action,
@@ -1699,14 +1703,14 @@ class ModalBackend(Backend):
         }
 
     def create(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure the space's Volume exists. Do not boot a VM — first exec/start does."""
         self._forget(space_id)
+        self._volume(space_id)
         existing = self._find_running(space_id)
         if existing is not None:
             self._sandboxes[space_id] = (existing.object_id, time.monotonic() + _M_SESSION_TTL)
             return self._summarize(space_id, existing, "create", adopted=True)
-        sb = self._create_sandbox(space_id, payload)
-        self._sandboxes[space_id] = (sb.object_id, time.monotonic() + _M_SESSION_TTL)
-        return self._summarize(space_id, sb, "create", adopted=False)
+        return self._summarize(space_id, None, "create", adopted=False)
 
     def info(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         sb = self._find_running(space_id)

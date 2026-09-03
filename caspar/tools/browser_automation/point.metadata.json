@@ -25,7 +25,7 @@
   "requires_network": true,
   "requiresNetwork": true,
   "bindSpace": false,
-  "autoAttach": true,
+  "autoAttach": false,
   "function": "navigate",
   "requiredArgs": [
     "function"
