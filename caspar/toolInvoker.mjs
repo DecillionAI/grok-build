@@ -22,6 +22,7 @@
 import crypto from "node:crypto";
 
 import { mergeArgs } from "./catalog.mjs";
+import { isMachineTool, machineSnapshotFromToolResult, takeMachineMs } from "./machineSession.mjs";
 import { isUnmeteredToolFunction } from "./meterPolicy.mjs";
 
 /** Default reply window: a cold spawn under gVisor routinely takes >1 min. */
@@ -167,6 +168,19 @@ export class ToolInvoker {
     });
     try {
       const result = await Promise.race([settled, timedOut]);
+      const spaceId = String(payload.space_id || payload.spaceId || "");
+      if (spaceId && isMachineTool(entry)) {
+        try {
+          await takeMachineMs(
+            this.bridge,
+            spaceId,
+            result === TIMED_OUT ? null : machineSnapshotFromToolResult(result, entry),
+            { commit: false },
+          );
+        } catch {
+          /* machine heartbeat is best-effort */
+        }
+      }
       if (result === TIMED_OUT) {
         if (billable) {
           this.usage.push({

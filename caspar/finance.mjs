@@ -125,6 +125,10 @@ function toolSettlement(quote, observed, sourceRef) {
   }
   const calls = integer(observed.calls, "tool.calls");
   const runtimeMs = integer(observed.runtimeMs, "tool.runtimeMs");
+  // Computer minutes are the sandbox VM's wall clock when the meter observed
+  // it (`machineMs`). Call duration still pays the tool owner. Older receipts
+  // without machineMs keep billing node_owner from runtimeMs.
+  const nodeMs = observed.machineMs == null ? runtimeMs : integer(observed.machineMs, "tool.machineMs");
   // No per-run ceiling: the pool's remaining balance is the only limit (live pool
   // metering debits actual usage and stops when the pool empties). authorizedCalls
   // / authorizedRuntimeMs, when present, are only a sizing envelope — never a
@@ -138,7 +142,7 @@ function toolSettlement(quote, observed, sourceRef) {
   const margin = gross - provider;
   const commission = ceilMulDiv(margin, price.platformCommissionBps, 10_000, "tool.commission");
   const creator = margin - commission;
-  const node = ceilMulDiv(runtimeMs, price.sandboxPerMinuteMinor, 60_000, "tool.node");
+  const node = ceilMulDiv(nodeMs, price.sandboxPerMinuteMinor, 60_000, "tool.node");
   const caps = capMap(quote);
   const lines = [];
   const payer = String(quote.payerUserId || "");
@@ -205,9 +209,15 @@ function agentSettlement(quote, observed, sourceRef) {
   if (price.kind !== "agent") throw new Error("quote price snapshot is not agent pricing");
   const promptTokens = integer(observed.promptTokens, "promptTokens");
   const completionTokens = integer(observed.completionTokens, "completionTokens");
-  // LLM think-time is not a computer. Machine cost is measured tool runtime
-  // (sandbox exec, computer screenshot/click) on the quote's tool lines.
-  const sandboxMs = 0;
+  // LLM think-time is not a computer unless the space's VM is on. Wall-clock
+  // computer time is `observed.machineMs` (sandbox create → shutdown). When a
+  // tool row carries machineMs, that line takes the node_owner share so we
+  // do not also bill the agent coordinator.
+  const toolsObserved = Array.isArray(observed.tools) ? observed.tools : [];
+  const machineOnTool = toolsObserved.some((row) => row?.machineMs != null);
+  const sandboxMs = observed.machineMs == null || machineOnTool
+    ? 0
+    : integer(observed.machineMs, "machineMs");
   const grossInput = ceilMulDiv(promptTokens, price.inputPerMillionMinor, 1_000_000, "input");
   const grossOutput = ceilMulDiv(completionTokens, price.outputPerMillionMinor, 1_000_000, "output");
   const gross = add(grossInput, grossOutput, "gross");
@@ -250,7 +260,7 @@ function agentSettlement(quote, observed, sourceRef) {
     const calls = integer(raw?.calls, "tool.calls");
     const runtimeMs = integer(raw?.runtimeMs, "tool.runtimeMs");
     const outcome = String(raw?.outcome || "ok");
-    const current = toolUsage.get(resourceId) || { resourceId, calls: 0, runtimeMs: 0, timeouts: 0 };
+    const current = toolUsage.get(resourceId) || { resourceId, calls: 0, runtimeMs: 0, machineMs: 0, timeouts: 0 };
     // A routed tools/result packet is the completion receipt. If the remote
     // node never returns one, retain the timeout in usage evidence but do not
     // pay its tool owner or node for unproven execution.
@@ -259,6 +269,9 @@ function agentSettlement(quote, observed, sourceRef) {
     } else {
       current.calls = add(current.calls, calls, "tool.calls.total");
       current.runtimeMs = add(current.runtimeMs, runtimeMs, "tool.runtime.total");
+      if (raw?.machineMs != null) {
+        current.machineMs = add(current.machineMs, integer(raw.machineMs, "tool.machineMs"), "tool.machine.total");
+      }
     }
     toolUsage.set(resourceId, current);
   }
@@ -291,8 +304,11 @@ function agentSettlement(quote, observed, sourceRef) {
       "tool.commission",
     );
     const toolCreator = toolMargin - toolCommission;
+    const toolNodeMs = observed.machineMs == null && usage.machineMs === 0
+      ? usage.runtimeMs
+      : usage.machineMs;
     const toolNode = ceilMulDiv(
-      usage.runtimeMs,
+      toolNodeMs,
       tool.sandboxPerMinuteMinor,
       60_000,
       "tool.node",
@@ -486,7 +502,11 @@ function agentCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
   const payer = String(quote.payerUserId || "");
   const promptTokens = integer(observed.promptTokens, "promptTokens");
   const completionTokens = integer(observed.completionTokens, "completionTokens");
-  const sandboxMs = 0;
+  const toolsObserved = Array.isArray(observed.tools) ? observed.tools : [];
+  const machineOnTool = toolsObserved.some((row) => row?.machineMs != null);
+  const sandboxMs = observed.machineMs == null || machineOnTool
+    ? 0
+    : integer(observed.machineMs, "machineMs");
   const grossInput = ceilMulDiv(promptTokens, price.inputPerMillionMinor, 1_000_000, "input");
   const grossOutput = ceilMulDiv(completionTokens, price.outputPerMillionMinor, 1_000_000, "output");
   const gross = add(grossInput, grossOutput, "gross");
@@ -513,9 +533,12 @@ function agentCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
     const rid = String(raw?.resourceId || "");
     if (!toolPrices.has(rid)) continue; // only quote-authorized tools are billable
     if (String(raw?.outcome || "ok") === "timeout") continue; // unproven execution
-    const cur = toolUsage.get(rid) || { calls: 0, runtimeMs: 0 };
+    const cur = toolUsage.get(rid) || { calls: 0, runtimeMs: 0, machineMs: 0 };
     cur.calls = add(cur.calls, integer(raw?.calls, "tool.calls"), "tool.calls.total");
     cur.runtimeMs = add(cur.runtimeMs, integer(raw?.runtimeMs, "tool.runtimeMs"), "tool.runtime.total");
+    if (raw?.machineMs != null) {
+      cur.machineMs = add(cur.machineMs, integer(raw.machineMs, "tool.machineMs"), "tool.machine.total");
+    }
     toolUsage.set(rid, cur);
   }
   for (const [rid, usage] of toolUsage) {
@@ -528,7 +551,10 @@ function agentCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
     const toolMargin = toolGross >= toolProvider ? toolGross - toolProvider : 0;
     const toolCommission = ceilMulDiv(toolMargin, tool.platformCommissionBps, 10_000, "tool.commission");
     const toolCreator = toolMargin - toolCommission;
-    const toolNode = ceilMulDiv(usage.runtimeMs, tool.sandboxPerMinuteMinor, 60_000, "tool.node");
+    const toolNodeMs = observed.machineMs == null && usage.machineMs === 0
+      ? usage.runtimeMs
+      : usage.machineMs;
+    const toolNode = ceilMulDiv(toolNodeMs, tool.sandboxPerMinuteMinor, 60_000, "tool.node");
     const toolRef = `${sourceRef}:${rid}`;
     pushLine(lines, payer, String(tool.providerClearingAccountId), "provider_clearing", toolProvider, toolRef);
     pushLine(lines, payer, String(tool.creatorAccountId), "tool_owner", toolCreator, toolRef);
@@ -553,6 +579,7 @@ function toolCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
   const payer = String(quote.payerUserId || "");
   const calls = integer(observed.calls, "tool.calls");
   const runtimeMs = integer(observed.runtimeMs, "tool.runtimeMs");
+  const nodeMs = observed.machineMs == null ? runtimeMs : integer(observed.machineMs, "tool.machineMs");
   const fixed = calls > 0 ? integer(price.fixedMinor, "tool.fixedMinor") : 0;
   const callCost = ceilMulDiv(calls, price.perCallMinor, 1, "tool.calls");
   const runtimeCost = ceilMulDiv(runtimeMs, price.runtimePerMinuteMinor, 60_000, "tool.runtime");
@@ -561,7 +588,7 @@ function toolCumulativeLines(quote, observed, sourceRef, applyMinCharge) {
   const margin = gross >= provider ? gross - provider : 0;
   const commission = ceilMulDiv(margin, price.platformCommissionBps, 10_000, "tool.commission");
   const creator = margin - commission;
-  const node = ceilMulDiv(runtimeMs, price.sandboxPerMinuteMinor, 60_000, "tool.node");
+  const node = ceilMulDiv(nodeMs, price.sandboxPerMinuteMinor, 60_000, "tool.node");
   const lines = [];
   pushLine(lines, payer, String(price.providerClearingAccountId), "provider_clearing", provider, sourceRef);
   pushLine(lines, payer, String(price.creatorAccountId), "tool_owner", creator, sourceRef);

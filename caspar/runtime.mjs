@@ -68,6 +68,7 @@ import {
   splitSettledCharge,
 } from "./finance.mjs";
 import { runDirectTool } from "./directTool.mjs";
+import { takeMachineMs } from "./machineSession.mjs";
 import {
   ensureDelegatedAuthorization,
   isServerOrchestrated,
@@ -1011,6 +1012,19 @@ export async function serveAgent(bridge, delivery, runTask = handleTask) {
     durationMs: 0,
     sandboxActive: false,
   };
+  const spaceId = String(delivery?.task?.spaceId || delivery?.task?.space_id || "");
+  if (spaceId) {
+    try {
+      const cap = Number(billingSession.quote?.priceSnapshot?.authorizedRuntimeMs);
+      const machineMs = await takeMachineMs(bridge, spaceId, null, {
+        capMs: Number.isSafeInteger(cap) && cap > 0 ? cap : 600_000,
+        commit: true,
+      });
+      if (machineMs > 0) observed.machineMs = machineMs;
+    } catch {
+      /* wall-clock computer time is best-effort on top of token/tool receipts */
+    }
+  }
   let settlement;
   try {
     settlement = await retrySettlement(

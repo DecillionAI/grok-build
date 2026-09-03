@@ -433,8 +433,8 @@ const directToolTask = {
 }
 
 {
-  // Think-time with the sandbox attached must not bill node_owner wall-clock.
-  // Machine time is the sandbox/computer tool runtime lines only.
+  // Think-time with the sandbox *attached* but no VM wall-clock observed must
+  // not bill node_owner. Duration of the LLM call is not computer time.
   const thinkQuote = {
     quoteId: "quote-think", requestId: "run-think", payerUserId: "payer",
     kind: "agent", resourceId: "agent-program", projectId: "project-1",
@@ -465,6 +465,42 @@ const directToolTask = {
   const settle = bridge.calls.find((c) => c.op === "settleHold");
   assert.ok(!settle.input.lines.some((l) => l.role === "node_owner"), "think-time is not billed as sandbox minutes");
   assert.ok(receipt.chargedMinor > 0, "tokens still settle");
+}
+
+{
+  // Wall-clock while the space VM is on is computer time, including idle
+  // between tool calls (create → shutdown), billed as node_owner.
+  const liveQuote = {
+    quoteId: "quote-machine", requestId: "run-machine", payerUserId: "payer",
+    kind: "agent", resourceId: "agent-program", projectId: "project-1",
+    maxAmount: 100_000,
+    beneficiaries: [
+      { userId: "provider", role: "provider_clearing", maxAmount: 100_000 },
+      { userId: "creator", role: "agent_creator", maxAmount: 100_000 },
+      { userId: "platform", role: "platform", maxAmount: 100_000 },
+      { userId: "node", role: "node_owner", maxAmount: 100_000 },
+    ],
+    priceSnapshot: {
+      kind: "agent",
+      inputPerMillionMinor: 1_000_000, outputPerMillionMinor: 1_000_000,
+      providerInputPerMillionMinor: 1_000_000, providerOutputPerMillionMinor: 1_000_000,
+      sandboxPerMinuteMinor: 600, minChargeMinor: 10, platformCommissionBps: 0,
+      platformAccountId: "platform", providerClearingAccountId: "provider",
+      nodeOwnerAccountId: "node", creatorAccountId: "creator", tools: [],
+    },
+  };
+  const bridge = new Bridge();
+  const session = {
+    runId: "run-machine", quoteId: "quote-machine", payerUserId: "payer",
+    holdId: "hold-machine", quote: liveQuote,
+  };
+  await settleBillingRun(bridge, session, {
+    promptTokens: 1_000, completionTokens: 0, sandboxActive: true, durationMs: 1_000,
+    machineMs: 60_000, tools: [],
+  });
+  const settle = bridge.calls.find((c) => c.op === "settleHold");
+  const node = settle.input.lines.find((l) => l.role === "node_owner");
+  assert.equal(node?.amount, 600, "one VM-minute at the computer rate");
 }
 
 // ── agent run billing lifecycle (serveAgent) ────────────────────────────────

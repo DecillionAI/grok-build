@@ -1,4 +1,9 @@
 import { releaseBillingRun } from "./finance.mjs";
+import {
+  isMachineTool,
+  machineSnapshotFromToolResult,
+  takeMachineMs,
+} from "./machineSession.mjs";
 import { isUnmeteredToolFunction } from "./meterPolicy.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 
@@ -97,7 +102,24 @@ export async function runDirectTool(bridge, delivery, billingSession) {
       function: fn,
       space_id: String(task.spaceId || ""),
     });
-    if (isUnmeteredToolFunction(entry, fn)) {
+    const spaceId = String(task.spaceId || args.space_id || args.spaceId || "");
+    const snapshot = isMachineTool(entry)
+      ? machineSnapshotFromToolResult(invoked.ok ? invoked.response : invoked, entry)
+      : null;
+    const unmetered = isUnmeteredToolFunction(entry, fn);
+    const stopped = snapshot?.running === false;
+    let machineMs = 0;
+    if (spaceId && isMachineTool(entry)) {
+      try {
+        machineMs = await takeMachineMs(bridge, spaceId, snapshot, {
+          capMs: authorizedRuntimeMs,
+          commit: !unmetered || stopped,
+        });
+      } catch {
+        machineMs = 0;
+      }
+    }
+    if (unmetered && machineMs <= 0) {
       await releaseBillingRun(bridge, billingSession, "unmetered tool peek");
       return {
         settled: false,
@@ -107,7 +129,7 @@ export async function runDirectTool(bridge, delivery, billingSession) {
       };
     }
     const usage = invoker.usageSnapshot()[0];
-    if (!usage || usage.outcome === "timeout") {
+    if (!unmetered && (!usage || usage.outcome === "timeout")) {
       await releaseBillingRun(
         bridge,
         billingSession,
@@ -124,9 +146,10 @@ export async function runDirectTool(bridge, delivery, billingSession) {
       settled: true,
       observed: {
         resourceId,
-        calls: usage.calls,
-        runtimeMs: usage.runtimeMs,
-        outcome: usage.outcome,
+        calls: unmetered ? 0 : usage.calls,
+        runtimeMs: unmetered ? 0 : usage.runtimeMs,
+        machineMs,
+        outcome: unmetered ? "ok" : usage.outcome,
       },
       result: invoked.ok
         ? invoked.response
