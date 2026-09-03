@@ -28,7 +28,9 @@ process.env.DELEGATED_QUOTE_INTERVAL_MS = "3";
 import {
   billingEndpointFromTask,
   ensureDelegatedAuthorization,
+  isSequentialHandoff,
   isServerOrchestrated,
+  parseAnswerMentionsOrdered,
   planAndLaunchFollowups,
   resolvePoolId,
   settleAutonomousSpend,
@@ -263,7 +265,7 @@ await check("a teammate may be handed a second turn after finishing the first", 
   assert.equal(launched.length, 1);
 });
 
-await check("parallel launches do not pre-claim siblings on each child branch", async () => {
+await check("independent mentions still launch in parallel", async () => {
   const { bridge, launched } = makeBridge();
   const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
     success: true,
@@ -274,6 +276,19 @@ await check("parallel launches do not pre-claim siblings on each child branch", 
   assert.deepEqual(byTarget["builder-prog"].orchestration.visited, ["self-prog", "builder-prog"]);
   assert.deepEqual(byTarget["growth-prog"].orchestration.visited, ["self-prog", "growth-prog"]);
   assert.ok(!byTarget["builder-prog"].orchestration.visited.includes("growth-prog"));
+});
+
+await check("sequential cues launch only the first teammate", async () => {
+  assert.equal(isSequentialHandoff("@builder then @growth write posts"), true);
+  assert.equal(isSequentialHandoff("@builder ship it. @growth draft posts."), false);
+  assert.deepEqual(parseAnswerMentionsOrdered("ask @builder then @growth"), ["builder", "growth"]);
+  const { bridge, launched } = makeBridge();
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "@builder ship the site, then @growth draft the posts.",
+  });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "builder-prog");
 });
 
 await check("a specialist can hand off to a sibling after the lead's parallel wave", async () => {

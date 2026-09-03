@@ -350,16 +350,42 @@ async function agentAddressBook(bridge, spaceId, roster) {
   return [...byProgram.values()];
 }
 
-/** The distinct @handles an answer mentions, lowercased (no leading @). */
-function parseAnswerMentions(answer) {
-  const out = new Set();
+/** The @handles an answer mentions, in document order, lowercased (no leading @). */
+export function parseAnswerMentionsOrdered(answer) {
+  const out = [];
+  const seen = new Set();
   const re = /(^|[^a-z0-9_-])@([a-z0-9][a-z0-9_-]*)/gi;
   let m;
   while ((m = re.exec(String(answer || "")))) {
     const h = m[2].toLowerCase();
-    if (h) out.add(h);
+    if (!h || seen.has(h)) continue;
+    seen.add(h);
+    out.push(h);
   }
   return out;
+}
+
+/** The distinct @handles an answer mentions, lowercased (no leading @). */
+function parseAnswerMentions(answer) {
+  return new Set(parseAnswerMentionsOrdered(answer));
+}
+
+/**
+ * True when the answer is sequencing teammates (B needs A first) rather than
+ * launching independent work in parallel. Independent mentions stay parallel.
+ */
+export function isSequentialHandoff(answer) {
+  const text = String(answer || "");
+  if (!text.trim()) return false;
+  if (/\bthen\s+@[a-z0-9]/i.test(text)) return true;
+  if (/\bafter(?:wards)?(?:\s+that)?\s+@[a-z0-9]/i.test(text)) return true;
+  if (/\bfirst\s+@[a-z0-9]/i.test(text)) return true;
+  if (/\bonce\s+@[a-z0-9]/i.test(text)) return true;
+  if (/\b(?:wait for|blocked on|depends on|needs)\s+@[a-z0-9]/i.test(text)) return true;
+  if (/@[a-z0-9][a-z0-9_-]*[\s\S]{0,140}\bthen\b[\s\S]{0,80}@[a-z0-9]/i.test(text)) return true;
+  const numbered = (text.match(/\d+[\.)]\s*@[a-z0-9]/gi) || []).length;
+  if (numbered >= 2) return true;
+  return false;
 }
 
 /** Which agents in `agents` did `answer` @mention (excluding self / visited)?
@@ -375,8 +401,8 @@ function mentionExactHit(a, mention) {
 }
 
 function mentionedTeammates(answer, agents, { visited, selfProgram }) {
-  const mentions = parseAnswerMentions(answer);
-  if (!mentions.size) return { teammates: [], capped: [] };
+  const mentions = parseAnswerMentionsOrdered(answer);
+  if (!mentions.length) return { teammates: [], capped: [], serial: false };
   const visitedList = Array.isArray(visited) ? visited.map(String) : [...(visited || [])].map(String);
   const visitCount = (id) => visitedList.filter((v) => v === id).length;
   const out = [];
@@ -393,16 +419,18 @@ function mentionedTeammates(answer, agents, { visited, selfProgram }) {
     return true;
   };
   const used = new Set();
-  for (const a of agents) {
-    const hit = [...mentions].find((m) => mentionExactHit(a, m));
-    if (!hit) continue;
-    if (take(a)) used.add(normHandle(hit));
+  for (const mention of mentions) {
+    const a = agents.find((row) => mentionExactHit(row, mention));
+    if (!a) continue;
+    if (take(a)) used.add(normHandle(mention));
   }
-  for (const a of agents) {
-    const hit = [...mentions].find((m) => !used.has(normHandle(m)) && agentHandleForms(a).has(normHandle(m)));
-    if (hit) take(a);
+  for (const mention of mentions) {
+    if (used.has(normHandle(mention))) continue;
+    const a = agents.find((row) => agentHandleForms(row).has(normHandle(mention)));
+    if (a) take(a);
   }
-  return { teammates: out, capped };
+  const serial = isSequentialHandoff(answer) && out.length > 1;
+  return { teammates: serial ? out.slice(0, 1) : out, capped, serial };
 }
 
 /** Signal a teammate's proxy to run one turn; the proxy injects its skill/LLM
@@ -515,7 +543,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const { teammates, capped } = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
+  const { teammates, capped, serial } = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
   if (!teammates.length) {
     const known = agents.map((a) => a.handle).filter(Boolean);
     log("GROK_ORCH", {
@@ -532,6 +560,10 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       await noteStall(bridge, task, reason);
     }
     return 0;
+  }
+
+  if (serial) {
+    log("GROK_ORCH", { followups: "serial-first", handle: teammates[0]?.handle });
   }
 
   const threadId = String(task.threadId || "main") || "main";

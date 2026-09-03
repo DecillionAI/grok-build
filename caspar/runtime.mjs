@@ -45,7 +45,7 @@ import { materializeAttachments, mediaContentBlocks } from "./attachments.mjs";
 import { extractAttachmentTexts } from "./extract.mjs";
 import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { creatureEnv, creatureFlag, creatureNumber } from "./env.mjs";
-import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, runGrok, runTempDir } from "./grokRunner.mjs";
+import { disallowedBuiltinTools, hydratePlatformKeys, PLATFORM_KEY_PROVIDERS, persistedConversationSession, resolveGrokHome, runGrok, runTempDir } from "./grokRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
 import { httpMcpServersFromCatalog, mcpServerSummaries } from "./mcpAttach.mjs";
 import { TrajectoryMapper } from "./events.mjs";
@@ -551,7 +551,15 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     mcpServers: attachedMcpServers,
     workspace,
   });
-  const prompt = buildUserPrompt(task, { objective, attachments, extractedTexts, workspace });
+  const grokHomeGuess = resolveGrokHome({ slug: sessionSlug(sessionId) });
+  const resuming = Boolean(persistedConversationSession(grokHomeGuess) || task.resumeSessionId);
+  const prompt = buildUserPrompt(task, {
+    objective,
+    attachments,
+    extractedTexts,
+    workspace,
+    includeHistory: !resuming,
+  });
   // With inline media, the turn becomes ACP content blocks: the composed text
   // first, then each image/audio block. Without any, `promptBlocks` stays null and
   // the run uses the plain-text prompt exactly as before.

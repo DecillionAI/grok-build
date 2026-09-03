@@ -24,9 +24,9 @@
 import { creatureNumber } from "./env.mjs";
 
 const HISTORY_FETCH_TIMEOUT_MS = creatureNumber("HISTORY_FETCH_TIMEOUT_MS", 8000);
-const MAX_TURN_CHARS = creatureNumber("HISTORY_TURN_CHARS", 4000);
+const MAX_TURN_CHARS = creatureNumber("HISTORY_TURN_CHARS", 800);
 /** How many of a thread's most recent conversational turns a prompt may carry. */
-const HISTORY_TURN_LIMIT = creatureNumber("HISTORY_TURN_LIMIT", 80);
+const HISTORY_TURN_LIMIT = creatureNumber("HISTORY_TURN_LIMIT", 16);
 
 /** What a signal is. One `kind=` tag per signal, always present. */
 export const KIND = {

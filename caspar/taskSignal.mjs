@@ -17,6 +17,7 @@
  * Everything here is pure so the decoding rules are testable without a node.
  */
 
+import crypto from "node:crypto";
 /** Keys the proxy stamps on the wrapper; kept when an inner payload is unwrapped. */
 const PROXY_KEYS = [
   "skill",
@@ -161,18 +162,39 @@ export function taskObjective(task) {
  * Derive a conversation-thread key from the task.
  *
  * The backend sends an explicit `sessionId` (`space:<spaceId>:<agentId|orbit>`),
- * which is authoritative. The space/target fallback mirrors that shape so a
- * caller that sends neither still gets one stable thread per space+agent instead
- * of mixing unrelated conversations onto one workspace.
+ * which is authoritative. Teammates must not share one Grok resume session —
+ * that is what made input tokens grow with every hop. A shared `…:orbit` key
+ * is pinned to this agent; an explicit per-agent key is left alone.
  */
+function agentSessionKey(task) {
+  const self = task && task.self && typeof task.self === "object" ? task.self : {};
+  return String(
+    self.id ||
+      self.programId ||
+      task.proxyProgramId ||
+      task.targetAgentId ||
+      task.target_agent_id ||
+      task.toAgent ||
+      "",
+  ).trim();
+}
+
 export function threadSessionId(task, fallback = "grok-default") {
   const explicit = task.session_id || task.sessionId;
-  if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
   const space = task.spaceId || task.storeId || task.space_id;
-  if (space) {
-    const target = task.self?.id || task.targetAgentId || task.target_agent_id || task.toAgent || "orbit";
-    return `space:${space}:${target}`;
+  const thread = String(task.threadId || task.thread_id || "main").trim() || "main";
+  const agent = agentSessionKey(task);
+  if (typeof explicit === "string" && explicit.trim()) {
+    let base = explicit.trim();
+    if (agent && /:(orbit|default)$/i.test(base) && !base.includes(agent)) {
+      base = `${base}:${agent}`;
+    }
+    if (thread !== "main" && !base.includes(`:${thread}`)) {
+      base = `${base}:${thread}`;
+    }
+    return base;
   }
+  if (space) return `space:${space}:${thread}:${agent || "orbit"}`;
   return fallback;
 }
 
@@ -180,7 +202,9 @@ export function threadSessionId(task, fallback = "grok-default") {
 export function sessionSlug(sessionId) {
   const slug = String(sessionId)
     .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 96);
-  return slug || "session";
+    .replace(/^-+|-+$/g, "");
+  if (!slug) return "session";
+  if (slug.length <= 120) return slug;
+  const hash = crypto.createHash("sha256").update(String(sessionId)).digest("hex").slice(0, 16);
+  return `${slug.slice(0, 96)}-${hash}`;
 }

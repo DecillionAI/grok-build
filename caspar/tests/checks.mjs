@@ -43,7 +43,7 @@ import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
 import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
 import { OutboundMediaCollector } from "../outboundMedia.mjs";
-import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
+import { buildSystemPrompt, buildUserPrompt, compactConversationBlock } from "../prompt.mjs";
 import { buildResult, normalizeUsage } from "../result.mjs";
 import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, readSpaceSignals, KIND } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
@@ -279,7 +279,7 @@ await check("the system prompt carries the persona and the group-chat protocol",
   assert.equal(/• Tina/.test(system), false, "the agent should not be in its own roster");
 });
 
-await check("history is owned by Grok and is not flattened into the current user turn", () => {
+await check("a new agent session gets a compact room transcript, not the full history", () => {
   const history = [
     { role: "user", content: "hey team", from: "Shayan", to: [] },
     { role: "assistant", content: "on it", from: "Bob", to: [{ name: "Shayan" }] },
@@ -287,8 +287,28 @@ await check("history is owned by Grok and is not flattened into the current user
   ];
   const { task } = decodeTaskSignal(...Object.values(proxyDelivery({ history })));
   const prompt = buildUserPrompt(task, { objective: "what's the status?", attachments: [], workspace: "/w" });
-  assert.equal(prompt, "what's the status?");
-  assert.doesNotMatch(prompt, /hey team|on it|CONVERSATION SO FAR/);
+  assert.match(prompt, /RECENT CHAT \(compact\)/);
+  assert.match(prompt, /Shayan: hey team/);
+  assert.match(prompt, /what's the status\?/);
+  assert.doesNotMatch(prompt, /CONVERSATION SO FAR/);
+  const resumed = buildUserPrompt(task, {
+    objective: "what's the status?",
+    attachments: [],
+    workspace: "/w",
+    includeHistory: false,
+  });
+  assert.equal(resumed, "what's the status?");
+  const compact = compactConversationBlock(history);
+  assert.ok(compact.length < 800);
+});
+
+await check("a shared orbit session id is pinned to the acting agent", () => {
+  assert.equal(
+    threadSessionId({ sessionId: "space:space-1:orbit", self: { id: "res-tina" }, spaceId: "space-1" }),
+    "space:space-1:orbit:res-tina",
+  );
+  assert.equal(threadSessionId({ sessionId: "space:space-1:res-tina", self: { id: "res-tina" } }), "space:space-1:res-tina");
+  assert.equal(threadSessionId({ spaceId: "space-1", self: { id: "res-tina" }, threadId: "design" }), "space:space-1:design:res-tina");
 });
 
 await check("OpenAI GPT-family image generation uses the Responses image tool and attaches its bytes", async () => {

@@ -11,13 +11,13 @@
  *                    several agents and people; the agent has to know who it is,
  *                    who else is present, and the @mention protocol that decides
  *                    who gets triggered next.
- *   • `history`    — retained on the delivery envelope for compatibility, but
- *                    not flattened into the next user message. Grok's persisted
- *                    session owns conversation history and context compaction.
+ *   • `history`    — compact recent chat on a *new* Grok session so a teammate
+ *                    sees the room; omitted when this agent is already resuming
+ *                    its own native session. Never the full 80-turn dump.
  *   • `attachments`— files materialised into the workspace.
  *
  * Stable identity/capability information belongs in Grok's system rules. The
- * user turn contains only the current message and its current attachments.
+ * user turn is the current message, optional compact chat, and attachments.
  */
 
 /** The agent's own identity, as sent by the backend. */
@@ -102,8 +102,9 @@ export function groupChatPreamble(task) {
     "is blocked on another, @mention all of them in this same final reply, each " +
     "with a specific ask, so they run in parallel. If B needs A's files, URL, or " +
     "findings, @mention A only; A @mentions B when that artifact is ready. Do not " +
-    "mention a blocked teammate early. After you finish independent work, do not " +
-    "courtesy-ping the whole roster — @mention only who must do the next blocked step.\n" +
+    "mention a blocked teammate early — never write “@a then @b” when b is waiting " +
+    "on a. After you finish independent work, do not courtesy-ping the whole roster " +
+    "— @mention only who must do the next blocked step.\n" +
     "  • Your tool calls are shown to everyone in this chat as they happen (a " +
     "structured entry per call), so the team can already see the work — do not " +
     "narrate every tool call in your prose.\n" +
@@ -282,11 +283,13 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "of them is built for. Only call a capability when it actually helps the " +
     "current request. A chat-only plan or review memo is not a substitute for using " +
     "these tools. If the outcome needs a live page or service, write it on the shared " +
-    "machine, start it, keep it running, and call sandbox `expose` (or `tunnel`) " +
-    "with the listening port so people get a public URL they can Open in the app. " +
+    "machine, start the real process people would run locally (the framework " +
+    "dev server, next/vite/npm start, the API) and keep it running, then call " +
+    "sandbox `expose` (or `tunnel`) with the listening port so people get a " +
+    "public URL they can Open in the app. Do not start `python -m http.server` " +
+    "on a folder of source files: that drops CSS/JS and is not the product. " +
     "Do not leave the only URL as localhost — that is the sandbox VM, not their " +
-    "laptop. Serve the actual app (index.html or the running process), never a " +
-    "directory listing. The graphical `computer` desktop (VNC GUI on that same " +
+    "laptop. Serve the running app, never a directory listing. The graphical `computer` desktop (VNC GUI on that same " +
     "sandbox) is expensive while it runs. Prefer sandbox exec, files, `expose`, " +
     "`web_search`, and headless browser tools. Call computer only when a visible " +
     "GUI page must be seen or clicked (login walls, captchas, a person watching). " +
@@ -445,14 +448,43 @@ export function buildSystemPrompt(task, opts = {}) {
   return parts.join("\n");
 }
 
+const CHAT_CONTEXT_TURNS = 12;
+const CHAT_TURN_CHARS = 500;
+const CHAT_OLDER_CHARS = 160;
+
 /**
- * The user turn handed to Grok: only the current message and material that is
- * part of that message. Conversation history is deliberately absent: Grok owns
- * it through its persisted/resumed session and applies its native context
- * management instead of receiving a synthetic transcript on every turn.
+ * A compact room transcript for a *new* Grok session. Each agent has its own
+ * native session; without this, a teammate would not see the group chat. Kept
+ * short on purpose so input tokens do not grow with every hop.
  */
-export function buildUserPrompt(task, { objective, attachments = [], extractedTexts = [], workspace }) {
+export function compactConversationBlock(turns) {
+  if (!Array.isArray(turns) || !turns.length) return "";
+  const slice = turns.slice(-CHAT_CONTEXT_TURNS);
+  const lines = slice.map((t, i) => {
+    const cap = i < Math.max(0, slice.length - 4) ? CHAT_OLDER_CHARS : CHAT_TURN_CHARS;
+    const who = String(t?.from || (t?.role === "assistant" ? "agent" : "user")).replace(/\s+/g, " ").trim() || "user";
+    const body = String(t?.content || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, cap);
+    if (!body) return "";
+    return `${who}: ${body}`;
+  }).filter(Boolean);
+  if (!lines.length) return "";
+  return "=== RECENT CHAT (compact) ===\n" + lines.join("\n") + "\n=== END RECENT CHAT ===\n";
+}
+
+/**
+ * The user turn handed to Grok: the current message, plus a short compact of
+ * recent room chat when this agent does not already have a resumed native
+ * session. Full Grok resume still owns same-agent context.
+ */
+export function buildUserPrompt(task, { objective, attachments = [], extractedTexts = [], workspace, includeHistory = true } = {}) {
   const parts = [];
+  if (includeHistory) {
+    const compact = compactConversationBlock(task && task.history);
+    if (compact) parts.push(compact);
+  }
   if (attachments.length) {
     parts.push(
       "=== FILES ATTACHED TO THIS MESSAGE ===\n" +
