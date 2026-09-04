@@ -77,6 +77,8 @@ import {
   recordServerRun,
   settleAutonomousSpend,
 } from "./orchestrate.mjs";
+import { AgentTaskBoard } from "./agentQueue.mjs";
+import { SEND_MESSAGE_TOOL, sendAgentMessage } from "./sendMessage.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -312,7 +314,15 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   // existing internet URL or a file from the shared sandbox.
   const initialCatalog = buildToolDefinitions(catalog);
   const byName = initialCatalog.byName;
-  const platformToolDefs = [GENERATE_MEDIA_TOOL, SHARE_MEDIA_TOOL, SCHEDULE_ROUTINE_TOOL];
+  const platformToolDefs = [
+    GENERATE_MEDIA_TOOL,
+    SHARE_MEDIA_TOOL,
+    SCHEDULE_ROUTINE_TOOL,
+    // Speaking mid-run needs a chat to speak into. A spaceless run (the market
+    // advisor) has none, so the tool is not offered there rather than offered
+    // and then refused.
+    ...(task.spaceId || task.storeId || task.space_id ? [SEND_MESSAGE_TOOL] : []),
+  ];
   const reservedToolNames = new Set(platformToolDefs.map((tool) => tool.name));
   const installCatalog = (rebuilt) => {
     // `initialCatalog.byName` is the same Map object as `byName`; snapshot it
@@ -323,7 +333,12 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
       if (!reservedToolNames.has(name)) byName.set(name, entry);
     }
     for (const tool of platformToolDefs) {
-      const category = tool.name === SCHEDULE_ROUTINE_TOOL.name ? "scheduler" : "media";
+      const category =
+        tool.name === SCHEDULE_ROUTINE_TOOL.name
+          ? "scheduler"
+          : tool.name === SEND_MESSAGE_TOOL.name
+            ? "chat"
+            : "media";
       byName.set(tool.name, { name: tool.name, kind: "tool", category });
     }
     return [...rebuilt.tools.filter((tool) => !reservedToolNames.has(tool.name)), ...platformToolDefs];
@@ -402,6 +417,10 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
       if (name === SHARE_MEDIA_TOOL.name) return mediaCollector.share(args);
       if (name === SCHEDULE_ROUTINE_TOOL.name)
         return scheduleRoutine(bridge, task, streamTo, args, { log });
+      if (name === SEND_MESSAGE_TOOL.name)
+        return sendAgentMessage(bridge, { ...task, correlationId: correlationId || task.correlationId }, args, {
+          log: (info) => log("GROK_SEND_MESSAGE", info),
+        });
       if (!invoker) return { ok: false, error: `tool ${name} needs a live Caspar bridge` };
       return invoker.invoke(name, args);
     },
@@ -1114,6 +1133,48 @@ export async function serveOnce(bridge, delivery) {
 }
 
 /**
+ * Tell the requester their prompt is on the agent's board rather than running.
+ *
+ * This is a TERMINAL reply on the original correlation, deliberately: the agent
+ * is busy, and how long it stays busy is not something a waiting client can be
+ * asked to sit through (its own idle watchdog would give up first, and holding a
+ * billing authorization open for an unknown wait is worse still). So the client
+ * releases its hold and shows the turn as queued; when the agent gets to the
+ * task, the backbone runs it unattended on a delegated quote and the answer
+ * lands in the chat like any other — no client needed, and none kept waiting.
+ */
+async function replyQueued(bridge, delivery, record) {
+  const result = {
+    objective: taskObjective(delivery.task || {}),
+    engine: "grok-build",
+    success: true,
+    queued: true,
+    answer: "",
+    task: {
+      taskId: record.taskId,
+      title: record.title,
+      spaceId: record.spaceId,
+      threadId: record.threadId,
+      agentProgramId: record.agentProgramId,
+      agentName: record.agentName,
+    },
+  };
+  process.stdout.write(`DAVINCI_RESULT ${JSON.stringify(result)}\n`);
+  if (!bridge || !delivery.replyTo) return;
+  try {
+    await bridge.signalUser("creatures/signal", String(delivery.replyTo), {
+      kind: "davinci/result",
+      correlationId: delivery.correlationId,
+      final: true,
+      stream: false,
+      result,
+    });
+  } catch (err) {
+    log("GROK_TASKBOARD", { queued_reply_error: String(err?.message || err).slice(0, 200) });
+  }
+}
+
+/**
  * The queue of prompts waiting to be served.
  *
  * One creature program serves EVERY agent in the platform, so two prompts can
@@ -1290,9 +1351,23 @@ export async function main() {
   // the loop the instant any slot opens. `serveOnce` never throws (it always
   // replies), but the guard keeps one broken run from taking down the server.
   const inFlight = new Set();
+  // One worker per agent per project, and the backlog behind it. Every prompt
+  // addressed to an agent becomes a task on its board; the board runs it now if
+  // the agent is free, and otherwise keeps it until the agent finishes what it is
+  // on. See agentQueue.mjs — this is why two instances of one agent never work at
+  // the same time, while different agents still run fully in parallel.
+  const board = new AgentTaskBoard();
   const startDelivery = (activeBridge, delivery) => {
     const task = (async () => {
       try {
+        // Does this agent take the work now, or does it go on its board? A
+        // delivery the board does not own (a direct tool call, a spaceless run)
+        // is admitted straight through, exactly as before.
+        const admission = await board.admit(activeBridge, delivery);
+        if (admission !== "run") {
+          if (admission && admission.queued) await replyQueued(activeBridge, delivery, admission.queued);
+          return;
+        }
         // A server-orchestrated delivery that arrived without a billing
         // authorization (a routine firing with no client to mint one) needs a
         // delegated quote built before it can run. No-op when the client already
@@ -1301,6 +1376,13 @@ export async function main() {
           const ready = await ensureDelegatedAuthorization(activeBridge, delivery);
           if (!ready) {
             log("GROK_ORCH", { skipped: "no-delegated-authorization", correlationId: delivery.correlationId });
+            // The task was claimed off the board for a run that cannot be paid
+            // for. Close it out (and free the agent) rather than leaving the
+            // board holding a task nobody will ever run.
+            await board.finish(activeBridge, delivery, {
+              success: false,
+              error: "no delegated billing authorization for this run",
+            });
             return;
           }
         }
@@ -1320,8 +1402,18 @@ export async function main() {
         // non-orchestrated run.
         await settleAutonomousSpend(activeBridge, delivery, result);
         await planAndLaunchFollowups(activeBridge, delivery, result);
+        // Archive this task off the agent's board and let it choose what to do
+        // next — the cycle that keeps the queue draining with no client present.
+        await board.finish(activeBridge, delivery, result);
       } catch (err) {
         log("GROK_BOOT", { serve_error: String(err?.message || err).slice(0, 200) });
+        // A run that threw still ends its task: leaving it "started" would hold
+        // the agent's only slot forever and stall everything behind it.
+        try {
+          await board.finish(activeBridge, delivery, { success: false, error: String(err?.message || err).slice(0, 300) });
+        } catch {
+          /* the board reports its own failures */
+        }
       } finally {
         served += 1;
         inFlight.delete(task);
@@ -1364,7 +1456,7 @@ export async function main() {
         continue;
       }
 
-      log("GROK_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, inflight: inFlight.size, ts: Date.now() / 1000 });
+      log("GROK_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, inflight: inFlight.size, agents_busy: board.activeCount, ts: Date.now() / 1000 });
       const delivery = await deliveries.next();
       if (delivery) {
         // Start the run and immediately loop back for the next prompt instead of

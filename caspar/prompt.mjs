@@ -114,7 +114,39 @@ export function groupChatPreamble(task) {
     "conversation back and forth forever).\n" +
     "  • Do not @mention yourself, and do not repeat another participant's answer " +
     "as if it were your own.\n" +
+    "  • Every teammate works on ONE task at a time. When you @mention someone who " +
+    "is already busy, your request is added to their queue and they start it when " +
+    "they finish what they are on — so a hand-off never fails for being badly " +
+    "timed, and you must never re-send it or wait for it inside this turn.\n" +
     "=== END GROUP CHAT ===\n"
+  );
+}
+
+/**
+ * Speaking mid-task — the `send_message` tool.
+ *
+ * An agent's turn used to have exactly one thing it could say: the final answer.
+ * `send_message` gives it a real chat channel it can use while it works, and
+ * (because a mention is how this platform hands work over) a way to hand a
+ * teammate work without ending its own turn. The preamble's job is only to say
+ * WHEN to reach for it; the tool itself does the posting and the hand-off.
+ */
+export function agentMessagingPreamble(task) {
+  if (!task || !task.spaceId) return "";
+  return (
+    "=== SPEAKING WHILE YOU WORK ===\n" +
+    "You can post a message into this chat at any point during your turn with the " +
+    "`send_message` tool — you do not have to save everything for your final answer, " +
+    "and you may call it several times.\n" +
+    "Use it to: say what you found as soon as it matters, tell the team you are taking " +
+    "a long path before you take it, ask a person a question you need answered, or hand " +
+    "a piece of work to a teammate by @mentioning them in the message — they are queued " +
+    "to start on it right away while you carry on with the rest.\n" +
+    "It is not your final answer: what you return at the end of the turn is still posted " +
+    "as your answer. Do not narrate every small step with it, and do not use it to repeat " +
+    "what you are about to say anyway — use it when someone would genuinely want to know " +
+    "now rather than at the end.\n" +
+    "=== END SPEAKING WHILE YOU WORK ===\n"
   );
 }
 
@@ -414,6 +446,9 @@ export function buildSystemPrompt(task, opts = {}) {
 
   const routines = projectRoutinesPreamble(task);
   if (routines) parts.push(routines);
+
+  const messaging = agentMessagingPreamble(task);
+  if (messaging) parts.push(messaging);
 
   if (opts.workspace) {
     parts.push(

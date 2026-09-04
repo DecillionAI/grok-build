@@ -141,6 +141,9 @@ which the node relays while keeping the correlation open.
 | `mediaUpload.mjs` | Puts media an agent shared into blob storage before the turn is built, so a chat record holds `{name, mimeType, kind, storageId, size}` and never base64. Uploads with `asSelf`, so the node — not this process — decides whose identity the file is stored under; an upload that fails is named on the turn rather than dropped. No URL is stored: clients build it from the id against their own storage base. |
 | `spaceHistory.mjs` | The space's chat, read and written through the node's signal log: `readSpaceSignals` / `fetchSpaceConversation` (tag-filtered read → the annotated history turns `prompt.mjs` renders) and `postSpaceSignal` (one tagged signal per turn — recorded and fanned out live in one call). Owns the tag vocabulary (`KIND`, `SIGNAL_TAGS`), which is shared with the Expo client and the decillion creatures. |
 | `orchestrate.mjs` | **Server-side agent orchestration.** After a run marked `serverOrchestrate` posts its answer, the backbone resolves the teammates it @mentioned (roster + program index), mints a **delegated** billing quote for each against the payer's pool (`billing/quote` with an explicit `payerUserId`, honoured because this backbone IS the settlement meter; bounded by the project's autonomous budget), and signals each teammate's proxy to run — so the @mention chain (and routine-fired runs) complete with **no client present**. `visited`/`maxHops` carry on the task, so the chain can't loop or double-launch; only backbone-minted (`autonomousQuote`) runs settle against the autonomous budget. Wired into `runtime.mjs`'s `startDelivery` (ensure-auth → serve → settle → fan out). |
+| `agentQueue.mjs` | **The per-agent task board (the kanban).** Every prompt addressed to an agent in a project becomes a task on that agent's board: run at once when the agent is free, queued behind whatever it is on otherwise, so two instances of one agent never work at the same time. Finishing a task archives it and starts the next — with more than one waiting, the agent's own model picks from the task TITLES (`llmChoice.mjs`), falling back to oldest-first. The board is a projection of `kind=task` signals on the space's log (`queued → started → done \| failed`, plus `requeued`/`cancelled`), so the app renders it live off the same fan-out and this backbone rebuilds a queue after a restart. A waiting task is later run by re-signalling the agent's proxy (`queueClaimed`), billed as the unattended run it is — a delegated quote inside the project's autonomous budget. |
+| `llmChoice.mjs` | "Which of my waiting tasks next?" — one tiny completion on the agent's own provider, titles in, a number out. Every failure (no key, refusal, timeout, unparseable answer) falls back to the oldest waiting task. |
+| `sendMessage.mjs` | The `send_message` micro-tool: an agent posts a real chat message **mid-run**, as many times as the task needs, instead of only speaking in its final answer — and any teammate it @mentions in one is handed the work right then (onto that teammate's board), so it hands off without ending its turn. Interim messages ride `kind=answer` with `interim: true`; the run's own answer is still written once, by the runtime. |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
 | `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time — the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`) — and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
 | `mcpAttach.mjs` | The **MCP servers a project attached** (catalog entries of kind `mcp`): turns each into a native `[mcp_servers.<name>]` url entry for the CLI (bearer token / extra headers / SSE transport), and summarises them for the prompt. They are never callable Caspar creatures — the CLI dials them itself. |
@@ -508,10 +511,13 @@ receiving an incompatible media request.
 ## Testing
 
 ```bash
-node caspar/tests/checks.mjs            # 45 checks, no node/container/LLM needed
-node caspar/tests/discovery-checks.mjs  # in-space discovery, merge and prompt
-node caspar/tests/live-cli.mjs          # against a REAL grok CLI (needs credentials)
-node caspar/tests/container-check.mjs   # against the built image (needs docker)
+node caspar/tests/checks.mjs             # 61 checks, no node/container/LLM needed
+node caspar/tests/discovery-checks.mjs   # in-space discovery, merge and prompt
+node caspar/tests/orchestrate-checks.mjs # server-side @mention fan-out + delegated billing
+node caspar/tests/agent-queue-checks.mjs # the per-agent task board and `send_message`
+node caspar/tests/finance-checks.mjs     # quotes, holds, settlement
+node caspar/tests/live-cli.mjs           # against a REAL grok CLI (needs credentials)
+node caspar/tests/container-check.mjs    # against the built image (needs docker)
 ```
 
 `checks.mjs` drives the real modules against a fake gateway that speaks the real
@@ -522,8 +528,18 @@ reaching the CLI, the MCP server landing in the run's config, one step per
 trajectory event on the right channel, exactly one terminal result through the
 proxy, billable usage, platform-pinned tool arguments winning over the model's,
 per-provider endpoint selection and the agent's key displacing the platform's,
-that a prompt arriving mid-run is queued rather than dropped, and that a failed
-run / a timed-out run / a crashed CLI all still reply.
+that a prompt arriving mid-run is queued rather than dropped, that two prompts
+for DIFFERENT agents run in parallel while two for the SAME agent are serialized
+on its task board, and that a failed run / a timed-out run / a crashed CLI all
+still reply.
+
+`agent-queue-checks.mjs` drives the task board itself against a fake bridge with
+a working (tag-filterable) store log: a free agent runs at once and a busy one
+queues, finishing archives the task and relays the next through the agent's
+proxy, the agent's model picks from the waiting titles (falling back to
+oldest-first when it cannot be asked), a cancelled card is never picked up, and
+`send_message` posts an interim chat turn while handing work to whoever it
+@mentions.
 
 `container-check.mjs` runs the image the way the node does — gateway env only —
 and asserts a proxy-relayed prompt comes back streamed and answered.
