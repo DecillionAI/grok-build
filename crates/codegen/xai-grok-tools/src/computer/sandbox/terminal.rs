@@ -70,6 +70,13 @@ struct TaskState {
     is_backgrounded: bool,
     block_waited: bool,
     explicitly_killed: bool,
+    /// Model already got a kill/wait tool result, or the kill was teardown.
+    /// The trait's `kill_task` is documented as a [`KillSource::ModelTool`]
+    /// kill, and this backend's teardown sweeps route through it too, so both
+    /// paths mark the result delivered. A kill we merely *observe* on the
+    /// bridge poll does not: nothing was handed to the model, so auto-wake
+    /// must still fire.
+    kill_result_delivered: bool,
     /// Sandbox-side pid, kept for diagnostics — surfaced in
     /// `BackgroundHandle.pid`, but the trait `TaskSnapshot` has no `pid`
     /// field, so it's not propagated further. Retain for future kill-by-pid
@@ -102,6 +109,7 @@ impl TaskState {
             kind: self.kind,
             block_waited: self.block_waited,
             explicitly_killed: self.explicitly_killed,
+            kill_result_delivered: self.kill_result_delivered,
             owner_session_id: self.owner_session_id.clone(),
             description: self.description.clone(),
             is_backgrounded: self.is_backgrounded,
@@ -409,6 +417,7 @@ fn build_task_state(
         is_backgrounded,
         block_waited: false,
         explicitly_killed: false,
+        kill_result_delivered: false,
         pid,
         stdout_offset: 0,
         stderr_offset: 0,
@@ -523,6 +532,11 @@ impl TerminalBackend for SandboxTerminalBackend {
                     .to_string();
                 self.with_task(task_id, |state| {
                     state.explicitly_killed = true;
+                    // `kill_task` is the trait's `KillSource::ModelTool` entry
+                    // point, and `kill_all_background_tasks*` (teardown) funnels
+                    // through it as well. Both sources count as delivered, so
+                    // the completion notification is not also auto-woken.
+                    state.kill_result_delivered = true;
                     if !state.completed {
                         state.completed = true;
                         state.end_time = Some(SystemTime::now());
