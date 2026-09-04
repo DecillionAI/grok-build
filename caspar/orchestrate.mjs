@@ -29,7 +29,7 @@ import crypto from "node:crypto";
 
 import { postSpaceSignal, KIND } from "./spaceHistory.mjs";
 
-const DEFAULT_MAX_HOPS = 8;
+const DEFAULT_MAX_HOPS = 32;
 
 /**
  * How many times ONE agent may be handed work along a single branch of the
