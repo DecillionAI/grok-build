@@ -1,5 +1,5 @@
-//! Test-only helpers, public because the tests that need them are in other
-//! crates. Production code must not use this module.
+//! These test-only helpers are public because the tests that need them are in other crates.
+//! Production code must not use this module.
 
 use super::{StatusLineConfig, StatusLineItem, StatusLineType};
 
@@ -11,7 +11,7 @@ pub struct StatusLineConfigFixture {
 }
 
 impl StatusLineConfigFixture {
-    /// A section that named this mode and set nothing else.
+    /// Builds a section that names this mode and sets nothing else.
     pub fn from_kind(kind: StatusLineType) -> Self {
         Self {
             config: StatusLineConfig {
@@ -31,15 +31,13 @@ impl StatusLineConfigFixture {
         self
     }
 
-    /// Seconds as a user would write them; `None` leaves the row event-driven.
-    /// The clamp still applies, on the way back out.
     pub fn with_refresh_interval(mut self, secs: Option<u64>) -> Self {
         self.config.refresh_interval = secs;
         self
     }
 
-    /// Columns per side as a user would write them. The cap still applies, on
-    /// the way back out.
+    /// The value is columns per side, as a user would write it.
+    /// The cap still applies on the way back out.
     pub fn with_padding(mut self, padding: u16) -> Self {
         self.config.padding = Some(padding);
         self

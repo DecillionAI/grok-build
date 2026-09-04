@@ -4,10 +4,9 @@ use super::*;
 
 const DIR: &str = "/home/user/project";
 
-/// The command-row stdin shape the pager's guide test also reads, so
-/// a field renamed here fails in front of all three. It carries `session_name`,
-/// which the client overlays for a command row; the agent's own notification
-/// leaves that field null.
+/// Returns the shared fixture: the JSON a command row receives on stdin, which the pager's guide test and the SDK suites also read.
+/// A field renamed in the type fails this test, the guide test, and the SDK suites.
+/// It carries `session_name`, which the client overlays for a command row; the agent's own notification leaves that field null.
 fn wire_fixture() -> serde_json::Value {
     let mut fixture: serde_json::Value =
         serde_json::from_str(include_str!("../testdata/status_wire.json"))
@@ -21,8 +20,8 @@ fn wire_fixture() -> serde_json::Value {
 
 #[test]
 fn every_field_survives_a_round_trip_through_the_shared_fixture() {
-    // Every field, rather than `..Default::default()`: a new one is a compile
-    // error here, and then a missing name in the fixture the SDKs read.
+    // Every field is set, rather than `..Default::default()`
+    // A new field is a compile error here, and then a missing name in the fixture the SDKs read
     let ctx = StatusLineContext {
         schema_version: Some(STATUS_LINE_SCHEMA_VERSION),
         cwd: DIR.into(),
@@ -78,7 +77,7 @@ fn every_field_survives_a_round_trip_through_the_shared_fixture() {
             branch: Some("feature-x".into()),
             main_worktree_root: Some(DIR.into()),
         }),
-        trigger: Some(StatusLineTrigger::Poll),
+        trigger: Some(StatusLineTrigger::RefreshInterval),
     };
 
     assert_eq!(
@@ -89,16 +88,10 @@ fn every_field_survives_a_round_trip_through_the_shared_fixture() {
     let parsed: StatusLineContext =
         serde_json::from_value(wire_fixture()).expect("the wire shape must parse back");
     assert_eq!(parsed, ctx, "a name the type writes but cannot read back");
-}
 
-/// The spellings scripts branch on. Serde derives them from the variant
-/// names, so a rename over there would silently rewire every script that
-/// reads `trigger`.
-#[test]
-fn trigger_spellings_are_pinned_to_the_wire() {
     assert_eq!(
-        serde_json::to_value(StatusLineTrigger::Poll).unwrap(),
-        json!("poll")
+        serde_json::to_value(StatusLineTrigger::RefreshInterval).unwrap(),
+        json!("refresh_interval")
     );
     assert_eq!(
         serde_json::to_value(StatusLineTrigger::State).unwrap(),

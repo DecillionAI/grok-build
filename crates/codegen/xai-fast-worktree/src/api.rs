@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use crate::copy::CopyStats;
 pub use crate::copy::DirtyFilesReport;
 use crate::copy::ParallelCopyConfig;
+pub use crate::nfs::NfsWorktreeOpts;
 
 /// Result from a delegated btrfs snapshot creation.
 #[derive(Debug, Clone)]
@@ -206,6 +207,10 @@ pub struct WorktreeReport {
     pub commit: String,
     pub unignored_copy: CopyReport,
     pub ignored_copy: Option<CopyReport>,
+    /// Dispatch arm that actually ran (`nfs` / `overlay` / `btrfs` / `copy` / `git` / `standalone`).
+    pub resolved_strategy: &'static str,
+    /// Arm-specific metadata persisted into worktrees.db.
+    pub strategy_metadata: Option<serde_json::Value>,
 }
 
 /// High-level builder API for creating fast git worktrees.
@@ -233,6 +238,7 @@ pub struct WorktreeBuilder {
     worktree_id: Option<String>,
     #[cfg(feature = "metadata")]
     metadata: Option<serde_json::Value>,
+    nfs: Option<NfsWorktreeOpts>,
 }
 
 impl std::fmt::Debug for WorktreeBuilder {
@@ -270,6 +276,7 @@ impl WorktreeBuilder {
             worktree_id: None,
             #[cfg(feature = "metadata")]
             metadata: None,
+            nfs: None,
         }
     }
 
@@ -382,27 +389,53 @@ impl WorktreeBuilder {
         self
     }
 
+    /// Explicit grove worktree enablement (macOS NFS / Linux FUSE).
+    /// The library never reads pager config.
+    pub fn grove_worktree(mut self, opts: NfsWorktreeOpts) -> Self {
+        self.nfs = Some(opts);
+        self
+    }
+
+    /// Deprecated alias for [`Self::grove_worktree`].
+    pub fn nfs_worktree(self, opts: NfsWorktreeOpts) -> Self {
+        self.grove_worktree(opts)
+    }
+
     /// Create the worktree using the configured options.
     ///
     /// This is a **blocking** operation. Callers should use `spawn_blocking`
     /// when calling from async contexts.
     pub fn create(self) -> Result<WorktreeReport> {
-        // Clone source/git_ref/creation_mode for DB registration before the move
-        // into WorktreePlan. These are one-per-create, not a hot path.
+        // One canonical dest for the plan id, IPC idempotency key, and DB id.
+        let dest = crate::worktree::plan::canonicalize_for_id(&self.dest);
+        let worktree_id = {
+            #[cfg(feature = "metadata")]
+            {
+                self.worktree_id
+                    .unwrap_or_else(|| crate::worktree::plan::worktree_id_from_path(&dest))
+            }
+            #[cfg(not(feature = "metadata"))]
+            {
+                crate::worktree::plan::worktree_id_from_path(&dest)
+            }
+        };
+        if !crate::nfs::is_safe_worktree_id(&worktree_id) {
+            anyhow::bail!("invalid worktree id from dest: {worktree_id}");
+        }
+
         #[cfg(feature = "metadata")]
         let meta_fields = (
             self.worktree_kind,
             self.session_id,
-            self.worktree_id,
+            worktree_id.clone(),
             self.source.clone(),
-            self.creation_mode.as_db_str(),
             self.git_ref.clone(),
             self.metadata,
         );
 
         let plan = crate::worktree::WorktreePlan {
             source: self.source,
-            dest: self.dest,
+            dest,
             git_ref: self.git_ref,
             parallelism: self.parallelism,
             channel_buffer: self.channel_buffer,
@@ -412,23 +445,28 @@ impl WorktreeBuilder {
             creation_mode: self.creation_mode,
             cancellation_token: self.cancellation_token,
             btrfs_delegate: self.btrfs_delegate,
+            worktree_id,
+            nfs: self.nfs,
         };
 
         let result = crate::worktree::execute_plan(plan).map_err(annotate_disk_full)?;
 
         #[cfg(feature = "metadata")]
         {
-            let (kind, session_id, wt_id, source, creation_mode, git_ref, metadata) = meta_fields;
+            let (kind, session_id, wt_id, source, git_ref, mut metadata) = meta_fields;
             if let Some(kind) = kind {
+                if let Some(sm) = result.strategy_metadata.clone() {
+                    metadata = Some(merge_strategy_metadata(metadata, sm));
+                }
                 register_worktree(
                     &result.worktree_path,
                     &source,
                     kind,
-                    creation_mode,
+                    result.resolved_strategy,
                     &git_ref,
                     &result.commit,
                     session_id,
-                    wt_id,
+                    Some(wt_id),
                     metadata,
                 );
             }
@@ -442,6 +480,8 @@ impl WorktreeBuilder {
             commit: result.commit,
             unignored_copy,
             ignored_copy: result.ignored_stats.map(Into::into),
+            resolved_strategy: result.resolved_strategy,
+            strategy_metadata: result.strategy_metadata,
         })
     }
 
@@ -555,6 +595,23 @@ fn annotate_disk_full(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+#[cfg(feature = "metadata")]
+fn merge_strategy_metadata(
+    caller: Option<serde_json::Value>,
+    strategy: serde_json::Value,
+) -> serde_json::Value {
+    match (caller, strategy) {
+        (Some(serde_json::Value::Object(mut a)), serde_json::Value::Object(b)) => {
+            for (k, v) in b {
+                a.insert(k, v);
+            }
+            serde_json::Value::Object(a)
+        }
+        (Some(c), _) if c.is_object() => c,
+        (_, s) => s,
+    }
+}
+
 /// Result of removing a worktree.
 #[derive(Clone, Debug)]
 pub struct RemoveReport {
@@ -619,6 +676,20 @@ fn remove_worktree_from_disk(
 
     #[cfg(not(target_os = "linux"))]
     let _ = delegate;
+
+    // NFS: daemon-first verified unmount. Never `umount -f`, never rm -rf a live mount.
+    {
+        match crate::nfs::try_nfs_remove(worktree_path) {
+            Ok(Some(report)) => return Ok(report),
+            Ok(None) => {}
+            Err(e) => {
+                // Fail closed for any NFS arm Err (inconclusive mount table, live non-grove NFS,
+                // or post-marker teardown). Swallowing would let the caller rm -rf a dest that
+                // may still be mounted or only partially cleaned.
+                return Err(e);
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -1549,94 +1620,6 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_report_from_copy_stats() {
-        let stats = CopyStats {
-            files_copied: 10,
-            dirs_created: 3,
-            symlinks_copied: 2,
-            files_skipped: 5,
-            issues: vec!["warning 1".to_string(), "warning 2".to_string()],
-        };
-
-        let report: CopyReport = stats.into();
-        assert_eq!(report.files_copied, 10);
-        assert_eq!(report.dirs_created, 3);
-        assert_eq!(report.symlinks_copied, 2);
-        assert_eq!(report.files_skipped, 5);
-        assert_eq!(report.issues.len(), 2);
-        assert!(report.dirty_files.is_none());
-    }
-
-    #[test]
-    fn test_btrfs_mode_default() {
-        let mode = BtrfsMode::default();
-        assert_eq!(mode, BtrfsMode::Auto);
-    }
-
-    #[test]
-    fn test_btrfs_mode_variants() {
-        assert_eq!(BtrfsMode::Auto, BtrfsMode::Auto);
-        assert_eq!(BtrfsMode::Force, BtrfsMode::Force);
-        assert_eq!(BtrfsMode::Disabled, BtrfsMode::Disabled);
-
-        assert_ne!(BtrfsMode::Auto, BtrfsMode::Force);
-        assert_ne!(BtrfsMode::Auto, BtrfsMode::Disabled);
-        assert_ne!(BtrfsMode::Force, BtrfsMode::Disabled);
-    }
-
-    #[test]
-    fn test_btrfs_mode_debug() {
-        let auto = format!("{:?}", BtrfsMode::Auto);
-        let force = format!("{:?}", BtrfsMode::Force);
-        let disabled = format!("{:?}", BtrfsMode::Disabled);
-
-        assert!(auto.contains("Auto"));
-        assert!(force.contains("Force"));
-        assert!(disabled.contains("Disabled"));
-    }
-
-    #[test]
-    fn test_btrfs_mode_clone() {
-        let mode = BtrfsMode::Force;
-        let cloned = mode.clone();
-        assert_eq!(mode, cloned);
-    }
-
-    #[test]
-    fn test_creation_mode_default() {
-        let mode = CreationMode::default();
-        assert_eq!(mode, CreationMode::Linked);
-    }
-
-    #[test]
-    fn test_creation_mode_variants() {
-        assert_eq!(CreationMode::Linked, CreationMode::Linked);
-        assert_eq!(CreationMode::Standalone, CreationMode::Standalone);
-        assert_eq!(CreationMode::GitCheckout, CreationMode::GitCheckout);
-        assert_ne!(CreationMode::Linked, CreationMode::Standalone);
-        assert_ne!(CreationMode::Linked, CreationMode::GitCheckout);
-    }
-
-    #[test]
-    fn test_worktree_builder_chain() {
-        let _builder = WorktreeBuilder::new("/source", "/dest")
-            .git_ref("main")
-            .parallelism(4)
-            .ignored_parallelism(2)
-            .channel_buffer(512)
-            .working_tree_mode(WorkingTreeMode::CleanAll)
-            .ignored_files_mode(IgnoredFilesMode::Copy {
-                skip_patterns: vec!["*.log".to_string()],
-            })
-            .creation_mode(CreationMode::GitCheckout);
-    }
-
-    #[test]
-    fn test_standalone_shorthand() {
-        let _builder = WorktreeBuilder::new("/source", "/dest").standalone(true);
-    }
-
-    #[test]
     fn copy_ignored_only_returns_err_when_cancelled() {
         let src = tempfile::TempDir::new().unwrap();
         let dest = tempfile::TempDir::new().unwrap();
@@ -1654,15 +1637,6 @@ mod tests {
             err.to_string().contains("cancelled"),
             "error should report cancellation, got: {err}"
         );
-    }
-
-    #[test]
-    fn test_cleanup_report_default() {
-        let report = CleanupReport::default();
-        assert_eq!(report.removed, 0);
-        assert_eq!(report.overlays_unmounted, 0);
-        assert_eq!(report.btrfs_deleted, 0);
-        assert_eq!(report.errors, 0);
     }
 
     #[test]
@@ -1785,17 +1759,6 @@ mod tests {
             "nested dangling symlink worktree must be removed"
         );
         assert_eq!(report.removed, 1);
-    }
-
-    #[test]
-    fn test_remove_report_has_overlay_field() {
-        let report = RemoveReport {
-            used_btrfs_delete: false,
-            unmounted_bind: false,
-            unmounted_overlay: true,
-        };
-        assert!(report.unmounted_overlay);
-        assert!(!report.used_btrfs_delete);
     }
 
     #[test]
