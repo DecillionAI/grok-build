@@ -71,6 +71,9 @@ const PROGRAM_INDEX = {
   "builder-prog": { programId: "builder-prog", creatureId: "builder-cr", entityId: "agent", metadata: { kind: "agent", name: "Builder", handle: "builder" } },
   "growth-prog": { programId: "growth-prog", creatureId: "growth-cr", entityId: "agent", metadata: { kind: "agent", name: "Growth", handle: "growth" } },
   "research-prog": { programId: "research-prog", creatureId: "research-cr", entityId: "agent", metadata: { kind: "agent", name: "Researcher", handle: "researcher" } },
+  // Attached the way the app attaches a market agent: the display name and the
+  // descriptor, whose `username` IS the @handle chat shows. No top-level handle.
+  "atlas-prog": { programId: "atlas-prog", creatureId: "atlas-cr", entityId: "agent", metadata: { kind: "agent", name: "Atlas", descriptor: { kind: "agent", name: "Atlas", username: "operator" } } },
   "tool-prog": { programId: "tool-prog", creatureId: "tool-cr", entityId: "main", metadata: { kind: "tool", name: "sandbox" } },
 };
 
@@ -241,20 +244,80 @@ await check("no @mention → nothing launched", async () => {
   assert.equal(launched.length, 0);
 });
 
-await check("the hop cap halts the chain", async () => {
-  const { bridge, launched } = makeBridge();
+await check("the hop cap halts the chain, and says so in the trail", async () => {
+  const { bridge, launched, notes } = makeBridge();
   const delivery = seedDelivery({ orchestration: { depth: 7, maxHops: 8, visited: ["self-prog"], poolId: "pool-1", payerUserId: "user-1" } });
   const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer keep going" });
   assert.equal(n, 0);
   assert.equal(launched.length, 0);
+  assert.match(notes[0].data.text, /8-hop limit/);
 });
 
-await check("a teammate already visited twice is not relaunched", async () => {
-  const { bridge, launched } = makeBridge();
+await check("a teammate already handed work twice is STILL reachable (hops are the loop guard)", async () => {
+  // The per-agent ledger used to veto a third hand-off, which killed the normal
+  // shape of teamwork (a lead and a specialist trading work) mid-task. The hop
+  // budget bounds the chain instead; the ledger no longer binds before it does.
+  const { bridge, launched, notes } = makeBridge();
   const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
   const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer once more" });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "mate-prog");
+  assert.equal(notes.length, 0);
+});
+
+await check("GROK_ORCH_VISIT_CAP still enforces a tighter cap, and the note says so", async () => {
+  process.env.GROK_ORCH_VISIT_CAP = "1";
+  try {
+    const { bridge, launched, notes } = makeBridge();
+    const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
+    const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer once more" });
+    assert.equal(n, 0);
+    assert.equal(launched.length, 0);
+    assert.match(notes[0].data.text, /@writer already took 1 turn in this chain/);
+  } finally {
+    delete process.env.GROK_ORCH_VISIT_CAP;
+  }
+});
+
+await check("a mention resolves past a blocked first match to the agent that can take it", async () => {
+  // "@lead" names this very agent AND a second "Orbit Lead" on the roster. The
+  // first row is the answer's own author, so the mention must fall through to
+  // the other one rather than being dropped.
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({
+    roster: [{ programId: "orbit-prog", name: "Orbit Lead", handle: "orbit-lead", kind: "agent", entityId: "agent" }],
+  });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@lead please take it from here." });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "orbit-prog");
+});
+
+await check("an @handle known only from the index descriptor still resolves", async () => {
+  // A run with no roster (a routine firing, a teammate launched after the client
+  // dropped) resolves handles from the program index. The index carries the
+  // listing's `username` on the descriptor — "Atlas" answers to @operator.
+  const { bridge, launched, notes } = makeBridge();
+  const delivery = seedDelivery({ roster: [] });
+  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@operator please roll it out." });
+  assert.equal(n, 1);
+  assert.equal(launched[0].target, "atlas-prog");
+  assert.equal(notes.length, 0);
+});
+
+await check("a mention that only names the answer's own author says so", async () => {
+  const { bridge, launched, notes } = makeBridge();
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), { success: true, answer: "@lead is on it." });
   assert.equal(n, 0);
   assert.equal(launched.length, 0);
+  assert.match(notes[0].data.text, /@lead names the agent that wrote this answer/);
+});
+
+await check("an unknown handle is named as unknown, with the known agents listed", async () => {
+  const { bridge, notes } = makeBridge();
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), { success: true, answer: "@nobody-here please help" });
+  assert.equal(n, 0);
+  assert.match(notes[0].data.text, /no agent in this project answers to @nobody-here/);
+  assert.match(notes[0].data.text, /known agents: .*@writer/);
 });
 
 await check("a teammate may be handed a second turn after finishing the first", async () => {
@@ -291,6 +354,17 @@ await check("sequential cues launch only the first teammate", async () => {
   assert.equal(launched[0].target, "builder-prog");
 });
 
+await check("a sequenced teammate is recorded as waiting, not silently dropped", async () => {
+  const { bridge, notes } = makeBridge();
+  await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "@builder ship the site, then @growth draft the posts.",
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].data.kind, "orch-deferred");
+  assert.match(notes[0].data.text, /@growth waits on @builder/);
+});
+
 await check("a specialist can hand off to a sibling after the lead's parallel wave", async () => {
   const { bridge, launched } = makeBridge();
   const delivery = seedDelivery({
@@ -313,7 +387,7 @@ await check("a specialist can hand off to a sibling after the lead's parallel wa
   assert.deepEqual(targets, ["builder-prog", "growth-prog", "self-prog"]);
 });
 
-await check("legacy packed visited still allows a second sibling turn (VISIT_CAP=2)", async () => {
+await check("legacy packed visited still allows a sibling another turn", async () => {
   const { bridge, launched } = makeBridge();
   const delivery = seedDelivery({
     proxyProgramId: "research-prog",
