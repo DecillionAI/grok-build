@@ -17,21 +17,45 @@
  * Billing note: only runs the backbone launches this way carry a delegated
  * quote (`autonomousQuote`) and count against the project's autonomous budget.
  * A user-initiated seed run keeps its own client-minted quote and is unaffected.
+ *
+ * Loop safety is the HOP BUDGET (`orchestration.maxHops`), plus the autonomous
+ * budget that bounds what an unattended chain may spend. A teammate is never
+ * refused work just because it already spoke earlier in the chain: teamwork is a
+ * lead and a specialist trading turns, and vetoing that stopped real work
+ * mid-task. `visited` is carried per branch for the trail (and for an optional
+ * tighter cap, `GROK_ORCH_VISIT_CAP`), not as a one-shot ticket per agent.
  */
 import crypto from "node:crypto";
 
 import { postSpaceSignal, KIND } from "./spaceHistory.mjs";
 
 const DEFAULT_MAX_HOPS = 8;
-/** Same agent may be handed work twice (e.g. lead reviews after a specialist). */
-const VISIT_CAP = 2;
+
+/**
+ * How many times ONE agent may be handed work along a single branch of the
+ * chain.
+ *
+ * The loop guard is the HOP BUDGET, not this ledger: every hand-off costs a hop,
+ * so a pair that keep tagging each other stop at exactly the depth any other
+ * chain does, and the project's autonomous budget bounds the spend. A tighter
+ * per-agent ledger looked like a second safety net, but it vetoed the normal
+ * shape of teamwork — a lead handing work back and forth with a specialist —
+ * and the veto surfaced in chat as "no teammate matched", so the chain died
+ * mid-task for a reason nobody could read. Default: the hop budget, i.e. it
+ * never binds before depth does. `GROK_ORCH_VISIT_CAP` restores a tighter cap.
+ */
+function visitCapFor(maxHops) {
+  const configured = Number(process.env.GROK_ORCH_VISIT_CAP);
+  if (Number.isFinite(configured) && configured >= 1) return Math.floor(configured);
+  return Math.max(1, Number(maxHops) || DEFAULT_MAX_HOPS);
+}
 
 // Surface a stalled @mention chain IN THE CHAT (not just the VM log) so the exact
 // blocker is visible in-app. On by default while stabilising server-side
 // orchestration; set GROK_ORCH_NOTES=off to silence.
 const ORCH_NOTES = String(process.env.GROK_ORCH_NOTES ?? "").trim().toLowerCase() !== "off";
 
-async function noteStall(bridge, task, reason) {
+async function noteChain(bridge, task, text, kind = "orch-stall") {
   if (!ORCH_NOTES || !bridge) return;
   try {
     const spaceId = String((task && (task.spaceId || task.storeId || task.space_id)) || "");
@@ -39,15 +63,15 @@ async function noteStall(bridge, task, reason) {
     const threadId = String((task && task.threadId) || "main") || "main";
     await postSpaceSignal(bridge, {
       spaceId,
-      // A stalled hand-off is part of the run's work trail, not a chat turn, so
-      // it is a step: visible in the work view, never a bubble in the chat.
+      // A note about the chain is part of the run's work trail, not a chat turn,
+      // so it is a step: visible in the work view, never a bubble in the chat.
       kind: KIND.STEP,
       threadId,
       correlationId: String((task && task.correlationId) || ""),
       data: {
         role: "system",
-        kind: "orch-stall",
-        text: `⚠️ Hand-off didn't continue: ${reason}`,
+        kind,
+        text,
         threadId,
         at: new Date().toISOString(),
       },
@@ -55,6 +79,11 @@ async function noteStall(bridge, task, reason) {
   } catch {
     /* diagnostics must never break the run */
   }
+}
+
+/** The chain could not continue, and why — the blocker, stated in the trail. */
+async function noteStall(bridge, task, reason) {
+  await noteChain(bridge, task, `⚠️ Hand-off didn't continue: ${reason}`);
 }
 
 function log(sentinel, payload) {
@@ -317,15 +346,21 @@ async function agentAddressBook(bridge, spaceId, roster) {
     for (const [pid, raw] of Object.entries(data)) {
       const rec = raw && typeof raw === "object" ? raw : {};
       const meta = rec.metadata && typeof rec.metadata === "object" ? rec.metadata : {};
-      const kind = String(meta.kind || meta.type || "").toLowerCase();
+      const desc = meta.descriptor && typeof meta.descriptor === "object" ? meta.descriptor : {};
+      const kind = String(meta.kind || meta.type || desc.kind || "").toLowerCase();
       if (kind === "tool" || kind === "sandbox") continue;
       put({
         programId: rec.programId || pid,
         creatureId: rec.creatureId || meta.creatureId,
         entityId: rec.entityId || meta.entityId || "agent",
         resourceId: meta.resourceId || rec.programId || pid,
-        name: meta.name || meta.title || rec.name,
-        handle: meta.handle,
+        name: meta.name || meta.title || desc.name || rec.name,
+        // The @handle chat shows is the listing's `username` — an agent writes
+        // "@lead", not "@orbit-lead". The index stores it on the descriptor, so
+        // read it here: a run that arrives with no roster (a routine firing, a
+        // teammate launched after the client dropped) must still resolve the
+        // handles its teammates are addressed by, not just their display names.
+        handle: meta.handle || meta.username || desc.username || desc.handle,
       });
     }
   } catch (err) {
@@ -400,17 +435,35 @@ function mentionExactHit(a, mention) {
   return normHandle(a.handle) === m || toHandle(a.name) === m;
 }
 
-function mentionedTeammates(answer, agents, { visited, selfProgram }) {
+/**
+ * Resolve an answer's @mentions to the teammates to launch.
+ *
+ * Every mention is tried against EVERY agent it could name, not just the first
+ * row that matches: a mention whose best match is blocked (it is the agent that
+ * wrote the answer, or it is already launched in this wave) falls through to the
+ * next agent that answers to the same handle instead of being dropped.
+ *
+ * The outcome is reported per mention so the chain can say what actually
+ * happened: `unknown` (no agent in this space answers to that handle),
+ * `capped` (that agent already took its turns on this branch), `selfOnly` (the
+ * answer named its own author) — the three used to collapse into one misleading
+ * "no teammate matched".
+ */
+function mentionedTeammates(answer, agents, { visited, selfProgram, maxHops } = {}) {
   const mentions = parseAnswerMentionsOrdered(answer);
-  if (!mentions.length) return { teammates: [], capped: [], serial: false };
+  const nothing = { teammates: [], capped: [], selfOnly: [], unknown: [], deferred: [], serial: false, visitCap: visitCapFor(maxHops) };
+  if (!mentions.length) return nothing;
+  const visitCap = visitCapFor(maxHops);
   const visitedList = Array.isArray(visited) ? visited.map(String) : [...(visited || [])].map(String);
   const visitCount = (id) => visitedList.filter((v) => v === id).length;
   const out = [];
   const seen = new Set();
   const capped = [];
+  const selfOnly = [];
+  const resolved = new Set();
   const take = (a) => {
     if (!a.programId || a.programId === selfProgram || seen.has(a.programId)) return false;
-    if (visitCount(a.programId) >= VISIT_CAP) {
+    if (visitCount(a.programId) >= visitCap) {
       if (!capped.some((x) => x.programId === a.programId)) capped.push(a);
       return false;
     }
@@ -418,19 +471,43 @@ function mentionedTeammates(answer, agents, { visited, selfProgram }) {
     out.push(a);
     return true;
   };
+  /** Launch the first agent this mention names that can still take the work. */
+  const claim = (mention, rows) => {
+    if (!rows.length) return false;
+    const m = normHandle(mention);
+    resolved.add(m);
+    for (const row of rows) if (take(row)) return true;
+    if (rows.every((row) => row.programId === selfProgram) && !selfOnly.includes(m)) selfOnly.push(m);
+    return false;
+  };
+  // Exact handles first, for every mention, so a loose name-token match can
+  // never steal the agent another mention names outright.
   const used = new Set();
   for (const mention of mentions) {
-    const a = agents.find((row) => mentionExactHit(row, mention));
-    if (!a) continue;
-    if (take(a)) used.add(normHandle(mention));
+    if (claim(mention, agents.filter((row) => mentionExactHit(row, mention)))) used.add(normHandle(mention));
   }
   for (const mention of mentions) {
-    if (used.has(normHandle(mention))) continue;
-    const a = agents.find((row) => agentHandleForms(row).has(normHandle(mention)));
-    if (a) take(a);
+    const m = normHandle(mention);
+    if (used.has(m)) continue;
+    if (claim(mention, agents.filter((row) => agentHandleForms(row).has(m)))) used.add(m);
   }
+  const unknown = [];
+  for (const mention of mentions) {
+    const m = normHandle(mention);
+    if (!resolved.has(m) && !unknown.includes(m)) unknown.push(m);
+  }
+  // "@a, then @b" is one agent's work followed by another's: launch only the
+  // unblocked one — @b runs when @a hands off. Independent mentions stay parallel.
   const serial = isSequentialHandoff(answer) && out.length > 1;
-  return { teammates: serial ? out.slice(0, 1) : out, capped, serial };
+  return {
+    teammates: serial ? out.slice(0, 1) : out,
+    deferred: serial ? out.slice(1) : [],
+    capped,
+    selfOnly,
+    unknown,
+    serial,
+    visitCap,
+  };
 }
 
 /** Signal a teammate's proxy to run one turn; the proxy injects its skill/LLM
@@ -505,13 +582,6 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   const orch = task.orchestration && typeof task.orchestration === "object" ? task.orchestration : {};
   const depth = Number(orch.depth || 0);
   const maxHops = Number(orch.maxHops || DEFAULT_MAX_HOPS);
-  if (depth + 1 >= maxHops) {
-    log("GROK_ORCH", { followups: "hop-cap", depth, maxHops });
-    return 0;
-  }
-  const visitedList = (Array.isArray(orch.visited) ? orch.visited : []).map(String);
-  const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
-  if (selfProgram && !visitedList.includes(selfProgram)) visitedList.push(selfProgram);
 
   // The @handles this answer actually mentioned, minus the ones that name a
   // PERSON in the roster (a human @mention is not a fan-out target, so it must
@@ -525,6 +595,24 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       .map((v) => v.toLowerCase()),
   );
   const answerHandles = [...parseAnswerMentions(answer)].filter((h) => !personHandles.has(h));
+
+  // The hop budget is the chain's loop guard, so it is also the one place the
+  // chain ends while an answer is still asking for someone: say so in the trail
+  // instead of stopping in silence.
+  if (depth + 1 >= maxHops) {
+    log("GROK_ORCH", { followups: "hop-cap", depth, maxHops, answerMentions: answerHandles });
+    if (answerHandles.length) {
+      await noteStall(
+        bridge,
+        task,
+        `this chain reached its ${maxHops}-hop limit, so ${answerHandles.map((h) => "@" + h).join(", ")} weren't started. Send a new message to carry the work on.`,
+      );
+    }
+    return 0;
+  }
+  const visitedList = (Array.isArray(orch.visited) ? orch.visited : []).map(String);
+  const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
+  if (selfProgram && !visitedList.includes(selfProgram)) visitedList.push(selfProgram);
 
   const payer = String(orch.payerUserId || task.streamTo || "");
   let poolId = String(orch.poolId || "");
@@ -543,32 +631,70 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const { teammates, capped, serial } = mentionedTeammates(answer, agents, { visited: visitedList, selfProgram });
+  const { teammates, capped, selfOnly, unknown, deferred, serial, visitCap } = mentionedTeammates(answer, agents, {
+    visited: visitedList,
+    selfProgram,
+    maxHops,
+  });
   if (!teammates.length) {
     const known = agents.map((a) => a.handle).filter(Boolean);
     log("GROK_ORCH", {
       followups: "no-teammates",
       agents: known,
       capped: capped.map((a) => a.handle),
+      selfOnly,
+      unknown,
       rosterSize: Array.isArray(task.roster) ? task.roster.length : 0,
       answerMentions: answerHandles,
     });
     if (answerHandles.length) {
-      const reason = capped.length
-        ? `those teammates already used their ${VISIT_CAP} turns this chain (${capped.map((a) => "@" + a.handle).join(", ")}).`
-        : `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`;
-      await noteStall(bridge, task, reason);
+      // Say which of the three actually happened. Collapsing them into "no
+      // teammate matched" sent people hunting for a handle typo when the handle
+      // was fine and the chain had simply vetoed the agent.
+      const reasons = [];
+      if (capped.length) {
+        reasons.push(
+          `${capped.map((a) => "@" + a.handle).join(", ")} already took ${visitCap} turn${visitCap === 1 ? "" : "s"} in this chain`,
+        );
+      }
+      if (selfOnly.length) {
+        reasons.push(`${selfOnly.map((h) => "@" + h).join(", ")} names the agent that wrote this answer`);
+      }
+      const stillUnknown = unknown.filter((h) => !personHandles.has(h));
+      if (stillUnknown.length) {
+        reasons.push(
+          `no agent in this project answers to ${stillUnknown.map((h) => "@" + h).join(", ")} (known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "none resolved"})`,
+        );
+      }
+      await noteStall(
+        bridge,
+        task,
+        reasons.length
+          ? `${reasons.join("; ")}.`
+          : `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`,
+      );
     }
     return 0;
   }
 
   if (serial) {
-    log("GROK_ORCH", { followups: "serial-first", handle: teammates[0]?.handle });
+    log("GROK_ORCH", { followups: "serial-first", handle: teammates[0]?.handle, deferred: deferred.map((a) => a.handle) });
+    // A deferred teammate is waiting on the one that just started, not lost —
+    // but nothing else would ever say so, so record it in the run's trail.
+    if (deferred.length) {
+      await noteChain(
+        bridge,
+        task,
+        `⏳ ${deferred.map((a) => "@" + a.handle).join(", ")} wait${deferred.length === 1 ? "s" : ""} on @${teammates[0]?.handle || "the first teammate"} — this answer sequenced them.`,
+        "orch-deferred",
+      );
+    }
   }
 
   const threadId = String(task.threadId || "main") || "main";
   const base = forwardContext(task);
   let launched = 0;
+  const blocked = [];
   for (const teammate of teammates) {
     const correlationId = crypto.randomBytes(16).toString("hex");
     const auth = await buildDelegatedAuthorization(bridge, {
@@ -583,6 +709,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       // Budget reached or quote failed: stop expanding down this teammate rather
       // than spend past the cap. The answer that named them is already persisted.
       log("GROK_ORCH", { skip_teammate: teammate.programId, reason: "no-delegated-quote" });
+      blocked.push(teammate);
       continue;
     }
     const childTask = {
@@ -619,14 +746,18 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       launched += 1;
     } catch (err) {
       log("GROK_ORCH", { launch_error: teammate.programId, error: String(err?.message || err).slice(0, 160) });
+      blocked.push(teammate);
     }
   }
   if (launched) log("GROK_ORCH", { launched, depth: depth + 1, spaceId, threadId });
-  else if (teammates.length) {
+  // Every teammate this answer named either started or is accounted for here —
+  // a hand-off that quietly went nowhere is the failure this whole module exists
+  // to make impossible to miss.
+  if (blocked.length) {
     await noteStall(
       bridge,
       task,
-      `couldn't authorize a delegated run for ${teammates.map((t) => "@" + t.handle).join(", ")} (budget reached, no open pool, or billing rejected). Check the project's autonomous budget and that the wallet has a funded pool.`,
+      `couldn't authorize a delegated run for ${blocked.map((t) => "@" + t.handle).join(", ")} (budget reached, no open pool, or billing rejected). Check the project's autonomous budget and that the wallet has a funded pool.`,
     );
   }
   return launched;
