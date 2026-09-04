@@ -53,6 +53,7 @@ import { ProviderMediaGenerator, GENERATE_MEDIA_TOOL } from "./mediaGeneration.m
 import { OutboundMediaCollector, SHARE_MEDIA_TOOL } from "./outboundMedia.mjs";
 import { uploadOutboundMedia } from "./mediaUpload.mjs";
 import { SCHEDULE_ROUTINE_TOOL, scheduleRoutine } from "./scheduleRoutine.mjs";
+import { readUniversalInstruction } from "./platformInstruction.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
@@ -544,12 +545,18 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     }
   }
 
+  // The platform-wide instruction an admin set for every agent on this platform,
+  // read from the settings creature's on-chain document at execution time so an
+  // edit in the admin panel reaches every agent's next turn without a redeploy.
+  const universalInstruction = await readUniversalInstruction(bridge);
+
   const systemPrompt = buildSystemPrompt(task, {
     capabilities,
     sharedEnv,
     disabledBuiltins: disallowedTools,
     mcpServers: attachedMcpServers,
     workspace,
+    universalInstruction,
   });
   const grokHomeGuess = resolveGrokHome({ slug: sessionSlug(sessionId) });
   const resuming = Boolean(persistedConversationSession(grokHomeGuess) || task.resumeSessionId);
@@ -576,6 +583,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     sandbox_backend: sandboxActive || undefined,
     disallowed_builtins: disallowedTools.length ? disallowedTools : undefined,
     skill: Boolean(task.skill),
+    universal_instruction_chars: universalInstruction.length || undefined,
     group_chat: Boolean(task.groupChat || task.group_chat),
     roster: Array.isArray(task.roster) ? task.roster.length : 0,
     llm: config.llm ? { provider: config.llm.provider, models: config.llm.models } : undefined,

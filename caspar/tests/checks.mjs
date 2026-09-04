@@ -43,6 +43,7 @@ import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
 import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
 import { OutboundMediaCollector } from "../outboundMedia.mjs";
+import { readUniversalInstruction, resetUniversalInstructionCache } from "../platformInstruction.mjs";
 import { buildSystemPrompt, buildUserPrompt, compactConversationBlock } from "../prompt.mjs";
 import { buildResult, normalizeUsage } from "../result.mjs";
 import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, readSpaceSignals, KIND } from "../spaceHistory.mjs";
@@ -277,6 +278,45 @@ await check("the system prompt carries the persona and the group-chat protocol",
   assert.match(system, /Shayan — @shayan \(person\)/);
   // The agent must never be listed among the other participants.
   assert.equal(/• Tina/.test(system), false, "the agent should not be in its own roster");
+});
+
+await check("the platform's universal instruction is concatenated with the agent's own", async () => {
+  const { task } = decodeTaskSignal(...Object.values(proxyDelivery()));
+  // No universal prompt set: the system prompt is exactly what it was before.
+  assert.equal(buildSystemPrompt(task), buildSystemPrompt(task, { universalInstruction: "   " }));
+
+  const withUniversal = buildSystemPrompt(task, { universalInstruction: "Always answer in metric units." });
+  assert.match(withUniversal, /PLATFORM INSTRUCTIONS \(every agent\)/);
+  assert.match(withUniversal, /Always answer in metric units\./);
+  // Both instructions are present, and the agent's own persona comes last so it
+  // remains the authority on identity.
+  assert.match(withUniversal, /Tina, the release manager/);
+  assert.ok(
+    withUniversal.indexOf("PLATFORM INSTRUCTIONS") < withUniversal.indexOf("YOUR PERSONA"),
+    "the platform instruction is prepended to the agent's own system instruction",
+  );
+
+  // Read at execution time from the settings creature's own document — never
+  // from `config`, which also holds the platform provider keys.
+  const calls = [];
+  const bridge = {
+    call: async (op, input) => {
+      calls.push({ op, input });
+      return { ok: true, data: { text: "  Always answer in metric units.  " } };
+    },
+  };
+  resetUniversalInstructionCache();
+  assert.equal(await readUniversalInstruction(bridge, { now: 1 }), "Always answer in metric units.");
+  assert.deepEqual(calls[0].input, { key: "Json::CreatureNamespace::settings", path: "universalPrompt" });
+
+  // A read failure never stops an agent from answering.
+  resetUniversalInstructionCache();
+  const broken = { call: async () => { throw new Error("node unreachable"); } };
+  assert.equal(await readUniversalInstruction(broken, { now: 2 }), "");
+  // Unset on the platform → empty, so nothing is added to the prompt.
+  resetUniversalInstructionCache();
+  assert.equal(await readUniversalInstruction({ call: async () => ({ ok: true, data: {} }) }, { now: 3 }), "");
+  resetUniversalInstructionCache();
 });
 
 await check("a new agent session gets a compact room transcript, not the full history", () => {
