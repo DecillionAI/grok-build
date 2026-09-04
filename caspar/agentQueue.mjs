@@ -131,6 +131,49 @@ export function newTaskId() {
  * when it actually has a choice to make, and the prompt itself is on the board
  * next to the title.
  */
+/**
+ * Words too common to tell two tasks apart. Dropped before a similarity check so
+ * "please draft the launch post" and "draft the launch post now" are recognised
+ * as the same request rather than two.
+ */
+const STOP_WORDS = new Set([
+  "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with", "at", "by", "from",
+  "please", "can", "could", "would", "you", "your", "we", "our", "it", "this", "that", "then",
+  "now", "next", "also", "is", "are", "be", "as", "so", "up", "out", "do", "does", "let", "will",
+]);
+
+/** The words that actually carry a task's meaning. */
+function contentWords(text) {
+  return new Set(
+    String(text || "")
+      .toLowerCase()
+      .replace(/(^|\s)@[a-z0-9][a-z0-9_-]*/gi, " ")
+      .replace(/```[\s\S]*?```/g, " ")
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length > 2 && !STOP_WORDS.has(w)),
+  );
+}
+
+/**
+ * How alike two task prompts are, 0…1 (Jaccard over their content words).
+ *
+ * Used to spot the same request arriving twice — which happens routinely, because
+ * two agents who both need the same specialist each hand it the work, and both
+ * hand-offs quote the same paragraph. Running it twice is not thoroughness: it is
+ * the same output produced twice, and then a third agent reconciling them.
+ */
+export function promptSimilarity(a, b) {
+  const left = contentWords(a);
+  const right = contentWords(b);
+  if (!left.size || !right.size) return 0;
+  let shared = 0;
+  for (const word of left) if (right.has(word)) shared += 1;
+  return shared / (left.size + right.size - shared);
+}
+
+/** At or above this, two waiting tasks are treated as the same request. */
+const DUPLICATE_SIMILARITY = Number(creatureNumber("TASK_DUPLICATE_SIMILARITY_PCT", 82)) / 100;
+
 export function deriveTitle(prompt, fallback = "Untitled task") {
   const text = String(prompt || "")
     // Mentions are addressing, not content — a board of "@writer ..." titles
@@ -424,10 +467,29 @@ export class AgentTaskBoard {
       return "run";
     }
 
+    // Is this the same request the board is already holding?
+    //
+    // Two agents who both need the same specialist each hand it the work, and
+    // both hand-offs quote the same paragraph — so the specialist ran the same
+    // job twice and somebody then had to reconcile two versions of one artifact.
+    // A duplicate is answered as queued against the row that already exists.
+    const duplicate = await this._findDuplicate(bridge, identity, task);
+    if (duplicate) {
+      log("GROK_TASKBOARD", { deduped: duplicate.taskId, key, title: duplicate.title || "" });
+      return { queued: duplicate, duplicate: true };
+    }
+
     const record = {
       taskId: newTaskId(),
       ...identity,
-      title: str(task.taskTitle) || deriveTitle(promptOf(task)),
+      // An assignment names its own task ("Build the page from copy.md"); prose
+      // only yields its first sentence, which for a hand-off is whatever the
+      // sender happened to open with. The board is chosen from these titles, so
+      // a good one is worth taking where it exists.
+      title:
+        str(task.taskTitle) ||
+        str(task.assignment && task.assignment.title) ||
+        deriveTitle(promptOf(task)),
       prompt: promptOf(task),
       origin: taskOrigin(task),
       // Who this work is for and who asked for it. The payer is the person the
@@ -657,6 +719,32 @@ export class AgentTaskBoard {
       log("GROK_TASKBOARD", { relay_error: String(err?.message || err).slice(0, 200), taskId: record.taskId });
       return false;
     }
+  }
+
+  /**
+   * A task already waiting on this agent's board that IS this request.
+   *
+   * Only open rows count — a request that repeats work already finished is a
+   * different problem, and the plan (what already exists) is what answers it.
+   * Returns null on any read failure: enqueuing a possible duplicate is much
+   * cheaper than dropping a real task.
+   */
+  async _findDuplicate(bridge, identity, task) {
+    const prompt = promptOf(task);
+    if (!prompt) return null;
+    try {
+      const board = await readAgentBoard(bridge, {
+        spaceId: identity.spaceId,
+        agentProgramId: identity.agentProgramId,
+      });
+      for (const waiting of openTasks(board)) {
+        if (waiting.threadId && waiting.threadId !== identity.threadId) continue;
+        if (promptSimilarity(waiting.prompt, prompt) >= DUPLICATE_SIMILARITY) return waiting;
+      }
+    } catch (err) {
+      log("GROK_TASKBOARD", { dedupe_read_error: String(err?.message || err).slice(0, 160) });
+    }
+    return null;
   }
 
   _rememberLlm(key, task) {

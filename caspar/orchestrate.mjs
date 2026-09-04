@@ -28,26 +28,117 @@
 import crypto from "node:crypto";
 
 import { postSpaceSignal, KIND } from "./spaceHistory.mjs";
-
-const DEFAULT_MAX_HOPS = 32;
+import { addPlanTask, readProjectPlan } from "./projectPlan.mjs";
+import { shouldHaltChain } from "./acceptance.mjs";
 
 /**
- * How many times ONE agent may be handed work along a single branch of the
- * chain.
+ * How deep one branch of a hand-off chain may go.
  *
- * The loop guard is the HOP BUDGET, not this ledger: every hand-off costs a hop,
- * so a pair that keep tagging each other stop at exactly the depth any other
- * chain does, and the project's autonomous budget bounds the spend. A tighter
- * per-agent ledger looked like a second safety net, but it vetoed the normal
- * shape of teamwork — a lead handing work back and forth with a specialist —
- * and the veto surfaced in chat as "no teammate matched", so the chain died
- * mid-task for a reason nobody could read. Default: the hop budget, i.e. it
- * never binds before depth does. `GROK_ORCH_VISIT_CAP` restores a tighter cap.
+ * This was 32, which in practice was no limit at all: 32 full billable agent
+ * runs of a lead and a specialist trading turns is indistinguishable, to the
+ * person watching, from a room of agents that never finish. Six hops is a lead,
+ * two or three specialists, and a review — past that a chain is not making
+ * progress, it is circling, and the stagnation check says so out loud.
  */
+const DEFAULT_MAX_HOPS = 6;
+
+/**
+ * How many times ONE agent may be handed work along a single branch.
+ *
+ * A cap of 2 lets the normal shape of teamwork happen — a lead hands work to a
+ * specialist, the specialist hands the artifact back, the lead finishes — and
+ * stops the third round, which is where a pair reliably starts restating each
+ * other. This used to default to the hop budget, i.e. it never bound at all.
+ * `GROK_ORCH_VISIT_CAP` overrides it.
+ */
+const DEFAULT_VISIT_CAP = 2;
+
+/**
+ * How many agent runs ONE user message may cause, across every branch.
+ *
+ * Depth alone was never a budget: `visited` is carried per branch, so an answer
+ * naming three teammates makes three branches, each free to fan out again. The
+ * chain was therefore a tree bounded only by depth and by money — which is how
+ * a single prompt turned into dozens of runs. This is the missing global
+ * ceiling: every launch in the chain draws on one budget, keyed by the root run.
+ */
+const DEFAULT_MAX_CHAIN_RUNS = 12;
+
+/** How long a root's run budget is remembered (a chain far outlives one run). */
+const CHAIN_BUDGET_TTL_MS = 6 * 60 * 60 * 1000;
+/** Most roots tracked at once, so the counter can never grow without bound. */
+const CHAIN_BUDGET_MAX_ROOTS = 500;
+
 function visitCapFor(maxHops) {
   const configured = Number(process.env.GROK_ORCH_VISIT_CAP);
   if (Number.isFinite(configured) && configured >= 1) return Math.floor(configured);
-  return Math.max(1, Number(maxHops) || DEFAULT_MAX_HOPS);
+  return Math.max(1, Math.min(DEFAULT_VISIT_CAP, Number(maxHops) || DEFAULT_MAX_HOPS));
+}
+
+function maxChainRuns() {
+  const configured = Number(process.env.GROK_ORCH_MAX_CHAIN_RUNS);
+  if (Number.isFinite(configured) && configured >= 1) return Math.floor(configured);
+  return DEFAULT_MAX_CHAIN_RUNS;
+}
+
+/**
+ * `rootRunId` → `{ spent, at }`. In memory on purpose: one backbone container
+ * serves every agent on the platform, so this is the same place the task board
+ * keeps its `busy` map, and a restart losing the count is fine — the durable
+ * ceiling is the project's autonomous budget, this is the one that keeps a
+ * single prompt from becoming a swarm.
+ */
+const chainBudgets = new Map();
+
+function sweepChainBudgets(now) {
+  if (chainBudgets.size < CHAIN_BUDGET_MAX_ROOTS) return;
+  for (const [id, rec] of chainBudgets) {
+    if (now - rec.at > CHAIN_BUDGET_TTL_MS) chainBudgets.delete(id);
+  }
+  // Still full of live roots: drop the oldest so the map stays bounded.
+  while (chainBudgets.size >= CHAIN_BUDGET_MAX_ROOTS) {
+    const oldest = chainBudgets.keys().next().value;
+    if (oldest === undefined) break;
+    chainBudgets.delete(oldest);
+  }
+}
+
+/** The root run a hand-off belongs to: the user message that started the chain. */
+export function rootRunIdOf(task, fallback = "") {
+  const orch = task && typeof task.orchestration === "object" && task.orchestration ? task.orchestration : {};
+  return String(orch.rootRunId || task?.correlationId || fallback || "").trim();
+}
+
+/**
+ * Take one run from this chain's budget. Returns false when the chain has spent
+ * it — the caller stops expanding and says so, rather than launching run 13 of
+ * something that was one question.
+ */
+export function takeChainRun(rootRunId, limit = maxChainRuns()) {
+  const id = String(rootRunId || "").trim();
+  if (!id) return true;
+  const now = Date.now();
+  sweepChainBudgets(now);
+  const rec = chainBudgets.get(id);
+  if (!rec || now - rec.at > CHAIN_BUDGET_TTL_MS) {
+    chainBudgets.set(id, { spent: 1, at: now });
+    return true;
+  }
+  if (rec.spent >= limit) return false;
+  rec.spent += 1;
+  rec.at = now;
+  return true;
+}
+
+/** How many runs this chain has already spent (diagnostics and tests). */
+export function chainRunsSpent(rootRunId) {
+  const rec = chainBudgets.get(String(rootRunId || "").trim());
+  return rec ? rec.spent : 0;
+}
+
+/** Forget every tracked chain (tests). */
+export function resetChainBudgets() {
+  chainBudgets.clear();
 }
 
 // Surface a stalled @mention chain IN THE CHAT (not just the VM log) so the exact
@@ -128,21 +219,29 @@ function normHandle(value) {
   return toHandle(String(value || "").replace(/^@/, "").replace(/_/g, "-"));
 }
 
-/** Handles an answer may use for one agent (roster slug, name, last token). */
+/**
+ * The LOOSE handles an agent may also answer to: single words of its display
+ * name ("growth" for "Growth Marketer").
+ *
+ * Kept because the roster does not always reach the backbone and a handle then
+ * has to be recovered from the program index's display name — but no longer
+ * treated as an exact hit. A loose form only resolves when it names exactly ONE
+ * agent (see `mentionedTeammates`): "@design" in a room with a Design Lead and a
+ * Designer is ambiguous, and guessing there launched the wrong agent, which then
+ * produced the wrong artifact, which somebody else then had to redo.
+ *
+ * Four characters minimum: three-letter fragments of a name collide with
+ * ordinary words far too often to be worth a billable run.
+ */
 function agentHandleForms(a) {
   const forms = new Set();
-  const add = (v) => {
-    const h = normHandle(v);
-    if (h) forms.add(h);
-  };
-  add(a && a.handle);
-  add(a && a.name);
   const name = String((a && a.name) || "").trim();
-  const parts = name.toLowerCase().split(/[^a-z0-9]+/).filter((p) => p.length >= 3);
+  const parts = name.toLowerCase().split(/[^a-z0-9]+/).filter((p) => p.length >= 4);
   for (const p of parts) forms.add(p);
-  for (const h of [...forms]) {
+  for (const source of [a && a.handle, name]) {
+    const h = normHandle(source);
     const last = h.split("-").filter(Boolean).pop();
-    if (last && last.length >= 3) forms.add(last);
+    if (last && last.length >= 4) forms.add(last);
   }
   return forms;
 }
@@ -385,13 +484,40 @@ async function agentAddressBook(bridge, spaceId, roster) {
   return [...byProgram.values()];
 }
 
+/**
+ * The part of an answer in which an `@handle` is actually ADDRESSING someone.
+ *
+ * Every `@token` used to trigger a real, billable agent run. That is wrong twice
+ * over: `@media` inside a CSS block, `@types/node` in a dependency list and
+ * `someone@example.com` in a draft email are not hand-offs, and an agent writing
+ * any of them fanned the chain out to whichever teammate fuzzily matched. So
+ * code, links and addresses are removed before mentions are read — what is left
+ * is prose, which is the only place a person or an agent addresses anyone.
+ */
+export function addressableText(answer) {
+  return String(answer || "")
+    // Fenced code, then indented code lines, then inline code.
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/^(?: {4}|\t).*$/gm, " ")
+    .replace(/`[^`\n]*`/g, " ")
+    // Links and e-mail addresses: the `@` in them addresses nobody.
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\bmailto:\S+/gi, " ")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, " ")
+    // Scoped package names (`@scope/pkg`) and decorators followed by a call.
+    .replace(/@[a-z0-9][a-z0-9_-]*\//gi, " ")
+    .replace(/@[a-z0-9][a-z0-9_-]*\s*\(/gi, " ");
+}
+
 /** The @handles an answer mentions, in document order, lowercased (no leading @). */
 export function parseAnswerMentionsOrdered(answer) {
   const out = [];
   const seen = new Set();
-  const re = /(^|[^a-z0-9_-])@([a-z0-9][a-z0-9_-]*)/gi;
+  const re = /(^|[^a-z0-9_@-])@([a-z0-9][a-z0-9_-]*)/gi;
   let m;
-  while ((m = re.exec(String(answer || "")))) {
+  const text = addressableText(answer);
+  while ((m = re.exec(text))) {
     const h = m[2].toLowerCase();
     if (!h || seen.has(h)) continue;
     seen.add(h);
@@ -400,9 +526,89 @@ export function parseAnswerMentionsOrdered(answer) {
   return out;
 }
 
+/**
+ * True when every occurrence of `@handle` is a courtesy or a reference rather
+ * than an ask — "thanks @lead", "as @researcher found", "per @designer's note".
+ *
+ * This is the cheapest half of the ping-pong problem. An agent that ends a turn
+ * with "Thanks @lead, the draft is attached" was, until now, handing @lead a
+ * fresh billable task; @lead would politely acknowledge it, handing one back.
+ * Neither agent was doing anything wrong — the platform was treating a reference
+ * to somebody as an instruction to them.
+ */
+export function isCourtesyMention(answer, handle) {
+  const h = String(handle || "").replace(/^@/, "").toLowerCase();
+  if (!h) return false;
+  const text = addressableText(answer);
+  const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|[^a-z0-9_@-])@${escaped}\\b`, "gi");
+  let m;
+  let found = false;
+  while ((m = re.exec(text))) {
+    found = true;
+    const before = text.slice(Math.max(0, m.index - 60), m.index).toLowerCase();
+    // Only the clause this mention owns: stop at the next sentence end or the
+    // next @mention, so an ask aimed at a LATER teammate ("great work @growth!
+    // @builder over to you") is not read as an ask aimed at this one.
+    const after = text
+      .slice(re.lastIndex, re.lastIndex + 120)
+      .split(/[.!?\n]|(?=[^a-z0-9_-]@[a-z0-9])/i)[0]
+      .toLowerCase();
+    const courteous =
+      /\b(thanks|thank you|thx|cheers|kudos|nice work|great work|good work|agreed|agree with|as|per|from|by|via|cc|fyi|noted|following|building on|handed (?:to|from)|credit to|shout ?out)\s*(to\s+)?$/i.test(
+        before.trim() + " ",
+      ) ||
+      // A possessive reference — "@researcher's findings", "@designer’s note".
+      // The apostrophe is required: without it "@growth draft the posts" reads as
+      // a reference to a draft rather than the instruction it plainly is.
+      /^['\u2019]s?\b/i.test(after);
+    // A directive next to the mention makes it a real hand-off again. Only
+    // strongly second-person phrasing counts: bare verbs like "draft" or "build"
+    // are nouns as often as instructions ("thanks @lead, draft attached"), and
+    // treating those as an ask is what made every acknowledgement a new run.
+    const asks = /\b(please|can you|could you|would you|over to you|your turn|you should|you'?ll|take it from here|pick (?:this |it )?up|go ahead|needs? you|handle (?:this|it)|review (?:this|it)|continue (?:from|with)|is yours)\b/i.test(
+      after,
+    );
+    if (!courteous || asks) return false;
+  }
+  return found;
+}
+
 /** The distinct @handles an answer mentions, lowercased (no leading @). */
 function parseAnswerMentions(answer) {
   return new Set(parseAnswerMentionsOrdered(answer));
+}
+
+/**
+ * The part of an answer that is the ask for ONE teammate.
+ *
+ * A hand-off used to carry the sender's whole reply as the receiving agent's
+ * entire task specification — including the paragraphs addressed to somebody
+ * else. The receiving agent then had to guess which part was its job, and the
+ * cheapest guess an LLM makes is "all of it", which is how three teammates ended
+ * up doing the same work three times. The sentences that actually name it are a
+ * far better objective; the full answer still travels as context.
+ */
+export function askForMention(answer, handle) {
+  const h = String(handle || "").replace(/^@/, "").toLowerCase();
+  const text = String(answer || "");
+  if (!h || !text.trim()) return "";
+  const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|[^a-z0-9_@-])@${escaped}\\b`, "i");
+  const sentences = text.split(/(?<=[.!?])\s+|\n+/);
+  const hit = sentences
+    .map((line, i) => ({ line: line.trim(), i }))
+    .filter((entry) => entry.line && re.test(entry.line));
+  if (!hit.length) return "";
+  // The sentence naming them, plus the one after it — an ask is regularly split
+  // ("@builder, next step. Use the copy in draft.md.").
+  const picked = [];
+  for (const { line, i } of hit) {
+    if (!picked.includes(line)) picked.push(line);
+    const next = (sentences[i + 1] || "").trim();
+    if (next && !re.test(next) && !/^@/.test(next) && !picked.includes(next)) picked.push(next);
+  }
+  return picked.join(" ").slice(0, 1200);
 }
 
 /**
@@ -450,9 +656,25 @@ function mentionExactHit(a, mention) {
  * "no teammate matched".
  */
 function mentionedTeammates(answer, agents, { visited, selfProgram, maxHops } = {}) {
-  const mentions = parseAnswerMentionsOrdered(answer);
-  const nothing = { teammates: [], capped: [], selfOnly: [], unknown: [], deferred: [], serial: false, visitCap: visitCapFor(maxHops) };
-  if (!mentions.length) return nothing;
+  const allMentions = parseAnswerMentionsOrdered(answer);
+  const nothing = {
+    teammates: [],
+    capped: [],
+    selfOnly: [],
+    unknown: [],
+    deferred: [],
+    courtesy: [],
+    ambiguous: [],
+    serial: false,
+    visitCap: visitCapFor(maxHops),
+  };
+  if (!allMentions.length) return nothing;
+  // An acknowledgement is not an instruction. Drop the mentions that only thank,
+  // credit or refer to somebody — launching those is what made two polite agents
+  // trade turns until the wallet stopped them.
+  const courtesy = allMentions.filter((h) => isCourtesyMention(answer, h));
+  const mentions = allMentions.filter((h) => !courtesy.includes(h));
+  if (!mentions.length) return { ...nothing, courtesy };
   const visitCap = visitCapFor(maxHops);
   const visitedList = Array.isArray(visited) ? visited.map(String) : [...(visited || [])].map(String);
   const visitCount = (id) => visitedList.filter((v) => v === id).length;
@@ -486,15 +708,28 @@ function mentionedTeammates(answer, agents, { visited, selfProgram, maxHops } = 
   for (const mention of mentions) {
     if (claim(mention, agents.filter((row) => mentionExactHit(row, mention)))) used.add(normHandle(mention));
   }
+  // Then the loose name-word forms — but ONLY when a form names exactly one
+  // agent. An ambiguous "@design" is reported, never guessed.
+  const ambiguous = [];
   for (const mention of mentions) {
     const m = normHandle(mention);
     if (used.has(m)) continue;
-    if (claim(mention, agents.filter((row) => agentHandleForms(row).has(m)))) used.add(m);
+    const hits = agents.filter((row) => agentHandleForms(row).has(m));
+    // Only rows that could actually take the work count towards ambiguity. The
+    // agent that wrote the answer is never a candidate, so including it turned
+    // "@lead, over to you" — in a room with one other lead — into a false
+    // ambiguity and dropped a perfectly good hand-off.
+    const distinct = new Set(hits.filter((row) => row.programId !== selfProgram).map((row) => row.programId));
+    if (distinct.size > 1) {
+      if (!ambiguous.includes(m)) ambiguous.push(m);
+      continue;
+    }
+    if (claim(mention, hits)) used.add(m);
   }
   const unknown = [];
   for (const mention of mentions) {
     const m = normHandle(mention);
-    if (!resolved.has(m) && !unknown.includes(m)) unknown.push(m);
+    if (!resolved.has(m) && !unknown.includes(m) && !ambiguous.includes(m)) unknown.push(m);
   }
   // "@a, then @b" is one agent's work followed by another's: launch only the
   // unblocked one — @b runs when @a hands off. Independent mentions stay parallel.
@@ -505,6 +740,8 @@ function mentionedTeammates(answer, agents, { visited, selfProgram, maxHops } = 
     capped,
     selfOnly,
     unknown,
+    courtesy,
+    ambiguous,
     serial,
     visitCap,
   };
@@ -559,13 +796,24 @@ function forwardContext(task) {
  */
 export async function launchTeammates(
   bridge,
-  { task, teammates, spaceId, threadId, prompt, payer, poolId, billingEndpoint, depth, maxHops, visitedList },
+  { task, teammates, spaceId, threadId, prompt, payer, poolId, billingEndpoint, depth, maxHops, visitedList, answer, rootRunId: rootId },
 ) {
   const base = forwardContext(task || {});
   const visited = Array.isArray(visitedList) ? visitedList : [];
+  const rootRunId = String(rootId || "").trim() || rootRunIdOf(task);
+  const runLimit = maxChainRuns();
   let launched = 0;
   const blocked = [];
+  const budgetExhausted = [];
   for (const teammate of teammates || []) {
+    // The chain's global budget, before anything is minted or written. Depth
+    // bounds one branch; this bounds the whole tree a single user message may
+    // grow, which is the ceiling that was missing entirely.
+    if (!takeChainRun(rootRunId, runLimit)) {
+      log("GROK_ORCH", { skip_teammate: teammate.programId, reason: "chain-run-budget", rootRunId, runLimit });
+      budgetExhausted.push(teammate);
+      continue;
+    }
     const correlationId = crypto.randomBytes(16).toString("hex");
     const auth = await buildDelegatedAuthorization(bridge, {
       billingEndpoint,
@@ -582,10 +830,45 @@ export async function launchTeammates(
       blocked.push(teammate);
       continue;
     }
+    // Every hand-off gets a CONTRACT, not a paragraph: a plan task the receiving
+    // agent owns, carrying the ask aimed at it, so it knows what its job is and
+    // — through the plan the prompt renders — what already exists. Best-effort:
+    // a plan the log refuses must not stop the work, it just costs the contract.
+    const ask = String(answer ? askForMention(answer, teammate.handle || teammate.name) : "") || String(prompt || "");
+    let assignment = null;
+    try {
+      const created = await addPlanTask(
+        bridge,
+        { ...task, spaceId, threadId },
+        {
+          title: ask.replace(/(^|\s)@[a-z0-9][a-z0-9_-]*/gi, " ").replace(/\s+/g, " ").trim().slice(0, 110) ||
+            `Work for ${teammate.name || teammate.handle || "a teammate"}`,
+          objective: ask,
+          owner: teammate.programId,
+          ownerName: teammate.name,
+          ownerHandle: teammate.handle,
+        },
+      );
+      if (created && created.ok) {
+        assignment = {
+          planTaskId: created.planTaskId,
+          objective: ask,
+          fromName: String((task && task.self && task.self.name) || ""),
+          fromHandle: String((task && task.self && task.self.handle) || ""),
+        };
+      }
+    } catch (err) {
+      log("GROK_ORCH", { plan_task_error: String(err?.message || err).slice(0, 160) });
+    }
+
     const childTask = {
       ...base,
-      prompt,
-      objective: prompt,
+      prompt: ask || prompt,
+      objective: ask || prompt,
+      ...(assignment ? { assignment } : {}),
+      // The full reply the ask came from, so the receiving agent can read the
+      // surrounding decision without the ask itself being a wall of text.
+      ...(answer && answer !== ask ? { handOffContextText: String(answer).slice(0, 4000) } : {}),
       streamTo: payer,
       spaceId,
       groupChat: true,
@@ -613,6 +896,9 @@ export async function launchTeammates(
         visited: [...visited, teammate.programId],
         poolId,
         payerUserId: payer,
+        // The user message this whole chain descends from. Every branch shares
+        // it, which is what makes one run budget cover the whole tree.
+        ...(rootRunId ? { rootRunId } : {}),
       },
     };
     try {
@@ -624,7 +910,7 @@ export async function launchTeammates(
     }
   }
   if (launched) log("GROK_ORCH", { launched, depth: Number(depth || 0) + 1, spaceId, threadId });
-  return { launched, blocked };
+  return { launched, blocked, budgetExhausted };
 }
 
 /**
@@ -673,10 +959,14 @@ export async function handOffMentions(bridge, task, text, options = {}) {
   if (selfProgram && !visitedList.includes(selfProgram)) visitedList.push(selfProgram);
 
   const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const { teammates, unknown } = mentionedTeammates(text, agents, { visited: visitedList, selfProgram, maxHops });
-  if (!teammates.length) return { ...nothing, unknown };
+  const { teammates, unknown, courtesy, ambiguous } = mentionedTeammates(text, agents, {
+    visited: visitedList,
+    selfProgram,
+    maxHops,
+  });
+  if (!teammates.length) return { ...nothing, unknown, courtesy, ambiguous };
 
-  const { launched, blocked } = await launchTeammates(bridge, {
+  const { launched, blocked, budgetExhausted } = await launchTeammates(bridge, {
     task,
     teammates,
     spaceId,
@@ -684,18 +974,23 @@ export async function handOffMentions(bridge, task, text, options = {}) {
     // The teammate is answering the message that named it, not this agent's
     // eventual final answer — which has not been written yet.
     prompt: String(options.prompt || text || ""),
+    answer: text,
     payer: context.payer,
     poolId: context.poolId,
     billingEndpoint: context.billingEndpoint,
     depth,
     maxHops,
     visitedList,
+    rootRunId: rootRunIdOf(task, options.rootRunId),
   });
-  const blockedIds = new Set(blocked.map((t) => t.programId));
+  const stoppedIds = new Set([...blocked, ...(budgetExhausted || [])].map((t) => t.programId));
   return {
-    launched: teammates.filter((t) => !blockedIds.has(t.programId)),
+    launched: teammates.filter((t) => !stoppedIds.has(t.programId)),
     blocked,
+    budgetExhausted: budgetExhausted || [],
     unknown,
+    courtesy,
+    ambiguous,
     count: launched,
   };
 }
@@ -785,12 +1080,34 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
     return 0;
   }
 
-  const agents = await agentAddressBook(bridge, spaceId, task.roster);
-  const { teammates, capped, selfOnly, unknown, deferred, serial, visitCap } = mentionedTeammates(answer, agents, {
-    visited: visitedList,
-    selfProgram,
-    maxHops,
+  // Is there any reason to carry on? The two questions nothing used to ask: is
+  // the work finished, and is this chain still producing anything. A chain that
+  // is done or circling stops here, and the room is told why — which is the
+  // difference between a team that finishes and one that has to be interrupted.
+  const rootRunId = rootRunIdOf(task, delivery && delivery.correlationId);
+  const plan = await readProjectPlan(bridge, { spaceId, threadId: String(task.threadId || "main") || "main" });
+  const gate = await shouldHaltChain(plan, {
+    rootRunId,
+    llm: task.config && typeof task.config === "object" ? task.config.llm : undefined,
   });
+  if (gate.halt) {
+    log("GROK_ORCH", { followups: gate.kind, rootRunId });
+    await noteChain(
+      bridge,
+      task,
+      gate.kind === "complete" ? `✅ ${gate.reason}` : `⚠️ ${gate.reason}`,
+      gate.kind === "complete" ? "orch-complete" : "orch-stagnant",
+    );
+    return 0;
+  }
+
+  const agents = await agentAddressBook(bridge, spaceId, task.roster);
+  const { teammates, capped, selfOnly, unknown, deferred, courtesy, ambiguous, serial, visitCap } =
+    mentionedTeammates(answer, agents, {
+      visited: visitedList,
+      selfProgram,
+      maxHops,
+    });
   if (!teammates.length) {
     const known = agents.map((a) => a.handle).filter(Boolean);
     log("GROK_ORCH", {
@@ -799,10 +1116,16 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       capped: capped.map((a) => a.handle),
       selfOnly,
       unknown,
+      courtesy,
+      ambiguous,
       rosterSize: Array.isArray(task.roster) ? task.roster.length : 0,
       answerMentions: answerHandles,
     });
-    if (answerHandles.length) {
+    // An answer that only thanked or credited somebody is not a stalled chain —
+    // it is a finished one. Saying "hand-off didn't continue" there taught people
+    // to read a healthy ending as a failure.
+    const askedFor = answerHandles.filter((h) => !courtesy.includes(h));
+    if (askedFor.length) {
       // Say which of the three actually happened. Collapsing them into "no
       // teammate matched" sent people hunting for a handle typo when the handle
       // was fine and the chain had simply vetoed the agent.
@@ -815,7 +1138,12 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
       if (selfOnly.length) {
         reasons.push(`${selfOnly.map((h) => "@" + h).join(", ")} names the agent that wrote this answer`);
       }
-      const stillUnknown = unknown.filter((h) => !personHandles.has(h));
+      if (ambiguous.length) {
+        reasons.push(
+          `${ambiguous.map((h) => "@" + h).join(", ")} matches more than one agent here — use the exact @handle`,
+        );
+      }
+      const stillUnknown = unknown.filter((h) => !personHandles.has(h) && !courtesy.includes(h));
       if (stillUnknown.length) {
         reasons.push(
           `no agent in this project answers to ${stillUnknown.map((h) => "@" + h).join(", ")} (known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "none resolved"})`,
@@ -826,7 +1154,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
         task,
         reasons.length
           ? `${reasons.join("; ")}.`
-          : `no teammate matched. Mentioned: ${answerHandles.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`,
+          : `no teammate matched. Mentioned: ${askedFor.map((h) => "@" + h).join(", ")}. Known agents: ${known.length ? known.map((h) => "@" + h).join(", ") : "(none resolved)"}.`,
       );
     }
     return 0;
@@ -847,19 +1175,30 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const threadId = String(task.threadId || "main") || "main";
-  const { launched, blocked } = await launchTeammates(bridge, {
+  const { launched, blocked, budgetExhausted } = await launchTeammates(bridge, {
     task,
     teammates,
     spaceId,
     threadId,
     prompt: answer,
+    answer,
     payer,
     poolId,
     billingEndpoint,
     depth,
     maxHops,
     visitedList,
+    rootRunId,
   });
+  if (budgetExhausted && budgetExhausted.length) {
+    await noteStall(
+      bridge,
+      task,
+      `this request has already run ${maxChainRuns()} agent turns, so ${budgetExhausted
+        .map((t) => "@" + (t.handle || t.name))
+        .join(", ")} weren't started. That ceiling exists to stop a chain circling — say what is still missing and it will run again.`,
+    );
+  }
   // Every teammate this answer named either started or is accounted for here —
   // a hand-off that quietly went nowhere is the failure this whole module exists
   // to make impossible to miss.

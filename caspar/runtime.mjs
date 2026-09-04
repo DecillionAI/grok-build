@@ -58,7 +58,13 @@ import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
 import { SandboxBridgeServer, detectSandboxTool } from "./sandboxBridge.mjs";
 import { prewarmToolContainers } from "./prewarm.mjs";
-import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, KIND } from "./spaceHistory.mjs";
+import {
+  buildHistoryTurns,
+  fetchSpaceConversation,
+  fetchTeamActivitySince,
+  postSpaceSignal,
+  KIND,
+} from "./spaceHistory.mjs";
 import {
   authorizeBillingRun,
   authorizeDirectToolRun,
@@ -79,6 +85,8 @@ import {
 } from "./orchestrate.mjs";
 import { AgentTaskBoard } from "./agentQueue.mjs";
 import { SEND_MESSAGE_TOOL, sendAgentMessage } from "./sendMessage.mjs";
+import { PLAN_TOOLS, PLAN_TOOL_NAMES, runPlanTool } from "./planTools.mjs";
+import { readProjectPlan, renderPlanForPrompt } from "./projectPlan.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "./taskSignal.mjs";
 import { ToolInvoker } from "./toolInvoker.mjs";
 import { ToolSocketServer } from "./toolSocket.mjs";
@@ -322,6 +330,9 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     // advisor) has none, so the tool is not offered there rather than offered
     // and then refused.
     ...(task.spaceId || task.storeId || task.space_id ? [SEND_MESSAGE_TOOL] : []),
+    // The shared plan. Like `send_message` these need a project to act on, so a
+    // spaceless run (the market advisor) is not offered them.
+    ...(task.spaceId || task.storeId || task.space_id ? PLAN_TOOLS : []),
   ];
   const reservedToolNames = new Set(platformToolDefs.map((tool) => tool.name));
   const installCatalog = (rebuilt) => {
@@ -338,7 +349,9 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
           ? "scheduler"
           : tool.name === SEND_MESSAGE_TOOL.name
             ? "chat"
-            : "media";
+            : PLAN_TOOL_NAMES.has(tool.name)
+              ? "plan"
+              : "media";
       byName.set(tool.name, { name: tool.name, kind: "tool", category });
     }
     return [...rebuilt.tools.filter((tool) => !reservedToolNames.has(tool.name)), ...platformToolDefs];
@@ -421,6 +434,8 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
         return sendAgentMessage(bridge, { ...task, correlationId: correlationId || task.correlationId }, args, {
           log: (info) => log("GROK_SEND_MESSAGE", info),
         });
+      if (PLAN_TOOL_NAMES.has(name))
+        return runPlanTool(bridge, { ...task, correlationId: correlationId || task.correlationId }, name, args);
       if (!invoker) return { ok: false, error: `tool ${name} needs a live Caspar bridge` };
       return invoker.invoke(name, args);
     },
@@ -569,6 +584,21 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
   // edit in the admin panel reaches every agent's next turn without a redeploy.
   const universalInstruction = await readUniversalInstruction(bridge);
 
+  // The project's shared plan: the outcome, what makes it done, what the team has
+  // already produced, and what is still open. Read per run so an agent starting
+  // now sees what an agent that finished a second ago registered.
+  const spaceForPlan = task.spaceId || task.storeId || task.space_id || "";
+  const plan = spaceForPlan ? await readProjectPlan(bridge, { spaceId: spaceForPlan, threadId: runThreadId }) : null;
+  const planBlock = plan ? renderPlanForPrompt(plan, { self: task.self }) : "";
+  if (plan) {
+    log("GROK_PLAN", {
+      goal: Boolean(plan.goal),
+      acceptance: plan.acceptance.length,
+      tasks: plan.tasks.size,
+      artifacts: plan.artifacts.size,
+    });
+  }
+
   const systemPrompt = buildSystemPrompt(task, {
     capabilities,
     sharedEnv,
@@ -576,15 +606,42 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     mcpServers: attachedMcpServers,
     workspace,
     universalInstruction,
+    planBlock,
+    planTools: Boolean(spaceForPlan),
   });
   const grokHomeGuess = resolveGrokHome({ slug: sessionSlug(sessionId) });
   const resuming = Boolean(persistedConversationSession(grokHomeGuess) || task.resumeSessionId);
+
+  // What the team did while this agent was not looking.
+  //
+  // A resumed engine session carries this agent's OWN past turns and nothing
+  // about anyone else's, and the compact room transcript was skipped exactly
+  // when a session was resumed — so from its second turn onward an agent planned
+  // as if the project were where it left it, and rebuilt what a teammate had
+  // already built. The delta is always fetched, resumed or not: on a fresh
+  // session it complements the transcript, and on a resumed one it is the only
+  // thing standing between this agent and duplicating a colleague's work.
+  let teamDelta = null;
+  if (bridge && spaceForPlan) {
+    try {
+      teamDelta = await fetchTeamActivitySince(bridge, {
+        spaceId: spaceForPlan,
+        threadId: runThreadId,
+        self: task.self,
+      });
+      if (teamDelta.lines.length) log("GROK_DELTA", { since: teamDelta.cutoff, lines: teamDelta.lines.length });
+    } catch (err) {
+      log("GROK_DELTA", { error: String(err?.message || err).slice(0, 160) });
+    }
+  }
+
   const prompt = buildUserPrompt(task, {
     objective,
     attachments,
     extractedTexts,
     workspace,
     includeHistory: !resuming,
+    teamDelta,
   });
   // With inline media, the turn becomes ACP content blocks: the composed text
   // first, then each image/audio block. Without any, `promptBlocks` stays null and
@@ -597,6 +654,8 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }, bi
     workspace,
     objective_chars: objective.length,
     history_turns: Array.isArray(task.history) ? task.history.length : 0,
+    delta_lines: teamDelta && teamDelta.lines.length ? teamDelta.lines.length : undefined,
+    plan_artifacts: plan && plan.artifacts.size ? plan.artifacts.size : undefined,
     tools: lastToolDefs.map((t) => t.name),
     shared_env: sharedEnv?.name,
     sandbox_backend: sandboxActive || undefined,

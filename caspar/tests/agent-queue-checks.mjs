@@ -28,6 +28,7 @@ import {
   deriveTitle,
   foldTaskEvents,
   openTasks,
+  promptSimilarity,
   queueIdentity,
   storablePayload,
 } from "../agentQueue.mjs";
@@ -234,6 +235,40 @@ await check("a busy agent queues the next task instead of running it twice", asy
   assert.equal(admission.queued.title, "Second job");
   const open = openTasks(await readBoard(bridge, "agent-a"));
   assert.deepEqual(open.map((t) => t.title), ["Second job"]);
+});
+
+await check("the same request handed over twice becomes ONE task, not two", async () => {
+  // Two agents who both need the same specialist each hand it the work, quoting
+  // the same paragraph. Running it twice is not thoroughness — it is one job done
+  // twice and a third agent reconciling two versions of one artifact.
+  const bridge = makeBridge();
+  const board = new AgentTaskBoard();
+  await board.admit(bridge, delivery("agent-a", "First job"));
+  const first = await board.admit(bridge, delivery("agent-a", "Please draft the launch post for the new pricing page"));
+  assert.notEqual(first, "run");
+  const again = await board.admit(bridge, delivery("agent-a", "Draft the launch post for the new pricing page now"));
+  assert.equal(again.duplicate, true, "the second copy is folded into the first");
+  assert.equal(again.queued.taskId, first.queued.taskId);
+  const open = openTasks(await readBoard(bridge, "agent-a"));
+  assert.equal(open.length, 1, "one row on the board, not two");
+});
+
+await check("genuinely different work still gets its own task", async () => {
+  const bridge = makeBridge();
+  const board = new AgentTaskBoard();
+  await board.admit(bridge, delivery("agent-a", "First job"));
+  await board.admit(bridge, delivery("agent-a", "Draft the launch post for the pricing page"));
+  const other = await board.admit(bridge, delivery("agent-a", "Audit the checkout flow for accessibility"));
+  assert.ok(!other.duplicate);
+  const open = openTasks(await readBoard(bridge, "agent-a"));
+  assert.equal(open.length, 2);
+});
+
+await check("similarity ignores mentions and filler, not meaning", () => {
+  assert.ok(promptSimilarity("@writer draft the launch post", "draft the launch post") > 0.9);
+  assert.ok(promptSimilarity("please can you draft the launch post now", "draft the launch post") > 0.8);
+  assert.ok(promptSimilarity("draft the launch post", "audit the checkout flow") < 0.2);
+  assert.equal(promptSimilarity("", "anything"), 0);
 });
 
 await check("a different agent in the same project is unaffected", async () => {

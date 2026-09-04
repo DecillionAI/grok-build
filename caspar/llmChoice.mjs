@@ -92,8 +92,14 @@ export function parseChoiceIndex(text, count) {
   return n - 1;
 }
 
-/** One completion, in whichever wire protocol the provider speaks. */
-async function completeOnce(route, prompt, { timeoutMs, fetchImpl }) {
+/**
+ * One completion, in whichever wire protocol the provider speaks.
+ *
+ * Exported because the acceptance check (`acceptance.mjs`) asks the same kind of
+ * tiny question on the same route — "is this project finished?" — and two copies
+ * of provider-shape handling is one too many.
+ */
+export async function completeOnce(route, prompt, { timeoutMs, fetchImpl, maxTokens = 16 } = {}) {
   const doFetch = fetchImpl || globalThis.fetch;
   if (typeof doFetch !== "function") throw new Error("no fetch available");
   const controller = new AbortController();
@@ -109,13 +115,13 @@ async function completeOnce(route, prompt, { timeoutMs, fetchImpl }) {
     let body;
     if (descriptor.apiBackend === "messages") {
       url = `${base}/messages`;
-      body = { model, max_tokens: 16, messages: [{ role: "user", content: prompt }] };
+      body = { model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] };
     } else if (descriptor.apiBackend === "responses") {
       url = `${base}/responses`;
-      body = { model, max_output_tokens: 16, input: prompt };
+      body = { model, max_output_tokens: maxTokens, input: prompt };
     } else {
       url = `${base}/chat/completions`;
-      body = { model, max_tokens: 16, messages: [{ role: "user", content: prompt }] };
+      body = { model, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] };
     }
     const res = await doFetch(url, {
       method: "POST",
