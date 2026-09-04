@@ -546,6 +546,161 @@ function forwardContext(task) {
 }
 
 /**
+ * Start one run per teammate: a delegated quote each, then their proxy signalled
+ * with the work. Shared by the two ways an agent hands work over — the @mentions
+ * in its final answer (`planAndLaunchFollowups`) and the @mentions in a message
+ * it sends mid-run (`handOffMentions`, the `send_message` tool) — so both cost a
+ * hop, both draw on the same autonomous budget, and both land on the receiving
+ * agent's task board rather than starting a second instance of it.
+ *
+ * Returns `{ launched, blocked }`: `blocked` are the teammates whose delegated
+ * quote was refused or whose proxy could not be reached, which the caller reports
+ * rather than dropping in silence.
+ */
+export async function launchTeammates(
+  bridge,
+  { task, teammates, spaceId, threadId, prompt, payer, poolId, billingEndpoint, depth, maxHops, visitedList },
+) {
+  const base = forwardContext(task || {});
+  const visited = Array.isArray(visitedList) ? visitedList : [];
+  let launched = 0;
+  const blocked = [];
+  for (const teammate of teammates || []) {
+    const correlationId = crypto.randomBytes(16).toString("hex");
+    const auth = await buildDelegatedAuthorization(bridge, {
+      billingEndpoint,
+      payer,
+      poolId,
+      proxyProgramId: teammate.programId,
+      spaceId,
+      correlationId,
+    });
+    if (!auth) {
+      // Budget reached or quote failed: stop expanding down this teammate rather
+      // than spend past the cap. The answer that named them is already persisted.
+      log("GROK_ORCH", { skip_teammate: teammate.programId, reason: "no-delegated-quote" });
+      blocked.push(teammate);
+      continue;
+    }
+    const childTask = {
+      ...base,
+      prompt,
+      objective: prompt,
+      streamTo: payer,
+      spaceId,
+      groupChat: true,
+      threadId,
+      proxyProgramId: teammate.programId,
+      agentProgramId: teammate.programId,
+      agentCreatureId: teammate.creatureId,
+      targetAgentId: teammate.resourceId,
+      self: { id: teammate.resourceId, name: teammate.name, handle: teammate.handle, programId: teammate.programId },
+      mentions: [{ programId: teammate.programId, name: teammate.name, handle: teammate.handle, kind: "agent" }],
+      billingAuthorization: auth,
+      autonomousQuote: true,
+      correlationId,
+      serverOrchestrate: true,
+      // Attribution for the receiving agent's task board: a hand-off should read
+      // as "from <the agent that asked>", not as an anonymous autonomous run.
+      taskOrigin: "agent",
+      ...(task && task.self && task.self.name ? { requestedByName: String(task.self.name) } : {}),
+      // Only mark THIS teammate visited on their branch. Pre-claiming every
+      // sibling blocked later hand-offs ("@builder please wire the tracking
+      // the researcher just found") even when handles matched.
+      orchestration: {
+        depth: Number(depth || 0) + 1,
+        maxHops,
+        visited: [...visited, teammate.programId],
+        poolId,
+        payerUserId: payer,
+      },
+    };
+    try {
+      await signalProxyRun(bridge, teammate, childTask, { spaceId, correlationId, streamTo: payer });
+      launched += 1;
+    } catch (err) {
+      log("GROK_ORCH", { launch_error: teammate.programId, error: String(err?.message || err).slice(0, 160) });
+      blocked.push(teammate);
+    }
+  }
+  if (launched) log("GROK_ORCH", { launched, depth: Number(depth || 0) + 1, spaceId, threadId });
+  return { launched, blocked };
+}
+
+/**
+ * The billing context a hand-off needs: who pays, out of which pool, through
+ * which billing creature. Returns null when any of the three is missing — with
+ * no way to bill an unattended run there is nothing to launch.
+ */
+export async function handOffContext(bridge, task) {
+  const orch = task && typeof task.orchestration === "object" && task.orchestration ? task.orchestration : {};
+  const payer = String(orch.payerUserId || (task && task.streamTo) || "");
+  const billingEndpoint = billingEndpointFromTask(task);
+  if (!payer || !billingEndpoint) return null;
+  const poolId = String(orch.poolId || "") || (await resolvePoolId(bridge, payer));
+  if (!poolId) return null;
+  return { payer, poolId, billingEndpoint, orch };
+}
+
+/**
+ * Hand work to whoever `text` @mentions, WITHOUT ending this agent's turn.
+ *
+ * This is what makes an agent's mid-run message a real hand-off rather than a
+ * note in the chat: the same launch path an answer's mentions take, so the
+ * teammate's task lands on its board and it starts when it is free. Returns
+ * `{ launched, blocked, unknown }` for the tool to report back to the model —
+ * an agent that mistyped a handle should be told, not left assuming.
+ */
+export async function handOffMentions(bridge, task, text, options = {}) {
+  const nothing = { launched: [], blocked: [], unknown: [] };
+  if (!bridge || !task) return nothing;
+  const spaceId = spaceIdOf(task);
+  if (!spaceId) return nothing;
+  const mentioned = parseAnswerMentionsOrdered(text);
+  if (!mentioned.length) return nothing;
+
+  const orchIn = task.orchestration && typeof task.orchestration === "object" ? task.orchestration : {};
+  const depth = Number(orchIn.depth || 0);
+  const maxHops = Number(orchIn.maxHops || DEFAULT_MAX_HOPS);
+  if (depth + 1 >= maxHops) {
+    return { ...nothing, hopCapped: true };
+  }
+  const context = await handOffContext(bridge, task);
+  if (!context) return { ...nothing, noBilling: true };
+
+  const visitedList = (Array.isArray(orchIn.visited) ? orchIn.visited : []).map(String);
+  const selfProgram = String(task.proxyProgramId || task.agentProgramId || (task.self && task.self.programId) || "");
+  if (selfProgram && !visitedList.includes(selfProgram)) visitedList.push(selfProgram);
+
+  const agents = await agentAddressBook(bridge, spaceId, task.roster);
+  const { teammates, unknown } = mentionedTeammates(text, agents, { visited: visitedList, selfProgram, maxHops });
+  if (!teammates.length) return { ...nothing, unknown };
+
+  const { launched, blocked } = await launchTeammates(bridge, {
+    task,
+    teammates,
+    spaceId,
+    threadId: String(task.threadId || "main") || "main",
+    // The teammate is answering the message that named it, not this agent's
+    // eventual final answer — which has not been written yet.
+    prompt: String(options.prompt || text || ""),
+    payer: context.payer,
+    poolId: context.poolId,
+    billingEndpoint: context.billingEndpoint,
+    depth,
+    maxHops,
+    visitedList,
+  });
+  const blockedIds = new Set(blocked.map((t) => t.programId));
+  return {
+    launched: teammates.filter((t) => !blockedIds.has(t.programId)),
+    blocked,
+    unknown,
+    count: launched,
+  };
+}
+
+/**
  * After a server-orchestrated run finishes, launch every teammate its answer
  * @mentioned. Each teammate gets a fresh correlation, a delegated quote, and the
  * advanced orchestration state (visited set + hop depth) so the chain cannot
@@ -692,64 +847,19 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
   }
 
   const threadId = String(task.threadId || "main") || "main";
-  const base = forwardContext(task);
-  let launched = 0;
-  const blocked = [];
-  for (const teammate of teammates) {
-    const correlationId = crypto.randomBytes(16).toString("hex");
-    const auth = await buildDelegatedAuthorization(bridge, {
-      billingEndpoint,
-      payer,
-      poolId,
-      proxyProgramId: teammate.programId,
-      spaceId,
-      correlationId,
-    });
-    if (!auth) {
-      // Budget reached or quote failed: stop expanding down this teammate rather
-      // than spend past the cap. The answer that named them is already persisted.
-      log("GROK_ORCH", { skip_teammate: teammate.programId, reason: "no-delegated-quote" });
-      blocked.push(teammate);
-      continue;
-    }
-    const childTask = {
-      ...base,
-      prompt: answer,
-      objective: answer,
-      streamTo: payer,
-      spaceId,
-      groupChat: true,
-      threadId,
-      proxyProgramId: teammate.programId,
-      agentProgramId: teammate.programId,
-      agentCreatureId: teammate.creatureId,
-      targetAgentId: teammate.resourceId,
-      self: { id: teammate.resourceId, name: teammate.name, handle: teammate.handle, programId: teammate.programId },
-      mentions: [{ programId: teammate.programId, name: teammate.name, handle: teammate.handle, kind: "agent" }],
-      billingAuthorization: auth,
-      autonomousQuote: true,
-      correlationId,
-      serverOrchestrate: true,
-      // Only mark THIS teammate visited on their branch. Pre-claiming every
-      // sibling blocked later hand-offs ("@builder please wire the tracking
-      // the researcher just found") even when handles matched.
-      orchestration: {
-        depth: depth + 1,
-        maxHops,
-        visited: [...visitedList, teammate.programId],
-        poolId,
-        payerUserId: payer,
-      },
-    };
-    try {
-      await signalProxyRun(bridge, teammate, childTask, { spaceId, correlationId, streamTo: payer });
-      launched += 1;
-    } catch (err) {
-      log("GROK_ORCH", { launch_error: teammate.programId, error: String(err?.message || err).slice(0, 160) });
-      blocked.push(teammate);
-    }
-  }
-  if (launched) log("GROK_ORCH", { launched, depth: depth + 1, spaceId, threadId });
+  const { launched, blocked } = await launchTeammates(bridge, {
+    task,
+    teammates,
+    spaceId,
+    threadId,
+    prompt: answer,
+    payer,
+    poolId,
+    billingEndpoint,
+    depth,
+    maxHops,
+    visitedList,
+  });
   // Every teammate this answer named either started or is accounted for here —
   // a hand-off that quietly went nowhere is the failure this whole module exists
   // to make impossible to miss.

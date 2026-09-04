@@ -1629,10 +1629,12 @@ await check("the serve loop processes prompts in parallel — a slow prompt does
   const gateway = await new FakeGateway().listen();
   process.env.CASPAR_GATEWAY_PORT = String(gateway.port);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // Two prompts as two different users/threads produce: distinct sessions (so
-  // they don't share a workspace) and distinct correlations.
-  const a = proxyDelivery({ prompt: "slow-a", correlationId: "cc-a", extra: { sessionId: "space:space-1:agent-a" } });
-  const b = proxyDelivery({ prompt: "slow-b", correlationId: "cc-b", extra: { sessionId: "space:space-1:agent-b" } });
+  // Two prompts for two DIFFERENT agents (distinct proxy program ids, hence
+  // distinct sessions and workspaces) with distinct correlations. Different
+  // agents are exactly what must stay parallel — one agent's own prompts are
+  // serialized onto its task board (checked separately below).
+  const a = proxyDelivery({ prompt: "slow-a", correlationId: "cc-a", replyTo: "8@global", extra: { sessionId: "space:space-1:agent-a", self: { id: "res-tina", name: "Tina", handle: "tina" } } });
+  const b = proxyDelivery({ prompt: "slow-b", correlationId: "cc-b", replyTo: "18@global", extra: { sessionId: "space:space-1:agent-b", self: { id: "res-bob", name: "Bob", handle: "bob" } } });
 
   const { main } = await import("../runtime.mjs");
   const mainPromise = main();
@@ -1670,6 +1672,79 @@ await check("the serve loop processes prompts in parallel — a slow prompt does
   } finally {
     // Drop the link and stop listening so the serve loop's reconnect fails and
     // main() returns instead of idling forever.
+    for (const socket of [...gateway.sockets]) socket.destroy();
+    await gateway.close();
+    await Promise.race([mainPromise, sleep(8000)]);
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+  }
+});
+
+await check("two prompts for the SAME agent are serialized on its task board", async () => {
+  // The other side of the parallelism check above: one agent is one worker, so
+  // the second prompt must NOT start a second instance of it. It is queued
+  // instead, and answered immediately with a `queued` result so the client is
+  // never left holding an authorization open for an unknown wait.
+  const SLEEP_MS = 1500;
+  const sleepScenario = {
+    messages: [
+      { type: "system", subtype: "init", session_id: "sess", model: "grok-build", tools: [], mcp_servers: [] },
+      { __sleepMs: SLEEP_MS },
+      ...successScenario("done").messages,
+    ],
+  };
+  const { file } = scenarioFile(sleepScenario);
+  const workspaceRoot = tempDir("caspar-ws-");
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CASPAR_GATEWAY_HOST: "127.0.0.1",
+    GROK_BIN: FAKE_CLI,
+    GROK_FAKE_SCENARIO: file,
+    GROK_FAKE_RECORD: "",
+    GROK_CREATURE_WORKSPACE_ROOT: workspaceRoot,
+    GROK_CREATURE_CONFIG_DIR: path.join(workspaceRoot, "config"),
+    GROK_CREATURE_MAX_WALL_SECONDS: "30",
+    GROK_CREATURE_USER: "",
+    GROK_CREATURE_MAX_CONCURRENT_PROMPTS: "4",
+    GROK_CREATURE_DISCOVER_TOOLS: "false",
+    GROK_CREATURE_TASK_WAIT: "30",
+    GROK_CREATURE_RECONNECT_ATTEMPTS: "1",
+  });
+  const gateway = await new FakeGateway().listen();
+  process.env.CASPAR_GATEWAY_PORT = String(gateway.port);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Same agent (same proxy program id), two prompts arriving together.
+  const a = proxyDelivery({ prompt: "first job", correlationId: "same-a", replyTo: "8@global" });
+  const b = proxyDelivery({ prompt: "second job", correlationId: "same-b", replyTo: "8@global" });
+
+  const { main } = await import("../runtime.mjs");
+  const mainPromise = main();
+  try {
+    for (let i = 0; i < 300 && gateway.sockets.size === 0; i++) await sleep(10);
+    assert.ok(gateway.sockets.size > 0, "the creature connected to the gateway");
+    await sleep(50);
+
+    gateway.pushSignal(a.key, a.data);
+    gateway.pushSignal(b.key, b.data);
+
+    for (let i = 0; i < 600; i++) {
+      if (gateway.signals().filter((s) => s.packet.kind === "davinci/result").length >= 2) break;
+      await sleep(20);
+    }
+    const finals = gateway.signals().filter((s) => s.packet.kind === "davinci/result");
+    assert.equal(finals.length, 2, "both prompts were answered");
+    const byCorrelation = new Map(finals.map((s) => [s.packet.correlationId, s.packet.result]));
+    const queued = [...byCorrelation.values()].filter((r) => r?.queued === true);
+    assert.equal(queued.length, 1, "exactly one of the two was queued behind the other");
+    assert.ok(queued[0].task?.taskId, "the queued reply names the task it created");
+    assert.ok(queued[0].task?.title, "and its title, so the client can show what is waiting");
+
+    // The board says the same thing: two tasks queued, only one ever started.
+    const taskRows = gateway.storeSignals().filter((s) => (s.tags || []).includes("kind=task"));
+    const events = taskRows.map((s) => s.data.event);
+    assert.equal(events.filter((e) => e === "queued").length, 2, "both prompts became tasks");
+    assert.equal(events.filter((e) => e === "started").length, 1, "only one instance of the agent ever ran");
+  } finally {
     for (const socket of [...gateway.sockets]) socket.destroy();
     await gateway.close();
     await Promise.race([mainPromise, sleep(8000)]);

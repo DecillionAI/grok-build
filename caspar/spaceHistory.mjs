@@ -42,6 +42,14 @@ export const KIND = {
   TOOLREPLY: "toolreply",
   /** A thread lifecycle marker (created / renamed / deleted). */
   THREAD: "thread",
+  /**
+   * One event in an agent's task board (the per-agent kanban): a task queued
+   * for an agent, claimed, finished, requeued or cancelled. The board is a
+   * projection of these rows — there is no second store — so the app renders
+   * live from the same fan-out and the backbone rebuilds the queue after a
+   * restart by replaying them. Never a chat bubble.
+   */
+  TASK: "task",
 };
 
 /** The tags this backbone builds and filters on. */
@@ -51,6 +59,8 @@ export const SIGNAL_TAGS = {
   agent: (programId) => `agent=${programId}`,
   run: (correlationId) => `run=${correlationId}`,
   mention: (programId) => `mention=${programId}`,
+  /** The task board row an event belongs to (see `KIND.TASK`). */
+  task: (taskId) => `task=${taskId}`,
 };
 
 /** The kinds that are conversation — what an agent should read as the chat. */
@@ -77,11 +87,18 @@ function tagValue(raw) {
  */
 export async function readSpaceSignals(
   bridge,
-  { spaceId, threadId, kinds, count = HISTORY_TURN_LIMIT, timeoutMs = HISTORY_FETCH_TIMEOUT_MS } = {},
+  { spaceId, threadId, kinds, tagsAll: extraTagsAll, count = HISTORY_TURN_LIMIT, timeoutMs = HISTORY_FETCH_TIMEOUT_MS } = {},
 ) {
   if (!bridge || !spaceId) return [];
   const tagsAll = [];
   if (threadId) tagsAll.push(SIGNAL_TAGS.thread(tagValue(threadId)));
+  // Extra `tagsAll` narrow the read further — an agent's own task board is
+  // `kind=task` AND `agent=<programId>`, which the node answers as one indexed
+  // query instead of a full-log scan this side has to filter.
+  for (const extra of Array.isArray(extraTagsAll) ? extraTagsAll : []) {
+    const t = tagValue(extra);
+    if (t && !tagsAll.includes(t)) tagsAll.push(t);
+  }
   const tagsAny = (kinds || []).map((k) => SIGNAL_TAGS.kind(k));
   let res;
   try {
@@ -146,7 +163,7 @@ export async function fetchSpaceConversation(bridge, { spaceId, threadId, limit 
  */
 export async function postSpaceSignal(
   bridge,
-  { spaceId, kind, threadId, data, agentProgramId, correlationId, mentions, temp = false, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
+  { spaceId, kind, threadId, data, agentProgramId, correlationId, mentions, tags: extraTags, temp = false, timeoutMs = HISTORY_FETCH_TIMEOUT_MS },
 ) {
   if (!bridge) throw new Error("postSpaceSignal: no bridge");
   if (!spaceId) throw new Error("postSpaceSignal: no spaceId");
@@ -157,6 +174,13 @@ export async function postSpaceSignal(
   for (const m of mentions || []) {
     const programId = tagValue(m && typeof m === "object" ? m.programId || m.id : m);
     if (programId) tags.push(SIGNAL_TAGS.mention(programId));
+  }
+  // Caller-supplied tags (the task board's `task=<id>`) ride the same list. The
+  // node caps a signal at 24 tags and rejects the whole signal on a malformed
+  // one, so they are trimmed and de-duplicated here like every other tag.
+  for (const extra of Array.isArray(extraTags) ? extraTags : []) {
+    const t = tagValue(extra);
+    if (t && !tags.includes(t)) tags.push(t);
   }
   const res = await bridge.call(
     "signal",
