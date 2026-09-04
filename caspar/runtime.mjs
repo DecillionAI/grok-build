@@ -81,7 +81,7 @@ import {
   isServerOrchestrated,
   planAndLaunchFollowups,
   recordServerRun,
-  settleAutonomousSpend,
+  settleProjectSpend,
 } from "./orchestrate.mjs";
 import { AgentTaskBoard } from "./agentQueue.mjs";
 import { SEND_MESSAGE_TOOL, sendAgentMessage } from "./sendMessage.mjs";
@@ -1455,11 +1455,13 @@ export async function main() {
           ...(result && result.success === false && result.error ? { error: String(result.error).slice(0, 300) } : {}),
           ...(result && result.answer ? { lastStep: String(result.answer).replace(/\s+/g, " ").trim().slice(0, 280) } : {}),
         });
-        // Record autonomous spend and drive the @mention chain forward — the
-        // backbone launches whichever teammates this answer named, so the chain
-        // completes with no client present. Both are no-ops for an ordinary,
-        // non-orchestrated run.
-        await settleAutonomousSpend(activeBridge, delivery, result);
+        // Record what this run cost against its project's budget, then drive the
+        // hand-off chain forward — the backbone launches whichever teammates this
+        // answer named, so the chain completes with no client present. Settling
+        // runs for EVERY billable run in a project, not just backbone-launched
+        // ones: a cap that only counted unattended work would let a person's own
+        // prompts spend past their own project budget.
+        await settleProjectSpend(activeBridge, delivery, result);
         await planAndLaunchFollowups(activeBridge, delivery, result);
         // Archive this task off the agent's board and let it choose what to do
         // next — the cycle that keeps the queue draining with no client present.

@@ -387,7 +387,7 @@ async function assignTask(bridge, task, args) {
       planTaskId: created.planTaskId,
       started: false,
       note:
-        "The task is in the plan, but the project's autonomous budget or wallet refused the run. " +
+        "The task is in the plan, but the project's budget or the wallet refused the run. " +
         "It stays open for a person to pick up. Do not repeat the assignment.",
     };
   }

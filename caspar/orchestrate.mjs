@@ -8,18 +8,18 @@
  * server-orchestrated run persists its answer, the backbone resolves the
  * teammates the answer @mentioned, mints a DELEGATED billing quote for each
  * (drawing on the payer's already-open pool, bounded by the project's
- * autonomous budget), and signals each teammate's proxy to run — re-entering
+ * project's budget), and signals each teammate's proxy to run — re-entering
  * this same backbone as an ordinary delivery. The chain therefore runs to
  * completion (and every turn is persisted on-chain) whether or not a client is
  * ever connected; a connected owner still sees it live because every run streams
  * to `streamTo`.
  *
  * Billing note: only runs the backbone launches this way carry a delegated
- * quote (`autonomousQuote`) and count against the project's autonomous budget.
- * A user-initiated seed run keeps its own client-minted quote and is unaffected.
+ * quote (`autonomousQuote`). Both kinds of run count against the project's own
+ * budget — the one cap, checked when any quote is minted.
  *
- * Loop safety is the HOP BUDGET (`orchestration.maxHops`), plus the autonomous
- * budget that bounds what an unattended chain may spend. A teammate is never
+ * Loop safety is the HOP BUDGET (`orchestration.maxHops`), plus the project's
+ * budget, which bounds what the whole project may spend. A teammate is never
  * refused work just because it already spoke earlier in the chain: teamwork is a
  * lead and a specialist trading turns, and vetoing that stopped real work
  * mid-task. `visited` is carried per branch for the trail (and for an optional
@@ -85,7 +85,7 @@ function maxChainRuns() {
  * `rootRunId` → `{ spent, at }`. In memory on purpose: one backbone container
  * serves every agent on the platform, so this is the same place the task board
  * keeps its `busy` map, and a restart losing the count is fine — the durable
- * ceiling is the project's autonomous budget, this is the one that keeps a
+ * ceiling is the project's budget, this is the one that keeps a
  * single prompt from becoming a swarm.
  */
 const chainBudgets = new Map();
@@ -337,7 +337,7 @@ async function readCommittedQuote(bridge, { quoteId, payer, requestId, resourceI
  * `FinancePoolByUser` link. A delegated run reuses it (it is opened + funded by
  * the client on the user's first run and lives for weeks); this never opens or
  * funds a pool, so a delegated run can only ever draw funds the user has already
- * pooled. Returns "" when the user has no open pool (then no autonomous run can
+ * pooled. Returns "" when the user has no open pool (then no delegated run can
  * proceed — correct: there is nothing to bill).
  */
 export async function resolvePoolId(bridge, payer) {
@@ -364,7 +364,7 @@ export async function resolvePoolId(bridge, payer) {
  * Mint a delegated agent quote for `payer` against `proxyProgramId`, bound to
  * `correlationId`. The billing creature only honours a delegated payer when the
  * requester IS the resource's settlement meter — which this backbone is — and
- * enforces the project's autonomous budget. Returns the quoteId or "".
+ * enforces the project's budget. Returns the quoteId or "".
  */
 async function mintDelegatedQuote(bridge, { billingEndpoint, payer, proxyProgramId, spaceId, correlationId }) {
   const quoteId = billingQuoteId(payer, correlationId);
@@ -770,6 +770,7 @@ function forwardContext(task) {
   const out = {};
   for (const k of [
     "billingEndpoint",
+    "settleEndpoint",
     "adminEndpoint",
     "routinesEndpoint",
     "schedulerProgramId",
@@ -787,7 +788,7 @@ function forwardContext(task) {
  * with the work. Shared by the two ways an agent hands work over — the @mentions
  * in its final answer (`planAndLaunchFollowups`) and the @mentions in a message
  * it sends mid-run (`handOffMentions`, the `send_message` tool) — so both cost a
- * hop, both draw on the same autonomous budget, and both land on the receiving
+ * hop, both draw on the same project budget, and both land on the receiving
  * agent's task board rather than starting a second instance of it.
  *
  * Returns `{ launched, blocked }`: `blocked` are the teammates whose delegated
@@ -1206,7 +1207,7 @@ export async function planAndLaunchFollowups(bridge, delivery, result) {
     await noteStall(
       bridge,
       task,
-      `couldn't authorize a delegated run for ${blocked.map((t) => "@" + t.handle).join(", ")} (budget reached, no open pool, or billing rejected). Check the project's autonomous budget and that the wallet has a funded pool.`,
+      `couldn't authorize a delegated run for ${blocked.map((t) => "@" + t.handle).join(", ")} (the project's budget is spent, there is no open pool, or billing refused it). Check the project's budget in Manage project and that the wallet has funds.`,
     );
   }
   return launched;
@@ -1260,24 +1261,53 @@ export async function ensureDelegatedAuthorization(bridge, delivery) {
  * (`autonomousQuote`) touch the ledger — a user-initiated seed keeps its own
  * client quote and must not count as autonomous spend. Best-effort.
  */
-export async function settleAutonomousSpend(bridge, delivery, result) {
+export function settleEndpointFromTask(task) {
+  return endpointFrom(task && (task.settleEndpoint || task.settle_endpoint));
+}
+
+/**
+ * Record what a run actually cost against its project's budget, and release the
+ * reservation the quote made.
+ *
+ * TWO bugs used to live here. It only ran for backbone-launched runs, so a
+ * person's own prompts never reached the project ledger at all; and it signalled
+ * the BILLING QUOTE program with `action: "settleAutonomous"` — but every billing
+ * action is its own WASM module and a module runs its own action body regardless
+ * of what the payload asks for, so the settle was quietly executing the quote
+ * body and failing its validation. Nothing was ever settled. Holds only expired,
+ * `spentMinor` stayed 0 for every project on the platform, and the "spent" figure
+ * the app showed came entirely from summing the run log.
+ *
+ * So this now signals the settle program specifically (`settleEndpoint`), and it
+ * runs for every billable run in a project. That is what makes the project's cap
+ * enforceable against cumulative spend rather than only against whatever is in
+ * flight at one instant.
+ */
+export async function settleProjectSpend(bridge, delivery, result) {
   const task = (delivery && delivery.task) || {};
-  if (!bridge || !task.autonomousQuote) return;
+  if (!bridge) return;
   const auth = task.billingAuthorization;
   const quoteId = auth && typeof auth === "object" ? String(auth.quoteId || "") : "";
   const spaceId = spaceIdOf(task);
-  const billingEndpoint = billingEndpointFromTask(task);
-  if (!quoteId || !spaceId || !billingEndpoint) return;
+  // The settle program, not the quote program. Falling back to the billing
+  // endpoint would resurrect the exact bug described above, so a run that was
+  // never given a settle address simply does not settle.
+  const settleEndpoint = settleEndpointFromTask(task);
+  if (!quoteId || !spaceId || !settleEndpoint) {
+    if (quoteId && spaceId) log("GROK_SETTLE", { skipped: "no-settle-endpoint", spaceId });
+    return;
+  }
   const charged = Math.max(0, Number((result && result.chargedMinor) || 0) || 0);
   // Fire-and-forget: recording spend must not block the chain, and a miss only
   // leaves the reservation to be swept at its expiry. The ledger write is the
   // effect; there is nothing to read back.
   await sendCreatureSignal(
     bridge,
-    billingEndpoint,
-    { action: "settleAutonomous", payload: { spaceId, quoteId, chargedMinor: charged } },
+    settleEndpoint,
+    { action: "settleProjectSpend", payload: { spaceId, quoteId, chargedMinor: charged } },
     { spaceId },
   );
+  log("GROK_SETTLE", { spaceId, chargedMinor: charged });
 }
 
 function adminEndpointFromTask(task) {
