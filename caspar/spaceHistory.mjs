@@ -50,6 +50,16 @@ export const KIND = {
    * restart by replaying them. Never a chat bubble.
    */
   TASK: "task",
+  /**
+   * One event in the project's shared PLAN: the goal and its acceptance
+   * criteria, a task in the work graph (who owns it, what it must produce,
+   * what makes it done), a claim, a completion, or an artifact the team
+   * produced. Like the board this is a projection of signals, not a second
+   * store — but unlike the board it is the whole team's, and it is the reason
+   * a hand-off can carry a contract instead of a paragraph of prose.
+   * Never a chat bubble.
+   */
+  PLAN: "plan",
 };
 
 /** The tags this backbone builds and filters on. */
@@ -61,10 +71,27 @@ export const SIGNAL_TAGS = {
   mention: (programId) => `mention=${programId}`,
   /** The task board row an event belongs to (see `KIND.TASK`). */
   task: (taskId) => `task=${taskId}`,
+  /** The plan task a `kind=plan` event belongs to (see `KIND.PLAN`). */
+  plan: (planTaskId) => `plan=${planTaskId}`,
 };
 
 /** The kinds that are conversation — what an agent should read as the chat. */
 const CONVERSATION_KINDS = [KIND.MESSAGE, KIND.ANSWER];
+
+/**
+ * The kinds that say what the team actually DID, as opposed to what it said.
+ *
+ * A tool call is not conversation, so it never belonged in the chat block — but
+ * it is exactly what an agent needs in order to know that a teammate already
+ * wrote the file it is about to write. `fetchTeamActivitySince` reads these
+ * alongside the conversation to build the "since your last turn" delta.
+ */
+const ACTIVITY_KINDS = [KIND.MESSAGE, KIND.ANSWER, KIND.TOOLCALL];
+
+/** How many rows the "since your last turn" delta may scan. */
+const DELTA_READ_COUNT = creatureNumber("HISTORY_DELTA_READ", 60);
+/** How many delta lines a prompt may carry. */
+const DELTA_LINE_LIMIT = creatureNumber("HISTORY_DELTA_LINES", 24);
 
 /**
  * Tags may only contain the characters the node accepts (see the node's
@@ -291,4 +318,83 @@ export function buildHistoryTurns(packets, self, { excludeText } = {}) {
       directedToMe,
     };
   });
+}
+
+/**
+ * What the rest of the team did since this agent last spoke.
+ *
+ * This is the fix for the single worst failure mode of a multi-agent room: an
+ * agent whose engine session is resumed gets its own past transcript back and
+ * NOTHING about the turns its teammates took in between, so it plans as if the
+ * project were where it left it — and writes the file a teammate already wrote.
+ *
+ * The delta is bounded by the agent's own last answer: rows newer than that are
+ * news to it, rows older are already in the session it is resuming. Tool calls
+ * are included (they are what actually changed the project), conversation is
+ * included, and everything is one short line so the block costs a few hundred
+ * tokens rather than a transcript.
+ *
+ * Returns `{ lines, cutoff, truncated }` — `lines` already newest-last, ready to
+ * render. Never throws: no delta is a worse prompt, not a failed run.
+ */
+export async function fetchTeamActivitySince(bridge, { spaceId, threadId, self, limit = DELTA_LINE_LIMIT }) {
+  const empty = { lines: [], cutoff: 0, truncated: false };
+  if (!bridge || !spaceId) return empty;
+  let packets;
+  try {
+    packets = await readSpaceSignals(bridge, {
+      spaceId,
+      threadId,
+      kinds: ACTIVITY_KINDS,
+      count: DELTA_READ_COUNT,
+    });
+  } catch {
+    return empty;
+  }
+  if (!packets.length) return empty;
+
+  const me = self && typeof self === "object" ? self : {};
+  const myProgram = String(me.programId || "").trim();
+  const myKeys = new Set(
+    [me.id, me.name, me.handle].filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim().toLowerCase()),
+  );
+  const mine = (record) => {
+    if (!record || typeof record !== "object") return false;
+    if (myProgram && String(record.agentProgramId || "") === myProgram) return true;
+    const name = typeof record.agentName === "string" ? record.agentName.trim().toLowerCase() : "";
+    return Boolean(name && myKeys.has(name));
+  };
+
+  // `packets` is newest-first. The cutoff is this agent's most recent answer:
+  // everything after it (i.e. earlier in this array) is what it has not seen.
+  let cutoff = 0;
+  for (const row of packets) {
+    if (mine(row.data)) {
+      cutoff = row.time || 0;
+      break;
+    }
+  }
+
+  const fresh = packets.filter((row) => (cutoff ? (row.time || 0) > cutoff : true) && !mine(row.data));
+  const ordered = fresh.slice().reverse();
+  const truncated = ordered.length > limit;
+  const kept = truncated ? ordered.slice(-limit) : ordered;
+
+  const lines = [];
+  for (const row of kept) {
+    const record = row.data;
+    const kind = row.tags.includes(SIGNAL_TAGS.kind(KIND.TOOLCALL)) ? KIND.TOOLCALL : "";
+    if (kind === KIND.TOOLCALL) {
+      const who = firstString(record.agentName, "an agent");
+      const tool = firstString(record.tool, record.name, record.toolName, "a tool");
+      const detail = firstString(record.summary, record.command, record.path, record.arguments && record.arguments.command);
+      lines.push(`${who} used ${tool}${detail ? `: ${String(detail).replace(/\s+/g, " ").slice(0, 160)}` : ""}`);
+      continue;
+    }
+    const text = recordText(record);
+    if (!text) continue;
+    const who = firstString(record.agentName, record.fromName, record.username, "someone");
+    lines.push(`${who}: ${text.replace(/\s+/g, " ").slice(0, 240)}`);
+  }
+  return { lines, cutoff, truncated };
 }

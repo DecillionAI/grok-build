@@ -27,6 +27,7 @@ process.env.DELEGATED_QUOTE_INTERVAL_MS = "3";
 
 import {
   billingEndpointFromTask,
+  resetChainBudgets,
   ensureDelegatedAuthorization,
   isSequentialHandoff,
   isServerOrchestrated,
@@ -35,6 +36,7 @@ import {
   resolvePoolId,
   settleAutonomousSpend,
 } from "../orchestrate.mjs";
+import { resetProgress } from "../acceptance.mjs";
 
 /** The deterministic quote id the billing creature (and the backbone) compute. */
 function fakeQuoteId(payer, requestId) {
@@ -55,6 +57,12 @@ const failures = [];
 
 async function check(name, fn) {
   try {
+    // The chain run budget is per-root and lives in the module, so without this
+    // every check after the twelfth launch would inherit an exhausted budget.
+    resetChainBudgets();
+    // The stagnation tracker is per-root module state too: without this, one
+    // check's idle hops would halt the next check's chain.
+    resetProgress();
     await fn();
     passed += 1;
     console.log(`${GREEN}✓${NC} ${name}`);
@@ -88,7 +96,8 @@ const PROGRAM_INDEX = {
 function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user-1" } }, quoteOk = true } = {}) {
   const launched = [];
   const settled = [];
-  const notes = []; // stall notes — posted as store signals on the space
+  const notes = []; // stall notes — `kind=step` signals on the space
+  const planEvents = []; // `kind=plan` rows — the shared plan the hand-off writes
   const quoteDocs = new Map(); // quoteId -> committed quote doc
   const parseInner = (packet) => {
     try {
@@ -102,9 +111,14 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
     machineId: "meter-machine",
     async call(op, input) {
       if (op === "signal") {
-        notes.push({ storeId: input?.storeId, tags: input?.tags || [], data: JSON.parse(input?.data || "{}") });
-        return { ok: true };
+        const row = { storeId: input?.storeId, tags: input?.tags || [], data: JSON.parse(input?.data || "{}") };
+        // The plan is state about the work, the stall note is a step in the run's
+        // trail. They ride the same host call and must not be counted together.
+        if (row.tags.includes("kind=plan")) planEvents.push(row);
+        else notes.push(row);
+        return { ok: true, persisted: true };
       }
+      if (op === "readSignals") return { ok: true, signals: [] };
       if (op === "getLink") {
         const m = String(input?.key || "").match(/^FinancePoolByUser::(.+)$/);
         return m ? String(pools[m[1]]?.poolId || "") : "";
@@ -152,7 +166,7 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
       return { ok: true };
     },
   };
-  return { bridge, launched, settled, notes };
+  return { bridge, launched, settled, notes, planEvents };
 }
 
 function seedDelivery(overrides = {}) {
@@ -253,16 +267,93 @@ await check("the hop cap halts the chain, and says so in the trail", async () =>
   assert.match(notes[0].data.text, /8-hop limit/);
 });
 
-await check("a teammate already handed work twice is STILL reachable (hops are the loop guard)", async () => {
-  // The per-agent ledger used to veto a third hand-off, which killed the normal
-  // shape of teamwork (a lead and a specialist trading work) mid-task. The hop
-  // budget bounds the chain instead; the ledger no longer binds before it does.
+await check("a teammate gets a second turn, but not a third — the pair stops trading", async () => {
+  // Two turns is the shape of real teamwork: a lead hands work to a specialist,
+  // the specialist hands the artifact back. The THIRD hand-off to the same agent
+  // on one branch is where a pair reliably starts restating each other, so the
+  // visit cap binds there — and says so in the trail, rather than the chain
+  // quietly going round again on the user's money.
+  const second = makeBridge();
+  const stillFree = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
+  assert.equal(await planAndLaunchFollowups(second.bridge, stillFree, { success: true, answer: "@writer one more pass please" }), 1);
+  assert.equal(second.launched[0].target, "mate-prog");
+
+  const third = makeBridge();
+  const capped = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
+  assert.equal(await planAndLaunchFollowups(third.bridge, capped, { success: true, answer: "@writer once more" }), 0);
+  assert.equal(third.launched.length, 0);
+  assert.match(third.notes[0].data.text, /@writer already took 2 turns in this chain/);
+});
+
+await check("one user message cannot grow into an unbounded tree of runs", async () => {
+  // Depth bounds ONE branch; `visited` is per branch, so an answer naming three
+  // teammates makes three branches, each free to fan out again. Without a global
+  // ceiling a single prompt became a swarm bounded only by the wallet. Every
+  // launch in the chain draws on one budget, keyed by the root run.
+  process.env.GROK_ORCH_MAX_CHAIN_RUNS = "2";
+  try {
+    resetChainBudgets();
+    const { bridge, launched, notes } = makeBridge();
+    const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
+      success: true,
+      answer: "@builder ship the site. @growth draft the posts. @researcher cite sources.",
+    });
+    assert.equal(n, 2, "the third teammate is over the chain's run budget");
+    assert.equal(launched.length, 2);
+    assert.match(notes.at(-1).data.text, /already run 2 agent turns/);
+    // The budget is per ROOT, and every branch carries the same root forward.
+    assert.equal(launched[0].task.orchestration.rootRunId, "seed-corr");
+  } finally {
+    delete process.env.GROK_ORCH_MAX_CHAIN_RUNS;
+    resetChainBudgets();
+  }
+});
+
+await check("an acknowledgement is not a hand-off", async () => {
+  // "Thanks @lead, draft attached" used to hand @lead a fresh billable task, who
+  // would acknowledge it back — two agents being polite at each other until the
+  // wallet stopped them. A courtesy mention launches nobody, and it is not
+  // reported as a stalled chain either: it is a finished one.
   const { bridge, launched, notes } = makeBridge();
-  const delivery = seedDelivery({ orchestration: { depth: 1, maxHops: 8, visited: ["self-prog", "mate-prog", "mate-prog"], poolId: "pool-1", payerUserId: "user-1" } });
-  const n = await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer once more" });
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "Landing page is live at the preview URL. Thanks @writer for the copy.",
+  });
+  assert.equal(n, 0);
+  assert.equal(launched.length, 0);
+  assert.equal(notes.length, 0, "a polite ending is not a stall");
+});
+
+await check("code, links and package names never trigger an agent", async () => {
+  // Every `@token` used to be a trigger, so an answer containing a CSS block or a
+  // dependency list fanned the chain out to whatever fuzzily matched.
+  const { bridge, launched } = makeBridge();
+  const n = await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "Installed @types/node and wrote:\n```css\n@media (min-width:0){}\n```\nMail bot@example.com. @builder please deploy it.",
+  });
   assert.equal(n, 1);
-  assert.equal(launched[0].target, "mate-prog");
-  assert.equal(notes.length, 0);
+  assert.equal(launched[0].target, "builder-prog");
+});
+
+await check("a hand-off carries a plan-backed contract, not just the sender's prose", async () => {
+  // The receiving agent used to be handed the whole reply as its entire task
+  // specification — including the paragraphs meant for somebody else. Now the
+  // ask aimed at it becomes a task in the shared plan that it owns, and the
+  // sender's full reply travels separately as context.
+  const { bridge, launched, planEvents } = makeBridge();
+  await planAndLaunchFollowups(bridge, seedDelivery(), {
+    success: true,
+    answer: "Research is done. @builder ship the landing page. Use copy.md. @growth draft the posts.",
+  });
+  const builder = launched.find((row) => row.target === "builder-prog").task;
+  assert.ok(builder.assignment?.planTaskId, "the teammate is given a plan task it owns");
+  assert.match(builder.objective, /ship the landing page/);
+  assert.ok(!/draft the posts/.test(builder.objective), "the other teammate's ask is not this one's job");
+  assert.match(builder.handOffContextText, /draft the posts/, "the full reply still travels as context");
+  const rows = planEvents.filter((row) => row.data.event === "task");
+  assert.equal(rows.length, 2, "one plan task per teammate");
+  assert.equal(rows[0].data.owner, "builder-prog");
 });
 
 await check("GROK_ORCH_VISIT_CAP still enforces a tighter cap, and the note says so", async () => {

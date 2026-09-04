@@ -118,6 +118,14 @@ export function groupChatPreamble(task) {
     "is already busy, your request is added to their queue and they start it when " +
     "they finish what they are on — so a hand-off never fails for being badly " +
     "timed, and you must never re-send it or wait for it inside this turn.\n" +
+    "  • Naming somebody to thank or credit them (\"thanks @lead\", \"as @researcher " +
+    "found\") does NOT hand them work, and should not: an acknowledgement that " +
+    "restarted a teammate is how two agents end up trading turns forever. When you " +
+    "genuinely need something, ask for it plainly — better still, use " +
+    "`assign_task`, which gives them the brief instead of making them infer it.\n" +
+    "  • A hand-off is for work somebody else must do. If you can finish it " +
+    "yourself, finish it. If it is already done — check the project plan — say so " +
+    "and stop. Passing a task on is not progress by itself.\n" +
     "=== END GROUP CHAT ===\n"
   );
 }
@@ -344,12 +352,18 @@ export function projectOutcomePreamble(task) {
   return (
     "=== PROJECT OUTCOME ===\n" +
     "This space has a living brief — the outcome the team is hired to accomplish, " +
-    "not a one-off chatbot prompt. Keep working toward it on every turn unless the " +
-    "latest message clearly changes course. Do not stop at a plan, review memo, or " +
-    "essay if tools can produce a real artifact (files on the shared machine, a " +
-    "running public preview URL, sourced research, an operated system). Recurring " +
-    "work named in the brief (daily posts, a weekly digest, a reminder) is part of " +
-    "the outcome — schedule it with `schedule_routine`; a file on disk is not a schedule.\n\n" +
+    "not a one-off chatbot prompt. Work toward it, and when tools can produce a real " +
+    "artifact (files on the shared machine, a running public preview URL, sourced " +
+    "research, an operated system) produce one rather than stopping at a plan or an " +
+    "essay. Recurring work named in the brief (daily posts, a weekly digest, a " +
+    "reminder) is part of the outcome — schedule it with `schedule_routine`; a file " +
+    "on disk is not a schedule.\n" +
+    "FINISHING IS PART OF THE JOB. The project plan says what makes this outcome " +
+    "done; when those criteria are met, say so and stop. Do not invent additional " +
+    "work to stay busy, do not re-open something a teammate has closed, and do not " +
+    "improve an artifact nobody asked you to improve. A team that keeps going after " +
+    "the outcome is met is not being thorough — it is failing to deliver, and it is " +
+    "spending the customer's money to do it.\n\n" +
     brief +
     "\n=== END PROJECT OUTCOME ===\n"
   );
@@ -389,6 +403,68 @@ export function projectRoutinesPreamble(task) {
     "scheduled in this conversation.\n" +
     "=== END ROUTINES ===\n"
   );
+}
+
+/**
+ * The shared plan, and how to work with it.
+ *
+ * `renderPlanForPrompt` supplies the content (the outcome, the acceptance
+ * criteria, what already exists, what is open); this section says what to DO
+ * about it. Both halves matter: an agent shown a list of existing artifacts
+ * still rebuilt them until it was told plainly not to.
+ */
+export function planPreamble(planBlock, { hasPlanTools = true } = {}) {
+  const block = typeof planBlock === "string" ? planBlock.trim() : "";
+  if (!block && !hasPlanTools) return "";
+  const rules = hasPlanTools
+    ? "=== WORKING FROM THE PLAN ===\n" +
+      "This project has ONE shared plan that every agent reads and writes. It is how " +
+      "a team of agents avoids doing the same job three times.\n" +
+      "  • Call `read_plan` before you start. If what you were about to make already " +
+      "exists there, open it and build on it — never recreate a teammate's artifact, " +
+      "and never start a task somebody already closed.\n" +
+      "  • If the plan has no outcome or no acceptance criteria yet and you are " +
+      "shaping the work, write them with `set_plan_goal`. Acceptance criteria are " +
+      "checkable statements ('the page is live at a public URL'), not ambitions. " +
+      "Without them nothing can ever tell this team it has finished.\n" +
+      "  • `claim_task` before you work on something, so two agents never take the " +
+      "same one. `complete_task` when you are done, ALWAYS listing the artifacts you " +
+      "produced — that list is what every other agent is shown, and registering it is " +
+      "what stops somebody rebuilding your work.\n" +
+      "  • To bring a teammate in, prefer `assign_task` over mentioning them in prose: " +
+      "it gives them the objective, the inputs that already exist, and what makes it " +
+      "done, instead of leaving them to guess from your reply.\n" +
+      "  • If a task cannot proceed, `block_task` with the reason. Do not quietly do " +
+      "something adjacent instead — substituting different work is how a project drifts.\n" +
+      "=== END WORKING FROM THE PLAN ===\n"
+    : "";
+  return [block, rules].filter(Boolean).join("\n");
+}
+
+/**
+ * The assignment this run is answering, when a teammate handed it over.
+ *
+ * A hand-off used to arrive as the sender's entire chat reply, and the receiving
+ * agent had to work out which part was its job. The cheapest guess a model makes
+ * there is "all of it" — which is how three teammates ended up doing the same
+ * work three times. This states the job outright.
+ */
+export function assignmentPreamble(task) {
+  const a = task && typeof task.assignment === "object" && task.assignment ? task.assignment : null;
+  if (!a) return "";
+  const from = String(a.fromName || a.fromHandle || "a teammate").trim();
+  const lines = [
+    "=== YOUR ASSIGNMENT ===",
+    `${from} handed you this piece of work. It is task ${a.planTaskId} in the project plan and you own it.`,
+  ];
+  if (a.objective) lines.push(`WHAT THEY NEED: ${a.objective}`);
+  lines.push(
+    "Do THIS, not the whole project: the rest of their message is context, and the other parts of it " +
+      "belong to other people. When you finish, call `complete_task` with this task id and the " +
+      "artifacts you produced. If it turns out to be already done, say so and close it — do not redo it.",
+    "=== END YOUR ASSIGNMENT ===",
+  );
+  return `${lines.join("\n")}\n`;
 }
 
 /**
@@ -443,6 +519,16 @@ export function buildSystemPrompt(task, opts = {}) {
 
   const outcome = projectOutcomePreamble(task);
   if (outcome) parts.push(outcome);
+
+  // What the team has already produced and what is still open, before anything
+  // that tells this agent to go and produce. An agent that reads "keep working
+  // toward the outcome" before it reads "the landing page already exists" builds
+  // a second landing page.
+  const plan = planPreamble(opts.planBlock, { hasPlanTools: opts.planTools !== false });
+  if (plan) parts.push(plan);
+
+  const assignment = assignmentPreamble(task);
+  if (assignment) parts.push(assignment);
 
   const routines = projectRoutinesPreamble(task);
   if (routines) parts.push(routines);
@@ -548,11 +634,49 @@ export function compactConversationBlock(turns) {
  * recent room chat when this agent does not already have a resumed native
  * session. Full Grok resume still owns same-agent context.
  */
-export function buildUserPrompt(task, { objective, attachments = [], extractedTexts = [], workspace, includeHistory = true } = {}) {
+/**
+ * What the rest of the team did since this agent last spoke.
+ *
+ * This block exists because of the single worst failure mode of the room: an
+ * agent whose engine session is RESUMED was given its own past transcript and
+ * nothing at all about the turns its teammates took in between, so it planned as
+ * if the project were where it left it — and rebuilt what somebody else had
+ * already built. The compact chat block was skipped precisely when it mattered
+ * most. This one is not: it is always included, and it is short because it is a
+ * delta rather than a transcript.
+ */
+export function teamDeltaBlock(lines, { truncated = false } = {}) {
+  const rows = Array.isArray(lines) ? lines.filter((l) => typeof l === "string" && l.trim()) : [];
+  if (!rows.length) return "";
+  return (
+    "=== WHAT THE TEAM DID SINCE YOUR LAST TURN ===\n" +
+    (truncated ? "(most recent shown)\n" : "") +
+    rows.map((l) => `  • ${l}`).join("\n") +
+    "\nTreat this as already done. Read what it produced before you write anything.\n" +
+    "=== END SINCE YOUR LAST TURN ===\n"
+  );
+}
+
+export function buildUserPrompt(
+  task,
+  { objective, attachments = [], extractedTexts = [], workspace, includeHistory = true, teamDelta } = {},
+) {
   const parts = [];
   if (includeHistory) {
     const compact = compactConversationBlock(task && task.history);
     if (compact) parts.push(compact);
+  }
+  // Always, even on a resumed session — especially on a resumed session.
+  const delta = teamDeltaBlock(teamDelta && teamDelta.lines, { truncated: teamDelta && teamDelta.truncated });
+  if (delta) parts.push(delta);
+  // The reply the ask came out of, when a teammate handed this work over.
+  const handOff = typeof task?.handOffContextText === "string" ? task.handOffContextText.trim() : "";
+  if (handOff) {
+    parts.push(
+      "=== THE MESSAGE YOUR ASSIGNMENT CAME FROM (context — not all of it is your job) ===\n" +
+        handOff +
+        "\n=== END CONTEXT ===\n",
+    );
   }
   if (attachments.length) {
     parts.push(

@@ -44,7 +44,15 @@ import { TrajectoryMapper } from "../events.mjs";
 import { ProviderMediaGenerator } from "../mediaGeneration.mjs";
 import { OutboundMediaCollector } from "../outboundMedia.mjs";
 import { readUniversalInstruction, resetUniversalInstructionCache } from "../platformInstruction.mjs";
-import { buildSystemPrompt, buildUserPrompt, compactConversationBlock } from "../prompt.mjs";
+import {
+  assignmentPreamble,
+  buildSystemPrompt,
+  buildUserPrompt,
+  compactConversationBlock,
+  planPreamble,
+  teamDeltaBlock,
+} from "../prompt.mjs";
+import { fetchTeamActivitySince } from "../spaceHistory.mjs";
 import { buildResult, normalizeUsage } from "../result.mjs";
 import { buildHistoryTurns, fetchSpaceConversation, postSpaceSignal, readSpaceSignals, KIND } from "../spaceHistory.mjs";
 import { decodeTaskSignal, sessionSlug, taskObjective, threadSessionId } from "../taskSignal.mjs";
@@ -340,6 +348,84 @@ await check("a new agent session gets a compact room transcript, not the full hi
   assert.equal(resumed, "what's the status?");
   const compact = compactConversationBlock(history);
   assert.ok(compact.length < 800);
+});
+
+await check("a RESUMED agent is still told what the team did while it was away", async () => {
+  // The failure this check exists for: an agent's engine session is resumed from
+  // its second turn onward, and the room transcript was skipped exactly then —
+  // so it planned as if the project were where it left it and rebuilt what a
+  // teammate had already built. The delta is included either way.
+  const { task } = decodeTaskSignal(...Object.values(proxyDelivery({})));
+  const delta = {
+    lines: ["Builder: landing page is live", "Builder used sandbox: npm run build"],
+    truncated: false,
+  };
+  const resumed = buildUserPrompt(task, {
+    objective: "what's the status?",
+    attachments: [],
+    workspace: "/w",
+    includeHistory: false,
+    teamDelta: delta,
+  });
+  assert.match(resumed, /WHAT THE TEAM DID SINCE YOUR LAST TURN/);
+  assert.match(resumed, /landing page is live/);
+  assert.match(resumed, /Read what it produced before you write anything/);
+  // Nothing to report is still nothing shown.
+  assert.equal(teamDeltaBlock([]), "");
+});
+
+await check("the delta is bounded by this agent's own last turn, and includes tool calls", async () => {
+  const rows = [
+    { id: "5", time: 50, tags: ["kind=toolcall"], data: { agentName: "Builder", tool: "sandbox", command: "npm run build" } },
+    { id: "4", time: 40, tags: ["kind=answer"], data: { agentName: "Builder", text: "page is live", agentProgramId: "b" } },
+    { id: "3", time: 30, tags: ["kind=answer"], data: { agentName: "Tina", text: "here is the copy", agentProgramId: "tina-prog" } },
+    { id: "2", time: 20, tags: ["kind=message"], data: { fromName: "Shayan", text: "make a landing page" } },
+  ];
+  const bridge = {
+    async call(op) {
+      if (op === "readSignals") return { ok: true, signals: rows.map((r) => ({ ...r, data: JSON.stringify(r.data) })) };
+      return { ok: true };
+    },
+  };
+  const delta = await fetchTeamActivitySince(bridge, {
+    spaceId: "space-1",
+    threadId: "main",
+    self: { programId: "tina-prog", name: "Tina" },
+  });
+  assert.equal(delta.cutoff, 30, "the cutoff is this agent's own most recent answer");
+  assert.deepEqual(delta.lines, ["Builder: page is live", "Builder used sandbox: npm run build"]);
+  assert.ok(!delta.lines.some((l) => l.includes("here is the copy")), "an agent is not told its own turn back");
+});
+
+await check("the plan section says what exists and what to do about it", () => {
+  const block = planPreamble("=== PROJECT PLAN ===\nOUTCOME: ship it\n=== END PROJECT PLAN ===\n");
+  assert.match(block, /OUTCOME: ship it/);
+  assert.match(block, /Call `read_plan` before you start/);
+  assert.match(block, /never recreate a teammate's artifact/);
+  assert.match(block, /prefer `assign_task`/);
+  // A run with no project gets neither the content nor the rules.
+  assert.equal(planPreamble("", { hasPlanTools: false }), "");
+});
+
+await check("an assigned agent is told which part of the message is its job", () => {
+  assert.equal(assignmentPreamble({}), "");
+  const text = assignmentPreamble({
+    assignment: { planTaskId: "p1", objective: "Build the page from copy.md", fromName: "Lead" },
+  });
+  assert.match(text, /Lead handed you this piece of work/);
+  assert.match(text, /task p1 in the project plan/);
+  assert.match(text, /Build the page from copy\.md/);
+  assert.match(text, /Do THIS, not the whole project/);
+  assert.match(text, /complete_task/);
+});
+
+await check("the outcome preamble tells an agent that finishing is part of the job", () => {
+  const { task } = decodeTaskSignal(
+    ...Object.values(proxyDelivery({ extra: { projectBrief: "Ship a landing page" } })),
+  );
+  const system = buildSystemPrompt(task, {});
+  assert.match(system, /FINISHING IS PART OF THE JOB/);
+  assert.match(system, /Do not invent additional work to stay busy/);
 });
 
 await check("a shared orbit session id is pinned to the acting agent", () => {

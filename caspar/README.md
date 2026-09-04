@@ -511,9 +511,10 @@ receiving an incompatible media request.
 ## Testing
 
 ```bash
-node caspar/tests/checks.mjs             # 61 checks, no node/container/LLM needed
+node caspar/tests/checks.mjs             # 66 checks, no node/container/LLM needed
 node caspar/tests/discovery-checks.mjs   # in-space discovery, merge and prompt
-node caspar/tests/orchestrate-checks.mjs # server-side @mention fan-out + delegated billing
+node caspar/tests/orchestrate-checks.mjs # server-side hand-off chain + delegated billing
+node caspar/tests/plan-checks.mjs        # the shared project plan, acceptance and stagnation
 node caspar/tests/agent-queue-checks.mjs # the per-agent task board and `send_message`
 node caspar/tests/finance-checks.mjs     # quotes, holds, settlement
 node caspar/tests/live-cli.mjs           # against a REAL grok CLI (needs credentials)
