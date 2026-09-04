@@ -34,7 +34,7 @@ import {
   parseAnswerMentionsOrdered,
   planAndLaunchFollowups,
   resolvePoolId,
-  settleAutonomousSpend,
+  settleProjectSpend,
 } from "../orchestrate.mjs";
 import { resetProgress } from "../acceptance.mjs";
 
@@ -73,6 +73,10 @@ async function check(name, fn) {
 }
 
 const BILLING_PROG = "billing-prog";
+/** The SETTLE program. A different module from the quote program, on purpose:
+ * every billing action is its own WASM module, so a settle sent to the quote
+ * program runs the quote body and settles nothing. */
+const SETTLE_PROG = "settle-prog";
 const PROGRAM_INDEX = {
   "self-prog": { programId: "self-prog", creatureId: "self-cr", entityId: "agent", metadata: { kind: "agent", name: "Orbit Lead", handle: "lead" } },
   "mate-prog": { programId: "mate-prog", creatureId: "mate-cr", entityId: "agent", metadata: { kind: "agent", name: "Writer", handle: "writer" } },
@@ -145,6 +149,11 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
       return () => {};
     },
     async signalUser(key, target, packet) {
+      if (target === SETTLE_PROG) {
+        const inner = parseInner(packet);
+        if (inner.action === "settleProjectSpend") settled.push({ payload: inner.payload || {} });
+        return { ok: true };
+      }
       if (target === BILLING_PROG) {
         const inner = parseInner(packet);
         const p = inner.payload || {};
@@ -157,8 +166,6 @@ function makeBridge({ pools = { "user-1": { poolId: "pool-1", payerUserId: "user
             resourceId: p.resourceId,
             projectId: p.projectId,
           });
-        } else if (inner.action === "settleAutonomous") {
-          settled.push({ payload: p });
         }
         return { ok: true };
       }
@@ -533,22 +540,54 @@ await check("a non-orchestrated delivery never fans out", async () => {
   assert.equal(launched.length, 0);
 });
 
-await check("settleAutonomousSpend records only backbone-minted runs", async () => {
+await check("every billable run settles against its project's budget", async () => {
+  // This used to run only for backbone-minted runs, so a person's own prompts
+  // never reached the project ledger — a project cap that counted only unattended
+  // work would let an owner spend straight past their own budget.
   const { bridge, settled } = makeBridge();
-  // A backbone-minted (delegated) run settles against the budget.
-  await settleAutonomousSpend(
+  const settleEndpoint = { programId: SETTLE_PROG, entityId: "main" };
+  await settleProjectSpend(
     bridge,
-    { task: { autonomousQuote: true, spaceId: "space-1", billingEndpoint: { programId: BILLING_PROG, entityId: "main" }, billingAuthorization: { quoteId: "q-1" } } },
+    { task: { autonomousQuote: true, spaceId: "space-1", settleEndpoint, billingAuthorization: { quoteId: "q-1" } } },
     { chargedMinor: 4321 },
   );
-  assert.equal(settled.length, 1);
-  // A user-initiated seed (no autonomousQuote) does not.
-  await settleAutonomousSpend(
+  await settleProjectSpend(
     bridge,
-    { task: { spaceId: "space-1", billingEndpoint: { programId: BILLING_PROG, entityId: "main" }, billingAuthorization: { quoteId: "q-9" } } },
+    { task: { spaceId: "space-1", settleEndpoint, billingAuthorization: { quoteId: "q-9" } } },
     { chargedMinor: 999 },
   );
-  assert.equal(settled.length, 1);
+  assert.equal(settled.length, 2, "the user's own run settles too");
+  assert.deepEqual(settled.map((row) => row.payload.chargedMinor), [4321, 999]);
+  assert.equal(settled[0].payload.spaceId, "space-1");
+});
+
+await check("a settle is never sent to the quote program", async () => {
+  // Every billing action is its own WASM module, and a module runs its own action
+  // body whatever the payload's `action` says. Sending the settle to the QUOTE
+  // program therefore ran the quote body and settled nothing — silently, for
+  // every project on the platform. A run with no settle address must decline to
+  // settle rather than fall back to the billing endpoint and resurrect that.
+  const { bridge, settled } = makeBridge();
+  await settleProjectSpend(
+    bridge,
+    {
+      task: {
+        autonomousQuote: true,
+        spaceId: "space-1",
+        billingEndpoint: { programId: BILLING_PROG, entityId: "main" },
+        billingAuthorization: { quoteId: "q-1" },
+      },
+    },
+    { chargedMinor: 4321 },
+  );
+  assert.equal(settled.length, 0);
+});
+
+await check("the settle address is carried down every hand-off in the chain", async () => {
+  const { bridge, launched } = makeBridge();
+  const delivery = seedDelivery({ settleEndpoint: { programId: SETTLE_PROG, entityId: "main" } });
+  await planAndLaunchFollowups(bridge, delivery, { success: true, answer: "@writer draft the copy" });
+  assert.equal(launched[0].task.settleEndpoint.programId, SETTLE_PROG);
 });
 
 await check("ensureDelegatedAuthorization mints a quote for a routine seed with no client auth", async () => {

@@ -164,7 +164,7 @@ export async function sendAgentMessage(bridge, task, args, { log } = {}) {
   if (handOff.blocked?.length) {
     notes.push(
       `Could not start ${handOff.blocked.map((t) => `@${t.handle || t.name}`).join(", ")} — ` +
-        "the project's autonomous budget or wallet refused the run.",
+        "the project's budget or the wallet refused the run.",
     );
   }
   if (handOff.hopCapped) notes.push("This chain reached its hop limit, so no teammate was started.");

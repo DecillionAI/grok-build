@@ -42,7 +42,7 @@
  * backbone as an ordinary delivery carrying `queueTaskId` + `queueClaimed`, so
  * it runs straight away instead of being queued a second time. It bills like any
  * other unattended run: a DELEGATED quote against the payer's pool, bounded by
- * the project's autonomous budget (`ensureDelegatedAuthorization`), because by
+ * the project's budget (`ensureDelegatedAuthorization`), because by
  * then there is no client holding an authorization open for it.
  */
 
@@ -668,7 +668,7 @@ export class AgentTaskBoard {
    * delivery — marked `queueClaimed` so it runs instead of queueing again, and
    * `serverOrchestrate` with no authorization so it bills as the unattended run
    * it now is (a delegated quote on the payer's pool, inside the project's
-   * autonomous budget).
+   * budget).
    */
   async _relay(bridge, identity, record) {
     const stored = record.payload && typeof record.payload === "object" ? record.payload : {};
