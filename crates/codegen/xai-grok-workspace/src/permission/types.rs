@@ -86,6 +86,43 @@ pub struct PermissionEvent {
     /// `user_prompted=true` events in the turn, not this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_depth: Option<u32>,
+    /// Ordered, deduplicated classifier finding tokens for this request. Three
+    /// distinct states (do not conflate `None` with `Some([])`):
+    /// - `None`: legacy trace, or the request never entered the Auto classifier
+    ///   route (fast-path allow, policy/gate decision, non-Bash access).
+    /// - `Some([])`: the classifier route was selected and the exact attempted
+    ///   assessment was empty. This is *not* a proven-clean classification.
+    /// - `Some(tokens)`: the classifier route was selected with these findings.
+    /// Projected once from the exact `BashSecurityAssessment` handed to the
+    /// classifier (`BashSecurityAssessment::tokens`); telemetry/traces never
+    /// recompute findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_findings: Option<Vec<String>>,
+    /// Classifier verdict when the Auto classifier route produced one:
+    /// `"allow" | "block" | "unavailable"`. `None` when the request never
+    /// reached a classifier verdict (legacy, fast path, non-classified route, or
+    /// requester gone mid-classify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_verdict: Option<String>,
+    /// Whether the `remember_tool_approvals` gate was enabled for this
+    /// decision. `None` on legacy traces only; the manager always sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_tool_approvals: Option<bool>,
+}
+/// A permission decision plus the authoritative manager [`PermissionEvent`] that
+/// produced it. The manager builds exactly one event per decision, sends one
+/// clone to the trace `event_tx`, and returns the identical event here so the
+/// shell can source content-free analytics fields (permission mode, wait time,
+/// classifier verdict/findings) from the manager rather than re-deriving them.
+///
+/// `event` is `None` for event-less paths (`AllowAll`, or a manager channel
+/// send/receive failure). Callers must omit manager-only analytics fields in
+/// that case instead of fabricating them. The shell never re-enqueues the
+/// returned event — the manager already emitted the sole trace copy.
+#[derive(Debug, Clone)]
+pub struct PermissionResolution {
+    pub decision: Decision,
+    pub event: Option<PermissionEvent>,
 }
 /// Identifies the type of client connecting to the agent.
 /// Used to determine which permission UI features to enable
@@ -244,7 +281,7 @@ pub enum PermissionCommand {
         access: AccessKind,
         tool_call_update: acp::ToolCallUpdate,
         path_context: Option<RequestPathContext>,
-        respond_to: oneshot::Sender<Decision>,
+        respond_to: oneshot::Sender<PermissionResolution>,
         /// Session ID originating this request. Used to attribute
         /// permission events to child subagents.
         session_id: Option<String>,
@@ -284,6 +321,7 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
             | ToolInput::WaitTasks(_)
             | ToolInput::KillTask(_)
             | ToolInput::Skill(_) => AccessKind::Read(None),
+            ToolInput::Task(t) => AccessKind::Edit(format!("task:{}", t.subagent_type)),
             ToolInput::WebSearch(ws) => AccessKind::WebSearch(ws.query.clone()),
             ToolInput::SearchReplace(search_replace) => {
                 AccessKind::Edit(search_replace.file_path.to_string())
@@ -302,11 +340,48 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
                 input: u.tool_input.clone(),
             },
             ToolInput::WebFetch(wf) => AccessKind::WebFetch(wf.url.clone()),
-            ToolInput::Dynamic(_) => AccessKind::Read(None),
+            ToolInput::Dynamic(value) => access_kind_from_dynamic(value),
             #[allow(unreachable_patterns)]
             _ => AccessKind::Read(None),
         }
     }
+}
+fn dynamic_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+fn dynamic_has_field(value: &serde_json::Value, keys: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| keys.iter().any(|key| object.contains_key(*key)))
+}
+fn access_kind_from_dynamic(value: &serde_json::Value) -> AccessKind {
+    if let Some(path) = dynamic_string_field(value, &["filePath", "file_path", "path"]) {
+        let is_mutation = dynamic_has_field(
+            value,
+            &[
+                "oldString",
+                "old_string",
+                "newString",
+                "new_string",
+                "content",
+                "edits",
+                "replaceAll",
+                "replace_all",
+            ],
+        );
+        return if is_mutation {
+            AccessKind::Edit(path)
+        } else {
+            AccessKind::Read(Some(path))
+        };
+    }
+    if let Some(command) = dynamic_string_field(value, &["command"]) {
+        return AccessKind::Bash(command);
+    }
+    AccessKind::Read(None)
 }
 /// Permission policy configuration (duplicated from util/config.rs for Phase 1 move independence; identical).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -458,6 +533,35 @@ mod tests {
         assert!(event.auto_denials_total.is_none());
         assert!(event.wait_ms.is_none());
         assert!(event.queue_depth.is_none());
+        assert!(event.security_findings.is_none());
+        assert!(event.classifier_verdict.is_none());
+    }
+    #[test]
+    fn permission_event_findings_none_vs_some_empty_are_distinct() {
+        let base = r#"{
+            "tool_id": "tc1",
+            "tool_name": "bash",
+            "access_kind": "bash",
+            "yolo_mode": false,
+            "auto_approved": false,
+            "user_prompted": true,
+            "decision": "allow",
+            "timestamp": "2026-03-24T00:00:00Z",
+            "security_findings": [],
+            "classifier_verdict": "block"
+        }"#;
+        let event: PermissionEvent = serde_json::from_str(base).unwrap();
+        assert_eq!(event.security_findings.as_deref(), Some(&[][..]));
+        assert_eq!(event.classifier_verdict.as_deref(), Some("block"));
+        let with_tokens: PermissionEvent = serde_json::from_str(&base.replace(
+            "\"security_findings\": []",
+            "\"security_findings\": [\"opaque_shell\"]",
+        ))
+        .unwrap();
+        assert_eq!(
+            with_tokens.security_findings.as_deref(),
+            Some(&["opaque_shell".to_owned()][..])
+        );
     }
     #[test]
     fn permission_event_with_subagent_attribution() {
@@ -484,6 +588,9 @@ mod tests {
             auto_denials_total: Some(5),
             wait_ms: Some(1234),
             queue_depth: Some(3),
+            security_findings: Some(vec!["opaque_shell".into()]),
+            classifier_verdict: Some("block".into()),
+            remember_tool_approvals: Some(true),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["subagent_session_id"], "child-1");
@@ -497,6 +604,9 @@ mod tests {
         assert_eq!(json["auto_denials_total"], 5);
         assert_eq!(json["wait_ms"], 1234);
         assert_eq!(json["queue_depth"], 3);
+        assert_eq!(json["security_findings"][0], "opaque_shell");
+        assert_eq!(json["classifier_verdict"], "block");
+        assert_eq!(json["remember_tool_approvals"], true);
     }
     #[test]
     fn permission_event_skips_none_optional_fields() {
@@ -523,6 +633,9 @@ mod tests {
             auto_denials_total: None,
             wait_ms: None,
             queue_depth: None,
+            security_findings: None,
+            classifier_verdict: None,
+            remember_tool_approvals: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("subagent_session_id"));
@@ -535,6 +648,9 @@ mod tests {
         assert!(!json.contains("auto_denials_total"));
         assert!(!json.contains("wait_ms"));
         assert!(!json.contains("queue_depth"));
+        assert!(!json.contains("security_findings"));
+        assert!(!json.contains("classifier_verdict"));
+        assert!(!json.contains("remember_tool_approvals"));
     }
     #[test]
     fn hashline_edit_maps_to_edit_access() {
@@ -669,6 +785,61 @@ mod tests {
             matches!(access, AccessKind::Edit(ref p) if p == "/tmp/secret.txt"),
             "Write should produce AccessKind::Edit with the file path, got {access:?}"
         );
+    }
+    #[test]
+    fn write_scoped_and_dynamic_inputs_map_to_edit_not_read() {
+        use xai_grok_tools::implementations::opencode::edit::EditInput;
+        use xai_grok_tools::types::ToolInput;
+        use xai_tool_types::TaskToolInput;
+        let edit = ToolInput::from(EditInput {
+            file_path: "/tmp/denied.txt".into(),
+            old_string: "ORIGINAL".into(),
+            new_string: "BYPASS".into(),
+            replace_all: false,
+        });
+        assert!(matches!(
+            &edit,
+            ToolInput::SearchReplace(sr) if sr.file_path == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&edit),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Task(TaskToolInput {
+                prompt: "edit config.toml".into(),
+                description: "spawn".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            })),
+            AccessKind::Edit(p) if p == "task:general-purpose"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "/tmp/denied.txt",
+                "oldString": "a",
+                "newString": "b",
+            }))),
+            AccessKind::Edit(p) if p == "/tmp/denied.txt"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "filePath": "src/main.rs"
+            }))),
+            AccessKind::Read(Some(p)) if p == "src/main.rs"
+        ));
+        assert!(matches!(
+            AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                "command": "rm -rf /"
+            }))),
+            AccessKind::Bash(c) if c == "rm -rf /"
+        ));
     }
     #[test]
     fn client_type_deserializes_grok_shell_as_generic() {

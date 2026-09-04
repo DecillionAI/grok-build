@@ -209,6 +209,21 @@ impl ChatStateHandle {
         });
     }
 
+    /// See [`ChatStateCommand::StripConversationImages`]. The outcome is
+    /// typed and disk-acknowledged: `Applied` means the backup and the
+    /// rewrite both reached disk; a dead actor reads as `ActorUnavailable`,
+    /// never as a successful no-op.
+    pub async fn strip_conversation_images(
+        &self,
+        urls: Vec<std::sync::Arc<str>>,
+    ) -> crate::StripOutcome {
+        self.query("StripConversationImages", |reply| {
+            ChatStateCommand::StripConversationImages { urls, reply }
+        })
+        .await
+        .unwrap_or(crate::StripOutcome::ActorUnavailable)
+    }
+
     /// Out-of-band history repair (`x.ai/session/repair`); see
     /// [`ChatStateCommand::RepairHistory`]. Returns `None` if the actor is
     /// dead, `Some(Err(_))` if a turn was in flight at processing time.
@@ -426,11 +441,17 @@ impl ChatStateHandle {
     /// `total_tokens` plus bytes/4 estimate of tool results pushed since the
     /// last model response. Used by `check_preflight_overflow`.
     pub async fn get_estimated_total_tokens(&self) -> u64 {
+        self.try_get_estimated_total_tokens().await.unwrap_or(0)
+    }
+
+    /// The same count, distinguishing "nothing yet" from "the actor did not
+    /// answer": a caller that reports occupancy cannot treat an unreadable
+    /// actor as an empty context.
+    pub async fn try_get_estimated_total_tokens(&self) -> Option<u64> {
         self.query("GetEstimatedTotalTokens", |reply| {
             ChatStateCommand::GetEstimatedTotalTokens { reply }
         })
         .await
-        .unwrap_or(0)
     }
 
     /// Bytes/4 estimate of all non-system conversation items.

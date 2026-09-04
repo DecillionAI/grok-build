@@ -35,6 +35,21 @@ pub struct WorkflowAgentInfo {
     pub duration_ms: u64,
 }
 
+/// `_meta` key on rename fan-out (`SessionSummaryGenerated` + ACP
+/// `SessionInfoUpdate`). Old clients ignore unknown meta.
+pub const TITLE_IS_MANUAL_META_KEY: &str = "x.ai/titleIsManual";
+
+/// `_meta` object carried on a manual-rename fan-out.
+pub fn title_is_manual_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: true })
+}
+
+/// `_meta` object carried on `/rename --auto` fan-out. Distinct from
+/// *absent* meta (auto title — must not clobber `display_name`).
+pub fn title_is_unpinned_meta() -> serde_json::Value {
+    serde_json::json!({ TITLE_IS_MANUAL_META_KEY: false })
+}
+
 /// xAI-specific session notification (parallel to acp::SessionNotification)
 /// This wraps an XaiSessionUpdate with session context for persistence and replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -544,9 +559,7 @@ pub enum SessionUpdate {
         event_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
-        /// The prompt turn this batch belongs to, when known; lets the
-        /// client keep a delayed `stop`/`stop_failure` batch off the wrong
-        /// turn's marker.
+        /// Keeps a delayed turn-end batch off the wrong turn's marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
         runs: Vec<HookRunEntryDto>,
@@ -570,6 +583,9 @@ pub enum SessionUpdate {
         /// List of (plugin_name, old_version, new_version).
         updates: Vec<(String, String, String)>,
     },
+    /// Status snapshot for client status lines. Send-only: never persisted,
+    /// since the next emit supersedes it.
+    SessionStatus(Box<xai_grok_status_line::StatusLineContext>),
     /// Session summary was generated for a new session.
     /// Sent after the first user prompt when the LLM generates a title.
     SessionSummaryGenerated {
@@ -793,7 +809,12 @@ pub enum SessionUpdate {
         subagent_id: Option<String>,
     },
     /// A scheduled task was deleted/cancelled.
-    ScheduledTaskDeleted { task_id: String },
+    ScheduledTaskDeleted {
+        task_id: String,
+        /// `Unknown` on rows persisted before the reason field existed.
+        #[serde(default)]
+        reason: xai_grok_tools::notification::ScheduledTaskRemovedReason,
+    },
     /// A monitor event (stdout line from a monitor background process).
     MonitorEvent {
         task_id: String,
@@ -1180,8 +1201,8 @@ pub enum RetryState {
 /// again. Drives the actionable re-auth banner.
 ///
 /// `legacy_auth` is intentionally excluded: those failures carry their own
-/// detailed migration guidance (`grok logout` / `grok login`) in the
-/// message, so we surface that verbatim instead of the generic prompt.
+/// detailed migration guidance (`grok update` / `grok logout` / `grok login`)
+/// in the message, so we surface that verbatim instead of the generic prompt.
 ///
 /// `auth_transient` is excluded for the opposite reason: the shell emits it
 /// only when the failure self-heals (see `AuthManager::requires_manual_reauth`)

@@ -6,6 +6,7 @@
 pub mod groups;
 mod layout;
 mod nav;
+mod pin_reserve;
 mod selection;
 mod timeline;
 mod types;
@@ -16,7 +17,7 @@ pub use layout::compute_paint_window;
 pub use timeline::TimelineEntry;
 pub use types::*;
 
-use layout::LayoutCache;
+use layout::{LayoutCache, StructuralScrollAnchor};
 
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
@@ -133,6 +134,32 @@ pub struct ScrollbackState {
     /// prompt at the viewport top while still enabling follow for new content.
     follow_preserve_scroll: bool,
 
+    /// Extra rows under the latest user prompt so a page-flip can keep that
+    /// prompt at the top. Independent of follow mode: a user scroll must not
+    /// collapse it (that clamp is the tail-jump). Dropped when the prompt
+    /// scrolls fully below the fold, or when the transcript is cleared.
+    pin_reserve_active: bool,
+
+    /// Rows currently added to `total_height` by [`Self::pin_reserve_active`].
+    /// Kept beside the flag so follow-preserve can still detect real overflow
+    /// against the unpadded content height.
+    pin_reserve_pad: usize,
+
+    /// Scroll offset of the page-flip pin, captured when the reserve is armed.
+    /// Re-deriving it from the last user prompt after a finish-time rebuild
+    /// (thinking collapse, "Worked for…" marker, group fold) can disagree
+    /// with the pose we scrolled to and drop the pad.
+    pin_reserve_target: Option<usize>,
+
+    /// Stable id of the prompt the pin targets, captured when armed. The pin
+    /// tracks this specific prompt, not "the last user prompt", so a mid-turn
+    /// interjection cannot move the above/below boundary the pad shift uses.
+    pin_reserve_prompt_id: Option<EntryId>,
+
+    /// The turn that armed the pin has finished. Midstream overflow still
+    /// chases the tail; after this, a remeasure or terminal marker must not.
+    pin_reserve_after_turn: bool,
+
     // Selection
     /// Currently selected entry index.
     selected: Option<usize>,
@@ -160,6 +187,11 @@ pub struct ScrollbackState {
 
     /// Layout cache for navigation (entry heights, prompt descriptors).
     layout_cache: Option<LayoutCache>,
+
+    /// One-shot viewport-top anchor armed by a structural entry mutation
+    /// (removal/insertion) just before it invalidates the layout cache, and
+    /// consumed by the next `prepare_layout` — see [`StructuralScrollAnchor`].
+    structural_scroll_anchor: Option<StructuralScrollAnchor>,
 
     // Sticky modes
     /// Display mode applied to thinking blocks when they finish running.
@@ -248,6 +280,11 @@ impl ScrollbackState {
             viewport_height: 0,
             follow_mode: true,
             follow_preserve_scroll: false,
+            pin_reserve_active: false,
+            pin_reserve_pad: 0,
+            pin_reserve_target: None,
+            pin_reserve_prompt_id: None,
+            pin_reserve_after_turn: false,
             selected: None,
             selection_box: None,
             turns: Vec::new(),
@@ -255,6 +292,7 @@ impl ScrollbackState {
             view_mode: ViewMode::AllTurns,
             last_width: 0,
             layout_cache: None,
+            structural_scroll_anchor: None,
             thinking_display_mode: DisplayMode::Collapsed,
             tick: 0,
             appearance: AppearanceConfig::default(),
@@ -387,6 +425,7 @@ impl ScrollbackState {
 
     /// Update the appearance configuration.
     pub fn set_appearance(&mut self, appearance: AppearanceConfig) {
+        crate::render::bidi::set_enabled(appearance.scrollback.display.rtl_bidi);
         self.appearance = appearance;
         // Invalidate caches since appearance affects rendering
         self.layout_cache = None;
@@ -658,6 +697,8 @@ impl ScrollbackState {
              block would print out of order in native scrollback"
         );
 
+        // Anchor the viewport top before the insertion shifts indices.
+        self.arm_structural_scroll_anchor();
         let id = EntryId::new(self.next_id);
         self.next_id += 1;
         let mut entry = ScrollbackEntry::new(block);
@@ -709,10 +750,14 @@ impl ScrollbackState {
     /// that was pushed at turn start. Returns `true` if an entry was removed.
     pub fn remove_entry(&mut self, id: EntryId) -> bool {
         // Capture the index before the removal shifts everything after it down.
-        let removed_index = self.entries.get_index_of(&id);
-        if self.entries.shift_remove(&id).is_none() {
+        let Some(removed_index) = self.entries.get_index_of(&id) else {
             return false;
-        }
+        };
+        // Anchor the viewport top before the removal shifts indices, then
+        // re-point it at the survivor if this removal deleted its entry.
+        self.arm_structural_scroll_anchor();
+        self.entries.shift_remove(&id);
+        self.migrate_structural_anchor_past_removal(id, removed_index);
         self.running.remove(&id);
         self.dirty_heights.remove(&id);
         self.committed.remove(&id);
@@ -723,9 +768,7 @@ impl ScrollbackState {
             self.selected = self.entries.len().checked_sub(1);
         }
         // Clamping alone is not enough here — see the cursor's contract.
-        if let Some(idx) = removed_index
-            && idx < self.commit_scan_cursor
-        {
+        if removed_index < self.commit_scan_cursor {
             self.commit_scan_cursor -= 1;
         }
         self.commit_scan_cursor = self.commit_scan_cursor.min(self.entries.len());
@@ -737,6 +780,9 @@ impl ScrollbackState {
     }
 
     pub fn remove_from(&mut self, index: usize) -> Vec<ScrollbackEntry> {
+        // Anchor a viewport parked above the cut; pruned below if the
+        // anchored entry itself is in the removed tail.
+        self.arm_structural_scroll_anchor();
         let mut removed = Vec::new();
         while self.entries.len() > index {
             if let Some((id, entry)) = self.entries.pop() {
@@ -748,6 +794,7 @@ impl ScrollbackState {
             }
         }
         removed.reverse();
+        self.prune_dead_structural_anchor();
         if let Some(sel) = self.selected
             && sel >= self.entries.len()
         {
@@ -797,9 +844,8 @@ impl ScrollbackState {
                 super::blocks::tool::HookPhase::Post => data.post_hooks = hook_entries,
             }
             entry.invalidate_cache();
-            // Structural, not just a height change: hook chrome removes the
-            // row from verb-group membership (`run_step`), so a folded run
-            // must re-run its folds to surface the `[hooks: N/M]` row.
+            // A height remeasure would revive a folded member whose cached
+            // height is zero; reapplying folds keeps hidden members hidden.
             self.mark_structurally_dirty(id);
         }
     }
@@ -858,10 +904,8 @@ impl ScrollbackState {
         None
     }
 
-    /// Merge a stop/stop_failure hook batch into a turn-terminal marker
-    /// entry and collapse it so the right-justified summary — not the
-    /// fold-out detail — is the resting state. Returns `false` unless the
-    /// entry is a turn-terminal session event the batch can be attributed to
+    /// Fold a turn-end hook batch into a turn-terminal marker and collapse it, so the summary
+    /// rather than the detail is the resting state. `false` unless the entry is such a marker
     /// (see [`Self::latest_turn_marker_accepting`]); re-checked here so a
     /// stray caller can't attach hooks to the wrong entry.
     pub fn attach_stop_hooks_to_marker(
@@ -1084,6 +1128,11 @@ impl ScrollbackState {
         self.turns.clear();
         self.current_turn = None;
         self.scroll_offset = 0;
+        self.pin_reserve_active = false;
+        self.pin_reserve_pad = 0;
+        self.pin_reserve_target = None;
+        self.pin_reserve_prompt_id = None;
+        self.pin_reserve_after_turn = false;
         self.commit_scan_cursor = 0;
         self.commit_expand_ring.clear();
         self.invalidate_layout_cache();
@@ -1577,6 +1626,11 @@ impl ScrollbackState {
         // Update viewport height
         self.viewport_height = height;
 
+        // Take an armed StructuralScrollAnchor unconditionally so it never
+        // outlives the first layout pass after its mutation; only the
+        // same-width full rebuild below applies it.
+        let structural_anchor = self.structural_scroll_anchor.take();
+
         // Case 1: Cache missing or width changed - full rebuild
         if self.layout_cache.is_none() || width != self.last_width {
             // A width change re-wraps every entry, so the absolute wrapped-row
@@ -1603,11 +1657,25 @@ impl ScrollbackState {
             }
             // Full rebuild produces cheap height ESTIMATES for every entry.
             self.ensure_layout_cache(width);
+            // Width changes invalidate the captured row coordinate. Re-pin before the release
+            // logic compares the new target with `scroll_offset`.
+            if resized && self.pin_reserve_active {
+                self.pin_reserve_target = self.pin_reserve_prompt_scroll_target();
+                if let Some(target) = self.pin_reserve_target {
+                    self.scroll_offset = target;
+                }
+            }
             self.compute_total_height_from_cache();
             // Re-pin the anchored content to the viewport top now that virtual_y
             // is rebuilt at the new width (before settle clamps / re-pins to it).
             if let Some(anchor) = scroll_anchor {
                 self.restore_scroll_anchor(anchor);
+            } else if !width_changed {
+                // Same-width rebuild forced by a structural mutation: re-pin
+                // the pre-mutation viewport-top content by stable EntryId. On
+                // a width change the anchor is dropped instead — its row
+                // offset is meaningless after a re-wrap.
+                self.apply_structural_scroll_anchor(structural_anchor, width);
             }
             self.fixup_hidden_selection();
             self.handle_follow_mode();
@@ -1633,8 +1701,13 @@ impl ScrollbackState {
 
         // Case 2: Some entries have dirty heights - incremental update
         if !self.dirty_heights.is_empty() {
+            // Viewport-top identity BEFORE heights change. Case 2 retains
+            // the cache (no insert/remove), so the plain index stays valid
+            // for the duration of this call.
+            let top_anchor = self.viewport_top_anchor_point();
             let changes = self.update_dirty_entry_heights(width);
             self.dirty_heights.clear();
+            self.shift_pin_reserve_target_for_changes(&changes);
 
             if !changes.is_empty() {
                 if self.gaps_may_be_dirty {
@@ -1648,11 +1721,12 @@ impl ScrollbackState {
                     // Patch virtual_y in O(n-k) where k is the earliest dirty index.
                     // For streaming (dirty entry at end), this is O(1).
                     let total_delta = self.patch_virtual_y_for_dirty(&changes);
-                    // Apply delta directly instead of re-summing entire visible range.
-                    // Clamp at 0 to avoid underflow; no upper cap (total_height is
-                    // usize, so tall sessions are not truncated).
-                    let new_total = (self.total_height as i64 + total_delta as i64).max(0);
-                    self.total_height = new_total as usize;
+                    // Streamed growth must shrink the reserve rather than inflate max_offset.
+                    let content = self.total_height.saturating_sub(self.pin_reserve_pad);
+                    let new_content = (content as i64 + total_delta as i64).max(0) as usize;
+                    self.release_pin_reserve_if_below_fold();
+                    self.pin_reserve_pad = self.pin_reserve_pad_rows(new_content);
+                    self.total_height = new_content.saturating_add(self.pin_reserve_pad);
                 }
             } else if self.gaps_may_be_dirty {
                 // Heights didn't change, but structural state is dirty (e.g.,
@@ -1667,6 +1741,12 @@ impl ScrollbackState {
                 self.compute_total_height_from_cache();
             }
 
+            // Re-pin the pre-change viewport-top row: geometry above it may
+            // have shifted virtual_y while the absolute scroll_offset stayed
+            // put (an exact no-op for changes at/below the top).
+            if let Some((entry_idx, rows_into_span)) = top_anchor {
+                self.repin_viewport_top_to_entry(entry_idx, rows_into_span);
+            }
             self.handle_follow_mode();
             // A scroll/content change may have brought estimated entries into
             // view (e.g. streaming while scrolled up); measure them exactly.
@@ -1774,6 +1854,7 @@ impl ScrollbackState {
             .saturating_sub(self.viewport_height as usize);
         self.scroll_offset = offset.min(max_offset);
         self.follow_mode = false;
+        self.maybe_release_pin_reserve();
         self.bump_generation();
     }
 
@@ -1792,7 +1873,7 @@ impl ScrollbackState {
         let Some(info) = cache.entries.get(idx) else {
             return false;
         };
-        info.is_group_header() || info.height == 0
+        (info.is_group_header() && !info.is_expanded_verb_header()) || info.height == 0
     }
 
     /// Whether entry `idx` overlaps the current viewport (cached offsets + the

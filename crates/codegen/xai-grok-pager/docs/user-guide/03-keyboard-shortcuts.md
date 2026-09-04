@@ -117,7 +117,9 @@ They share one contract:
   Where it leaves to is the one thing that differs per card — the question card
   and the permission prompt park the keyboard in the scrollback so you can
   scroll up and read the context behind them (the card stays on screen), while
-  the cancel-turn panel's "keep everything running" resolves it outright.
+  the cancel-turn panel's "keep running" closes the panel and leaves the
+  turn (and any subagents) running. Enter or `1`–`4` still pick a
+  cancel-and-subagent choice.
 - With the keyboard parked, the shortcuts bar shows the scrollback's own keys,
   and its focus hint names the card rather than the prompt: `Tab/Space:
   question`. That hint is pinned, so a narrow bar can never trim away the only
@@ -141,6 +143,9 @@ They share one contract:
 | `y` | Copy the focused answer |
 | `Shift+X` | Dismiss the question (the agent continues without an answer) |
 | `Ctrl+F` | Fullscreen the card |
+
+The bare `/feedback` pane is the one exception to this table: it has no answers
+to walk, `Enter` sends the report, and `Esc` dismisses the pane.
 
 While typing a free-text answer, `Enter` submits and `Esc` returns to the
 answer rows; every other key goes to the text field.
@@ -180,11 +185,11 @@ sends it and `Esc` returns to the options.
 | Turn cancelling | `Esc` | Re-sends cancel in **every** mode (retry if the first ack was lost). `Ctrl+C` in this state escalates toward quit. |
 | Idle + non-empty prompt (text or image chips), **prompt focused** | **2× `Esc` within 800ms** | Clear the prompt; non-empty text is saved to prompt history. First press shows “press again to clear”. |
 | Idle + empty prompt + conversation messages, **prompt or scrollback focused** | **2× `Esc` within 800ms** | Open the rewind picker (same as `/rewind`). First press is silent (no toast). |
-| Idle + empty + no messages, **or scrollback focused with a draft / moded (`!` `#` feedback) composer / pending needs-input overlay / open history search** | `Esc` | Swallowed no-op (does not focus scrollback). Clear is prompt-pane only; rewind requires an empty Normal-mode composer, no pending overlay, and no open history search — reading the scrollback never mutates your draft, your composer mode, a question awaiting an answer, or an in-progress search. |
+| Idle + empty + no messages, **or scrollback focused with a draft / moded (`!` `#`) composer / pending needs-input overlay / open history search** | `Esc` | Swallowed no-op (does not focus scrollback). Clear is prompt-pane only; rewind requires an empty Normal-mode composer, no pending overlay, and no open history search. Reading the scrollback never mutates your draft, your composer mode, a question awaiting an answer, or an in-progress search. |
 
 **Post-cancel grace:** for about a second after an Esc-triggered cancel, the idle rewind arm stays suppressed — mashing Esc to stop a turn cannot silently open the rewind picker. Only the rewind arm is held; every other Esc behavior is unaffected.
 
-**Steal-Esc (runs before mid-turn cancel / swallow and clear / rewind):** overlays, modals, slash/file/completion dropdowns, history search, scrollback search, text selection, link highlight, voice, and **Bash / Remember / Feedback mode exit** when the prompt is empty (Esc leaves `!` / `#` / feedback mode and returns to the normal prompt — even while a turn is running).
+**Steal-Esc (runs before mid-turn cancel / swallow and clear / rewind):** overlays, modals, slash/file/completion dropdowns, history search, scrollback search, text selection, link highlight, voice, and **Bash / Remember mode exit** when the prompt is empty (Esc leaves `!` / `#` mode and returns to the normal prompt, even while a turn is running). Bare `/feedback` opens the report pane; Esc dismisses it.
 
 **Ctrl+C vs Esc:** with a non-empty draft while a turn is running, Ctrl+C clears the draft and keeps the turn; a second Ctrl+C on an empty prompt cancels. Esc cancels immediately and preserves the draft (in fullscreen vim mode it does not cancel — it only retries while already cancelling). Idle non-empty Ctrl+C clears in one press; Esc requires two presses within 800ms.
 
@@ -253,7 +258,7 @@ Over SSH, the remote Grok process usually cannot access the terminal's local X11
 
 While the agent is generating:
 
-- **Plain `Enter`** (with text in the composer) **queues** a follow-up for later. Queued follow-ups run after the current turn ends — and they deliberately **hold** while the agent is blocked waiting on background tasks or a subagent (a hint explains the hold and how to send one now).
+- **Plain `Enter`** (with text in the composer) **queues** a follow-up for later. By default (`[ui].follow_up_behavior = "queue"`) those follow-ups run after the current turn ends — and they deliberately **hold** while the agent is blocked waiting on background tasks or a subagent (a hint explains the hold and how to send one now). With `"steer"`, the same Enter still shows the row in the queue, then the shell injects it mid-turn at the next tool or model safe gap (see [Configuration](05-configuration.md)).
 - **`Enter` again on the emptied composer** (double-Enter) sends the **top** queued follow-up now.
 - The **send now** chord is **cancel-and-send**: it stops the current turn (background tasks, subagents, and the rest of the queue keep running) and sends your message as the next turn, so it always appears at the bottom of the transcript:
   - **Non-empty composer** → cancel and send that text now.
@@ -403,11 +408,22 @@ Paste:            Ctrl+V (text, files, screenshots on macOS/Linux)
 Selected text:    Middle click or Shift+Insert (Linux X11/XWayland PRIMARY)
 Paste image:      Alt+V (Windows only — for screenshots / "Copy Image")
 Select all:       Cmd+A (macOS, Ghostty only — see note below)
+Select text:      Shift+←/→ (char) · Alt+Shift+←/→ (word) ·
+                  Cmd+Shift+←/→ (visual row) · Shift+Home/End (logical line) ·
+                  Shift+↑/↓ (row)
+Copy / Cut:       Cmd+C / Cmd+X (with a selection; Kitty-protocol terminals)
 Leave:            Tab (back to scrollback)
 Cancel (running): Ctrl+C (empty prompt; non-empty draft clears first)
 Clear (idle):     Esc Esc within 800ms (non-empty prompt)
 Rewind (idle):    Esc Esc within 800ms (empty prompt + messages)
 ```
+
+With a selection active, typing / `Enter` / paste replace it, delete and
+word-kill chords delete just the selection, arrows collapse it to the
+matching edge (word/line moves continue from that edge), and `Esc` or `Tab`
+drop the highlight while still performing their normal action. Note
+`Shift+←/→` only selects while the **prompt** is focused; with scrollback
+focused the same chords jump between turns (see Navigation above).
 
 > **Cmd+A is gated to Ghostty.** Grok's in-app `Cmd+A` handler is only
 > wired up when the detected terminal is Ghostty. Other terminals
