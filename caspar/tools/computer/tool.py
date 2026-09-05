@@ -250,18 +250,28 @@ sleep 1
 
 pkill -f "cloudflared.*$WEB_PORT" 2>/dev/null || true
 rm -f "$DIR/url"
-echo "START: opening a secure Cloudflare tunnel"
-$DETACH "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$WEB_PORT" >"$DIR/cloudflared.log" 2>&1 &
-echo $! >"$DIR/tunnel.pid"
 
-# --- 3. wait for the public URL and record it ------------------------------
-i=0
-while [ $i -lt ''' + str(TUNNEL_WAIT_S) + r''' ]; do
-  u="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/cloudflared.log" 2>/dev/null | head -n1)"
-  if [ -n "$u" ]; then printf '%s' "$u" >"$DIR/url"; echo "READY: $u"; break; fi
-  i=$((i+1)); sleep 1
-done
-[ -s "$DIR/url" ] || echo "ERROR: the tunnel did not publish a URL in time"
+if [ -n "$PRE_URL" ]; then
+  echo "READY: using native sandbox encrypted tunnel on port $WEB_PORT"
+  printf '%s' "$PRE_URL" >"$DIR/url"
+  echo "READY: $PRE_URL"
+  rm -f "$DIR/tunnel.pid"
+elif [ -x "$CF" ]; then
+  echo "START: opening a secure Cloudflare tunnel"
+  $DETACH "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$WEB_PORT" >"$DIR/cloudflared.log" 2>&1 &
+  echo $! >"$DIR/tunnel.pid"
+
+  # --- 3. wait for the public URL and record it ------------------------------
+  i=0
+  while [ $i -lt ''' + str(TUNNEL_WAIT_S) + r''' ]; do
+    u="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/cloudflared.log" 2>/dev/null | head -n1)"
+    if [ -n "$u" ]; then printf '%s' "$u" >"$DIR/url"; echo "READY: $u"; break; fi
+    i=$((i+1)); sleep 1
+  done
+  [ -s "$DIR/url" ] || echo "ERROR: the tunnel did not publish a URL in time"
+else
+  echo "ERROR: no tunnel client available"
+fi
 echo "PROVISION_DONE"
 '''
 
@@ -269,17 +279,25 @@ _DETECT_SCRIPT = r'''#!/bin/sh
 DIR="$HOME/''' + REMOTE_DIR + r'''"
 have(){ command -v "$1" >/dev/null 2>&1; }
 inst=MISSING
-if have Xvfb && have x11vnc && have websockify && [ -x "$DIR/cloudflared" ] && \
+if have Xvfb && have x11vnc && have websockify && \
    { have ''' + BROWSER_BIN + r''' || have firefox || have chromium || have chromium-browser; }; then
   inst=INSTALLED
 fi
 run=DOWN
 url=""
 alive=1
-for p in xvfb browser vnc novnc tunnel; do
+for p in xvfb browser vnc novnc; do
   f="$DIR/$p.pid"
   if [ ! -f "$f" ] || ! kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/null; then alive=0; fi
 done
+if [ -f "$DIR/tunnel.pid" ]; then
+  if ! kill -0 "$(cat "$DIR/tunnel.pid" 2>/dev/null)" 2>/dev/null; then alive=0; fi
+fi
+if [ "$alive" = 1 ]; then
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf -o /dev/null --connect-timeout 2 "http://127.0.0.1:''' + str(REMOTE_WEB_PORT) + r'''/vnc.html" || alive=0
+  fi
+fi
 if [ "$alive" = 1 ] && [ -s "$DIR/url" ]; then
   run=UP; url="$(cat "$DIR/url" 2>/dev/null)"
 fi
@@ -435,9 +453,9 @@ def _write_remote_file(desk: "Desktop", rel_path: str, content: str) -> None:
 # Provisioning — drive the sandbox to install + run the desktop, stream its log
 # --------------------------------------------------------------------------- #
 
-def _detect(space_id: str) -> Tuple[str, str, str]:
+def _detect(space_id: str, *, timeout: float = SANDBOX_BOOT_TIMEOUT_S) -> Tuple[str, str, str]:
     """(installed, running, url) as reported from the sandbox."""
-    res = _sbx_exec(space_id, _DETECT_SCRIPT, timeout=SANDBOX_BOOT_TIMEOUT_S)
+    res = _sbx_exec(space_id, _DETECT_SCRIPT, timeout=timeout)
     out = str(res.get("stdout") or "")
     inst = run = ""
     url = ""
@@ -502,14 +520,29 @@ def _provision(desk: Desktop) -> None:
             _get_home(desk)
         desk.log("the space sandbox is up")
 
+        # Check if the sandbox has a native tunnel for the desktop web port (6080).
+        # On Modal, encrypted_ports includes 6080, providing a permanent native HTTPS tunnel
+        # (https://<hash>-6080.modal.run) that never encounters Cloudflare Error 1033!
+        native_url = ""
+        try:
+            info = _sbx("info", {"space_id": space_id}, timeout=EXEC_TIMEOUT_S)
+            for r in (info.get("routes") or []):
+                if isinstance(r, dict) and r.get("port") == REMOTE_WEB_PORT and r.get("url"):
+                    native_url = str(r["url"]).strip()
+                    break
+        except Exception:
+            pass
+
         # 2) Already running there? Then skip the install entirely.
         inst, run, url = _detect(space_id)
         desk.installed = inst == "INSTALLED"
-        if run == "UP" and url:
-            desk.url = _compose_url(url)
-            desk.phase = PHASE_READY
-            desk.log("the desktop is already running on the sandbox — reusing it")
-            return
+        if run == "UP":
+            active_url = native_url or url
+            if active_url:
+                desk.url = _compose_url(active_url)
+                desk.phase = PHASE_READY
+                desk.log("the desktop is already running on the sandbox — reusing it")
+                return
 
         # 3) Write the provision/start script onto the sandbox (via exec, so its
         #    path matches $HOME) and run it in the background, capturing its output
@@ -519,10 +552,12 @@ def _provision(desk: Desktop) -> None:
         d = "\"$HOME/" + REMOTE_DIR + "\""
         script = "\"$HOME/" + REMOTE_DIR + "/provision.sh\""
         logf = "\"$HOME/" + REMOTE_DIR + "/install.log\""
+        pre_export = f"export PRE_URL='{native_url}'; " if native_url else ""
         launch = (
             "mkdir -p " + d + "; : > " + logf + "; "
             "if command -v setsid >/dev/null 2>&1; then DET=setsid; else DET=nohup; fi; "
-            "$DET sh " + script + " >" + logf + " 2>&1 </dev/null & echo launched")
+            + pre_export
+            + "$DET sh " + script + " >" + logf + " 2>&1 </dev/null & echo launched")
         _sbx_exec(space_id, launch, timeout=EXEC_TIMEOUT_S)
 
         # 4) Stream the sandbox's install log until it publishes a URL (or fails).
@@ -537,7 +572,12 @@ def _provision(desk: Desktop) -> None:
         # 5) Read the published URL from the sandbox.
         inst, run, url = _detect(space_id)
         desk.installed = inst == "INSTALLED" or desk.installed
-        if url:
+        final_url = native_url or url
+        if final_url and run == "UP":
+            desk.url = _compose_url(final_url)
+            desk.phase = PHASE_READY
+            desk.log("the computer is ready — opening the live browser")
+        elif url and run == "UP":
             desk.url = _compose_url(url)
             desk.phase = PHASE_READY
             desk.log("the computer is ready — opening the live browser")
@@ -767,6 +807,27 @@ def _act_status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if desk is None:
         return {"ok": True, "action": "status", "space_id": space_id, "phase": PHASE_IDLE,
                 "url": None, "installed": False, "ready": False, "logs": [], "cursor": 0}
+
+    # If the desktop was marked ready, verify that the sandbox and desktop are still alive.
+    # When a sandbox stops (e.g. idle stop after 5m), reset to IDLE and clear the URL so the UI
+    # doesn't stay stuck on an unresponsive iframe or Cloudflare 1033.
+    if desk.phase == PHASE_READY:
+        try:
+            sb_info = _sbx("info", {"space_id": space_id}, timeout=3.0)
+            if not isinstance(sb_info, dict) or not sb_info.get("ok") or sb_info.get("status") in ("stopped", "not_running", "terminated"):
+                desk.phase = PHASE_IDLE
+                desk.url = ""
+            else:
+                inst, run, url = _detect(space_id, timeout=3.0)
+                if run != "UP" or not url:
+                    desk.phase = PHASE_IDLE
+                    desk.url = ""
+                elif url:
+                    desk.url = _compose_url(url)
+        except Exception:
+            desk.phase = PHASE_IDLE
+            desk.url = ""
+
     # Long-poll: the Victor guest VM has no timer, so it paces its poll loop by
     # asking us to hold the call briefly while the desktop is still installing —
     # we return early the moment new log lines land or the phase changes.

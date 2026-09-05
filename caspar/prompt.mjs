@@ -325,8 +325,8 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
     "these tools. If the outcome needs a live page or service, write it on the shared " +
     "machine, start the real process people would run locally (the framework " +
     "dev server, next/vite/npm start, the API) and keep it running, then call " +
-    "sandbox `expose` (or `tunnel`) with the listening port so people get a " +
-    "public URL they can Open in the app. Do not start `python -m http.server` " +
+    "sandbox `expose` (or `info`) with the listening port so people get a " +
+    "public URL they can Open in the app. Standard web ports (3000, 3001, 4173, 5173, 8000, 8080) are automatically tunneled to public HTTPS by the sandbox runtime — do NOT attempt external tunneling services like localtunnel or ngrok. Do not start `python -m http.server` " +
     "on a folder of source files: that drops CSS/JS and is not the product. " +
     "Do not leave the only URL as localhost — that is the sandbox VM, not their " +
     "laptop. Serve the running app, never a directory listing. The graphical `computer` desktop (VNC GUI on that same " +

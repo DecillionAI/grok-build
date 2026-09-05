@@ -37,7 +37,7 @@
   "argSchema": {
     "function": {
       "type": "string",
-      "description": "operation: exec (default) | write | read | mkdir | list_dir | info | start | stop"
+      "description": "operation: exec (default) | write | read | mkdir | list_dir | info | expose | start | stop"
     },
     "command": {
       "type": "string",
@@ -54,6 +54,10 @@
     "timeout_ms": {
       "type": "number",
       "description": "optional per-command timeout in milliseconds"
+    },
+    "ports": {
+      "type": "array",
+      "description": "for expose/start: port numbers to tunnel publicly (e.g. [4173])"
     },
     "path": {
       "type": "string",
@@ -221,6 +225,24 @@
           "runtime",
           "ports",
           "space_id"
+        ]
+      }
+    },
+    {
+      "name": "expose",
+      "desc": "get the public HTTPS tunnel URLs for web servers running in the sandbox (e.g. port 4173, 3000, 5173, 8000)",
+      "args": {
+        "ports": {
+          "type": "ARRAY",
+          "desc": "ports to expose publicly (e.g. [4173])"
+        }
+      },
+      "widget": {
+        "heading": "Expose",
+        "details": [
+          "routes",
+          "ports",
+          "status"
         ]
       }
     },

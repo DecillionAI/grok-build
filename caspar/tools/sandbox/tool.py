@@ -764,6 +764,29 @@ def _expose(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     ports = _preview_ports(payload)
     b = backend()
+
+    # If the sandbox is already running and already has routes for the requested ports,
+    # do NOT kill the container! That would kill the server the agent or user just started.
+    info = None
+    try:
+        info = b.info(space_id, {"resume": False})
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(info, dict) and info.get("status") == "running":
+        existing_routes = info.get("routes") or []
+        existing_ports = {r.get("port") for r in existing_routes if isinstance(r, dict)}
+        if existing_routes and (not ports or all(p in existing_ports for p in ports)):
+            out = dict(info)
+            out.update({
+                "ok": True,
+                "action": "expose",
+                "space_id": space_id,
+                "ports": ports,
+                "routes": existing_routes,
+                "restarted": None,
+            })
+            return out
+
     try:
         b.stop(space_id, payload)
     except Exception:  # noqa: BLE001
@@ -1461,8 +1484,17 @@ class ModalBackend(Backend):
         app = self._get_app()
         payload = apply_machine_policy(payload)
         res = self._resources(payload)
+        # Always bind default preview ports and computer desktop port (6080)
+        # so any web dev server (3000, 3001, 4173, 5173, 8000, 8080) or noVNC
+        # automatically gets a permanent TLS HTTPS tunnel from Modal at boot time.
+        declared_ports = set(DEFAULT_PREVIEW_PORTS)
+        declared_ports.add(6080)
         ports = payload.get("ports")
-        encrypted_ports = [int(p) for p in (ports or []) if str(p).strip().isdigit()]
+        if ports:
+            for p in ports:
+                if str(p).strip().isdigit():
+                    declared_ports.add(int(p))
+        encrypted_ports = sorted(list(declared_ports))
         kwargs: Dict[str, Any] = {
             "app": app,
             "image": self._image(payload),
@@ -1752,15 +1784,17 @@ class ModalBackend(Backend):
         routes: List[Dict[str, Any]] = []
         if sb is not None:
             session_id = getattr(sb, "object_id", None)
-            status = "running" if self._is_running(sb) else "stopped"
-            # Do not call tunnels() on idle peeks — opening tunnels resets
-            # Modal's idle timer and keeps a unused VM billed.
-            if action not in ("info", "create", "status"):
+            if self._is_running(sb):
+                status = "running"
                 try:
                     for port, tunnel in (sb.tunnels() or {}).items():
-                        routes.append({"url": getattr(tunnel, "url", None), "port": port})
+                        url = getattr(tunnel, "url", None)
+                        if url:
+                            routes.append({"url": url, "port": int(port)})
                 except Exception:  # noqa: BLE001 — no exposed ports / not supported
                     pass
+            else:
+                status = "stopped"
         return {
             "ok": True,
             "action": action,
