@@ -331,6 +331,18 @@ await check("an acknowledgement is not a hand-off", async () => {
   assert.equal(notes.length, 0, "a polite ending is not a stall");
 });
 
+await check("a completion report back to teammates or lead is not a hand-off", async () => {
+  const { bridge, launched, notes } = makeBridge();
+  const delivery = seedDelivery({ self: { programId: "mate-prog", name: "Writer", handle: "writer" } });
+  const n = await planAndLaunchFollowups(bridge, delivery, {
+    success: true,
+    answer: "@lead Research is complete in research.md and task 1234 is closed.",
+  });
+  assert.equal(n, 0);
+  assert.equal(launched.length, 0);
+  assert.equal(notes.length, 0, "a completion report terminates cleanly without looping");
+});
+
 await check("code, links and package names never trigger an agent", async () => {
   // Every `@token` used to be a trigger, so an answer containing a CSS block or a
   // dependency list fanned the chain out to whatever fuzzily matched.

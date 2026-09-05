@@ -561,7 +561,13 @@ export function isCourtesyMention(answer, handle) {
       // A possessive reference — "@researcher's findings", "@designer’s note".
       // The apostrophe is required: without it "@growth draft the posts" reads as
       // a reference to a draft rather than the instruction it plainly is.
-      /^['\u2019]s?\b/i.test(after);
+      /^['\u2019]s?\b/i.test(after) ||
+      // A completion or status report back to teammates or lead — e.g.:
+      // "@lead Research is complete in research.md", "@lead I created shared runbook.md",
+      // "@lead Content pack is complete", "@lead Website task ... completed"
+      /^\s*(?:(?:i(?:'ve| have)?\s+)?(?:created|built|completed|finished|prepared|drafted|written|shipped|added|set up|closed)|(?:task|workstream|work|deliverable|draft|plan|research|content|website|site|runbook|pack)\s+(?:is\s+)?(?:complete|completed|done|finished|ready)|all\s+(?:tasks?\s+)?(?:are\s+)?(?:complete|completed|done)|completed\b|done\b)/i.test(
+        after,
+      );
     // A directive next to the mention makes it a real hand-off again. Only
     // strongly second-person phrasing counts: bare verbs like "draft" or "build"
     // are nouns as often as instructions ("thanks @lead, draft attached"), and
