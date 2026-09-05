@@ -670,39 +670,8 @@ def _list_tasks(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _list_dir(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Structured, read-only directory listing for a file-explorer front-end.
-
-    Runs the listing script through the ordinary exec path (so it shares the
-    space's session and auto-resume), then parses the tab-separated rows into
-    `{name, type, size}` entries with directories first.
-    """
-    path = str(payload.get("path") or payload.get("dir") or ".").strip() or "."
-    res = backend().exec(space_id, {"command": _LIST_SCRIPT,
-                                    "env": {"LIST_DIR": path},
-                                    "timeout_ms": int(payload.get("timeout_ms") or 15000)})
-    stdout = res.get("stdout") or ""
-    lines = [ln for ln in stdout.splitlines() if ln != ""]
-    if lines and lines[0].strip() == "__NODIR__":
-        return {"ok": False, "action": "list_dir", "space_id": space_id, "path": path,
-                "sandbox": sandbox_name(space_id), "error": "not a directory or not found"}
-    entries: List[Dict[str, Any]] = []
-    for line in lines:
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        kind, size_str, name = parts[0], parts[1], "\t".join(parts[2:])
-        if not name:
-            continue
-        try:
-            size = int(size_str)
-        except (TypeError, ValueError):
-            size = 0
-        entries.append({"name": name, "type": "dir" if kind == "d" else "file", "size": size})
-    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
-    return {"ok": True, "action": "list_dir", "space_id": space_id,
-            "sandbox": sandbox_name(space_id), "path": path,
-            "entries": entries, "count": len(entries),
-            "exit_code": res.get("exit_code")}
+    """Structured, read-only directory listing for a file-explorer front-end."""
+    return backend().list_dir(space_id, payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -848,6 +817,35 @@ class Backend:
     def stop(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]: ...
     def delete(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]: ...
     def list(self, payload: Dict[str, Any]) -> Dict[str, Any]: ...
+
+    def list_dir(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        path = str(payload.get("path") or payload.get("dir") or ".").strip() or "."
+        res = self.exec(space_id, {"command": _LIST_SCRIPT,
+                                   "env": {"LIST_DIR": path},
+                                   "timeout_ms": int(payload.get("timeout_ms") or 15000)})
+        stdout = res.get("stdout") or ""
+        lines = [ln for ln in stdout.splitlines() if ln != ""]
+        if lines and lines[0].strip() == "__NODIR__":
+            return {"ok": False, "action": "list_dir", "space_id": space_id, "path": path,
+                    "sandbox": sandbox_name(space_id), "error": "not a directory or not found"}
+        entries: List[Dict[str, Any]] = []
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            kind, size_str, name = parts[0], parts[1], "\t".join(parts[2:])
+            if not name:
+                continue
+            try:
+                size = int(size_str)
+            except (TypeError, ValueError):
+                size = 0
+            entries.append({"name": name, "type": "dir" if kind == "d" else "file", "size": size})
+        entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+        return {"ok": True, "action": "list_dir", "space_id": space_id,
+                "sandbox": sandbox_name(space_id), "path": path,
+                "entries": entries, "count": len(entries),
+                "exit_code": res.get("exit_code")}
 
 
 def _env_first(*names: str) -> str:
@@ -1372,6 +1370,11 @@ class ModalBackend(Backend):
         self._app = None
         # space_id -> (sandbox_object_id, monotonic deadline)
         self._sandboxes: Dict[str, Tuple[str, float]] = {}
+        # space_id -> timestamp of last active user/agent operation (exec, write, start)
+        self._last_active: Dict[str, float] = {}
+
+    def _touch(self, space_id: str) -> None:
+        self._last_active[space_id] = time.time()
 
     @staticmethod
     def _import_modal():
@@ -1456,6 +1459,7 @@ class ModalBackend(Backend):
     def _create_sandbox(self, space_id: str, payload: Dict[str, Any]) -> Any:
         modal = self._modal
         app = self._get_app()
+        payload = apply_machine_policy(payload)
         res = self._resources(payload)
         ports = payload.get("ports")
         encrypted_ports = [int(p) for p in (ports or []) if str(p).strip().isdigit()]
@@ -1481,6 +1485,7 @@ class ModalBackend(Backend):
                          "origin": "decillion", "spaceId": str(space_id)[:256]})
         except Exception:  # noqa: BLE001 — tags are best-effort discovery aid
             pass
+        self._touch(space_id)
         return sb
 
     def _sandbox(self, space_id: str, *, auto_create: bool = True,
@@ -1490,6 +1495,8 @@ class ModalBackend(Backend):
             try:
                 sb = self._modal.Sandbox.from_id(cached[0])
                 if self._is_running(sb):
+                    if space_id not in self._last_active:
+                        self._touch(space_id)
                     return sb
             except Exception:  # noqa: BLE001
                 pass
@@ -1499,6 +1506,9 @@ class ModalBackend(Backend):
             if not auto_create:
                 raise SandboxError(f"no running sandbox for space {space_id}", status=404)
             sb = self._create_sandbox(space_id, create_payload or {})
+        else:
+            if space_id not in self._last_active:
+                self._touch(space_id)
         self._sandboxes[space_id] = (sb.object_id, time.monotonic() + _M_SESSION_TTL)
         return sb
 
@@ -1508,6 +1518,7 @@ class ModalBackend(Backend):
     # ---------------------------------------------------------------- exec #
 
     def exec(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._touch(space_id)
         command, args = _command_spec(payload)
         shell_line = _shell_line(command, args)
         env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
@@ -1619,6 +1630,7 @@ class ModalBackend(Backend):
             return b""
 
     def write(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._touch(space_id)
         entries = _file_entries(payload)
         cwd = payload.get("cwd")
 
@@ -1638,14 +1650,32 @@ class ModalBackend(Backend):
         if not path:
             raise SandboxError("path is required")
         target = self._abs(path, payload.get("cwd"))
+        sb = self._find_running(space_id)
+        if sb is not None:
+            self._touch(space_id)
+            def run(sb: Any) -> Tuple[bytes, str]:
+                return self._fs_read_bytes(sb, target), sb.object_id
+            data, sid = self._with_sandbox(space_id, run)
+            offline = False
+        else:
+            if not self._volume_exists(space_id):
+                raise SandboxError(f"file not found: {path}", status=404)
+            vol = self._volume(space_id)
+            if target.startswith(MODAL_WORKDIR):
+                vol_rel = os.path.relpath(target, MODAL_WORKDIR)
+            else:
+                vol_rel = target.lstrip("/")
+            try:
+                chunks = list(vol.read_file(vol_rel))
+                data = b"".join(chunks)[:MAX_READ_BYTES]
+                sid = "volume-offline"
+                offline = True
+            except Exception as exc:
+                raise SandboxError(f"file not found: {path}", status=404) from exc
 
-        def run(sb: Any) -> Tuple[bytes, str]:
-            return self._fs_read_bytes(sb, target), sb.object_id
-
-        data, sid = self._with_sandbox(space_id, run)
         result = {"ok": True, "action": "read", "space_id": space_id,
                   "sandbox": sandbox_name(space_id), "session_id": sid,
-                  "path": path, "bytes": len(data)}
+                  "path": path, "bytes": len(data), "offline": offline}
         try:
             result["content"] = _truncate(data.decode("utf-8"))
             result["encoding"] = "text"
@@ -1655,6 +1685,7 @@ class ModalBackend(Backend):
         return result
 
     def mkdir(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._touch(space_id)
         path = str(payload.get("path") or "").strip()
         if not path:
             raise SandboxError("path is required")
@@ -1667,6 +1698,50 @@ class ModalBackend(Backend):
         sid = self._with_sandbox(space_id, run)
         return {"ok": True, "action": "mkdir", "space_id": space_id, "path": path,
                 "sandbox": sandbox_name(space_id), "session_id": sid}
+
+    def list_dir(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        path = str(payload.get("path") or payload.get("dir") or ".").strip() or "."
+        sb = self._find_running(space_id)
+        if sb is not None:
+            self._touch(space_id)
+            return super().list_dir(space_id, payload)
+
+        name = sandbox_name(space_id)
+        if not self._volume_exists(space_id):
+            return {"ok": True, "action": "list_dir", "space_id": space_id,
+                    "sandbox": name, "path": path, "entries": [], "count": 0, "offline": True}
+        try:
+            vol = self._volume(space_id)
+            vol_path = "/" if path in (".", "/", "") else f"/{path.lstrip('/')}"
+            entries: List[Dict[str, Any]] = []
+            try:
+                items = vol.listdir(vol_path, recursive=False)
+            except Exception:
+                return {"ok": False, "action": "list_dir", "space_id": space_id, "path": path,
+                        "sandbox": name, "error": "not a directory or not found", "offline": True}
+            for entry in items:
+                p = getattr(entry, "path", "").rstrip("/")
+                base = os.path.basename(p)
+                if not base or base in (".", ".."):
+                    continue
+                is_dir = False
+                if hasattr(entry, "is_dir") and callable(entry.is_dir):
+                    try:
+                        is_dir = bool(entry.is_dir())
+                    except Exception:
+                        pass
+                elif hasattr(entry, "type"):
+                    t_str = str(getattr(entry.type, "name", entry.type)).upper()
+                    is_dir = "DIR" in t_str
+                sz = getattr(entry, "size", 0) or 0
+                entries.append({"name": base, "type": "dir" if is_dir else "file", "size": int(sz)})
+            entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+            return {"ok": True, "action": "list_dir", "space_id": space_id,
+                    "sandbox": name, "path": path, "entries": entries, "count": len(entries),
+                    "offline": True}
+        except Exception as exc:
+            return {"ok": False, "action": "list_dir", "space_id": space_id, "path": path,
+                    "sandbox": name, "error": str(exc), "offline": True}
 
     # -------------------------------------------------------------- actions #
 
@@ -1714,7 +1789,25 @@ class ModalBackend(Backend):
 
     def info(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         sb = self._find_running(space_id)
+        if sb is not None:
+            # Active idle shutdown reaper:
+            # If the sandbox has had no active operations (exec, write, start)
+            # for longer than idle_timeout_s (default 5 minutes), terminate it.
+            res = self._resources(payload)
+            idle_timeout_s = res.get("idle_timeout") or int(DEFAULT_IDLE_TIMEOUT_MS / 1000)
+            last_active = self._last_active.get(space_id)
+            if last_active is None:
+                self._last_active[space_id] = time.time()
+            elif (time.time() - last_active) >= idle_timeout_s:
+                try:
+                    sb.terminate()
+                except Exception:
+                    pass
+                self._forget(space_id)
+                self._last_active.pop(space_id, None)
+                sb = None
         if sb is None and bool(payload.get("resume", False)):
+            self._touch(space_id)
             sb = self._sandbox(space_id)
         if sb is None:
             # A stopped-but-provisioned space still has its Volume; report absence
@@ -1735,6 +1828,7 @@ class ModalBackend(Backend):
 
     def start(self, space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         self._forget(space_id)
+        self._touch(space_id)
         sb = self._sandbox(space_id, create_payload=payload)
         return self._summarize(space_id, sb, "start")
 
@@ -1743,6 +1837,7 @@ class ModalBackend(Backend):
         next command recreates a sandbox that mounts the same files."""
         name = sandbox_name(space_id)
         self._forget(space_id)
+        self._last_active.pop(space_id, None)
         stopped = 0
         for sb in self._list_space_sandboxes(space_id):
             if self._is_running(sb):
@@ -1759,6 +1854,7 @@ class ModalBackend(Backend):
         """Terminate the sandbox and delete its Volume. Idempotent."""
         name = sandbox_name(space_id)
         self._forget(space_id)
+        self._last_active.pop(space_id, None)
         terminated = 0
         for sb in self._list_space_sandboxes(space_id):
             try:
@@ -1789,15 +1885,31 @@ class ModalBackend(Backend):
                 tags = {}
             if tags.get("origin") and tags.get("origin") != "decillion":
                 continue
-            rows.append({"name": tags.get(MODAL_SPACE_TAG) or getattr(sb, "object_id", None),
-                         "status": "running" if self._is_running(sb) else "stopped",
-                         "spaceId": tags.get("spaceId")})
-        return {"ok": True, "action": "list", "sandboxes": rows}
+            rows.append(self._summarize(tags.get("spaceId") or "", sb, "list"))
+        return {"ok": True, "action": "list", "count": len(rows), "sandboxes": rows}
 
 
 # =========================================================================== #
-# Dispatch
+# Action router (entry point for the tool runner)
 # =========================================================================== #
+
+def _normalize_action(function_name: str, payload: Dict[str, Any]) -> str:
+    """Pick the action from the signal's ``function`` or the payload.
+
+    Davinci's bridge executor sends the catalog's routing function, but a lead
+    agent reaching the tool through the generic ``invoke`` route names the
+    action in its arguments instead — both must work.
+    """
+    for candidate in (payload.get("action"), payload.get("function"), function_name):
+        if isinstance(candidate, str) and candidate.strip() and candidate.strip() != "invoke":
+            return candidate.strip().lower()
+    cmd = payload.get("command")
+    if isinstance(cmd, str) and cmd.strip():
+        cmd_lower = cmd.strip().lower()
+        if cmd_lower not in _ALL_ACTIONS and cmd_lower != "invoke":
+            return "exec"
+    return "info"
+
 
 # Actions handled provider-agnostically on top of the backend's primitives.
 _SHARED_ACTIONS = {
@@ -1848,18 +1960,6 @@ _SPACELESS = {"list"}
 
 _ALL_ACTIONS = sorted(set(_SHARED_ACTIONS) | set(_BACKEND_ACTIONS))
 
-
-def _normalize_action(function_name: str, payload: Dict[str, Any]) -> str:
-    """Pick the action from the signal's ``function`` or the payload.
-
-    Davinci's bridge executor sends the catalog's routing function, but a lead
-    agent reaching the tool through the generic ``invoke`` route names the
-    action in its arguments instead — both must work.
-    """
-    for candidate in (payload.get("action"), payload.get("function"), function_name):
-        if isinstance(candidate, str) and candidate.strip() and candidate.strip() != "invoke":
-            return candidate.strip().lower()
-    return "exec" if payload.get("command") else "info"
 
 
 def _space_id(payload: Dict[str, Any]) -> str:

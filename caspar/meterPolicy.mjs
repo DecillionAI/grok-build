@@ -15,7 +15,7 @@ export function isUnmeteredToolFunction(entry, fn) {
   }
   if (
     (isMachineTool(entry) || /sandbox/.test(name)) &&
-    ["info", "status", "list", "list_dir"].includes(f)
+    ["info", "status", "list", "list_dir", "read"].includes(f)
   ) {
     return true;
   }

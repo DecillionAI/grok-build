@@ -288,6 +288,12 @@ def _extract_invoke(data: dict) -> dict:
 _CHAT_TEXT_ALIASES = ("text", "query", "prompt", "task", "input", "message", "q")
 
 
+_SYSTEM_OR_ROUTING_FUNCTIONS = {
+    "invoke", "info", "status", "list", "list_dir", "read", "stop", "delete",
+    "create", "provision", "start", "resume", "open", "logs", "help",
+}
+
+
 def _normalize_chat_args(function: str, payload: dict) -> None:
     """Spread a chat command's free-text argument across the alias keys tools read.
 
@@ -297,7 +303,8 @@ def _normalize_chat_args(function: str, payload: dict) -> None:
     so a tool that wants to branch on it can."""
     if not isinstance(payload, dict):
         return
-    if function and not payload.get("command"):
+    fn_lower = str(function or "").strip().lower()
+    if fn_lower and not payload.get("command") and fn_lower not in _SYSTEM_OR_ROUTING_FUNCTIONS:
         payload["command"] = function
     text = ""
     for src in ("args", "chat_text", "command_text", "text", "query", "prompt"):
