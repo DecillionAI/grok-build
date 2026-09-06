@@ -32,6 +32,7 @@ const STANDARD_KEYS = {
   openai: ["OPENAI_API_KEY"],
   gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
   openrouter: ["OPENROUTER_API_KEY"],
+  agentrouter: ["AGENTROUTER_API_KEY"],
   groq: ["GROQ_API_KEY"],
   deepseek: ["DEEPSEEK_API_KEY"],
   mistral: ["MISTRAL_API_KEY"],

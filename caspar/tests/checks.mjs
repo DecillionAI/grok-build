@@ -655,6 +655,24 @@ await check("a per-agent LLM override becomes a native endpoint entry, per provi
   // An agent may point a provider at its own gateway.
   const custom = buildChildEnv({ env, llm: { provider: "openai", models: ["m"], api_key: "k", base_url: "https://gw.example/v1" } });
   assert.equal(custom.modelConfig.baseUrl, "https://gw.example/v1");
+
+  // A gateway may demand a header the table cannot know (an account id, a
+  // routing tag, a client identifier it allow-lists). The operator's env JSON
+  // and the agent's own `headers` merge onto the table's defaults, agent last,
+  // so satisfying one is configuration rather than a code change.
+  const operatorHeaders = buildChildEnv({
+    env: { ...env, GROK_CREATURE_LLM_HEADERS_AGENTROUTER: '{"x-route":"eu","x-tier":"1"}' },
+    llm: { provider: "agentrouter", models: ["claude-sonnet-4-5-20250929"], api_key: "ar-key", headers: { "x-tier": "2" } },
+  });
+  assert.equal(operatorHeaders.modelConfig.headers["x-route"], "eu", "the operator's configured header is sent");
+  assert.equal(operatorHeaders.modelConfig.headers["x-tier"], "2", "the agent's own header wins on a collision");
+  // The table's own headers survive a merge that does not mention them.
+  const pinned = buildChildEnv({
+    env,
+    llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "k", headers: { "x-extra": "1" } },
+  });
+  assert.equal(pinned.modelConfig.headers["anthropic-version"], "2023-06-01");
+  assert.equal(pinned.modelConfig.headers["x-extra"], "1");
 });
 
 await check("an unusable LLM override falls back to the default backbone, with a warning", () => {

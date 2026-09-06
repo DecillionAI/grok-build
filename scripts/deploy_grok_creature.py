@@ -291,6 +291,17 @@ def bake_env() -> Dict[str, str]:
             value = env_any(name, default="")
             if value:
                 env[name] = value
+    # Per-provider endpoint and header overrides
+    # (GROK_CREATURE_LLM_BASE_<PROVIDER>, GROK_CREATURE_LLM_HEADERS_<PROVIDER>).
+    # Non-secret configuration: they repoint a provider at a gateway, or satisfy
+    # an endpoint that demands a header the provider table cannot know. Platform
+    # *keys* are still never baked — they come from the secret store (above).
+    for name, raw in os.environ.items():
+        if name == "GROK_CREATURE_LLM_BASE_URL":
+            continue  # the default backbone's own base url, handled above
+        if name.startswith("GROK_CREATURE_LLM_BASE_") or name.startswith("GROK_CREATURE_LLM_HEADERS_"):
+            if raw.strip():
+                env[name] = raw.strip()
     for name in PROXY_ENV_NAMES:
         value = env.get(name, "")
         if value and ("127.0.0.1" in value or "localhost" in value):
