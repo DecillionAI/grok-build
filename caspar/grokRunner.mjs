@@ -117,6 +117,10 @@ export function applyLlmOverride(env, llm) {
   const apiKey = (typeof llm.api_key === "string" && llm.api_key.trim()) || (typeof llm.apiKey === "string" && llm.apiKey.trim()) || "";
   const baseUrl = (typeof llm.base_url === "string" && llm.base_url.trim()) || (typeof llm.baseUrl === "string" && llm.baseUrl.trim()) || "";
   const apiBackend = (typeof llm.api_backend === "string" && llm.api_backend.trim()) || (typeof llm.apiBackend === "string" && llm.apiBackend.trim()) || "";
+  // Extra request headers the endpoint demands but the provider table cannot
+  // know (a gateway account id, a routing tag, a client identifier it
+  // allow-lists). Merged onto the table's defaults by resolveProvider.
+  const headers = (llm.headers && typeof llm.headers === "object" && llm.headers) || (llm.extra_headers && typeof llm.extra_headers === "object" && llm.extra_headers) || null;
   const modelId = model && model.trim() ? model.trim() : undefined;
 
   /** Drop every credential the image baked in, so only the agent's own is used. */
@@ -124,7 +128,7 @@ export function applyLlmOverride(env, llm) {
     for (const key of CREDENTIAL_ENV) delete env[key];
   };
 
-  const resolved = resolveProvider(provider, { env, baseUrlOverride: baseUrl, apiBackend });
+  const resolved = resolveProvider(provider, { env, baseUrlOverride: baseUrl, apiBackend, headers });
 
   // No provider named at all: an explicit model (and key) on the creature's own
   // backbone.

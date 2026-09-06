@@ -18,6 +18,12 @@
  *
  * An operator can repoint any provider with `GROK_CREATURE_LLM_BASE_<PROVIDER>`
  * (e.g. an Azure/OpenAI gateway), and an agent may set `llm.base_url` itself.
+ *
+ * Extra request headers work the same way: `GROK_CREATURE_LLM_HEADERS_<PROVIDER>`
+ * (a JSON object) or an agent's own `llm.headers` merge onto the table's
+ * defaults. That is how a gateway which demands a header the table cannot know
+ * — an account id, a routing tag, a client identifier it allow-lists — is
+ * satisfied by configuration instead of a code change.
  */
 
 import { creatureEnv } from "../env.mjs";
@@ -85,8 +91,13 @@ const PROVIDERS = [
     id: "agentrouter",
     aliases: ["agent-router"],
     label: "AgentRouter",
-    // AgentRouter exposes an OpenAI-compatible API and authenticates with the
-    // token as a standard bearer credential.
+    // AgentRouter is a gateway: one bearer token fronts Claude, GPT, DeepSeek and
+    // GLM models, and the model id passes straight through (`claude-…`, `gpt-…`),
+    // so nothing here has to know the catalog. Its OpenAI-compatible surface also
+    // serves `/responses` and `/messages`, which an agent selects with
+    // `llm.api_backend`; chat completions is the one every listed model answers.
+    // If the account requires a client identification header, set it with
+    // `GROK_CREATURE_LLM_HEADERS_AGENTROUTER` rather than hard-coding one here.
     baseUrl: "https://agentrouter.org/v1",
     apiBackend: "chat_completions",
   },
@@ -141,6 +152,36 @@ export function baseUrlEnvName(providerId) {
   return `LLM_BASE_${String(providerId).toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
 }
 
+/** `agentrouter` → `GROK_CREATURE_LLM_HEADERS_AGENTROUTER` (a JSON object). */
+export function headersEnvName(providerId) {
+  return `LLM_HEADERS_${String(providerId).toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+/** String-valued headers only; anything else in the object is ignored. */
+function headerEntries(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [name, value] of Object.entries(raw)) {
+    const key = String(name || "").trim();
+    if (!key) continue;
+    if (typeof value !== "string" && typeof value !== "number") continue;
+    const text = String(value).trim();
+    if (text) out[key] = text;
+  }
+  return out;
+}
+
+/** The operator's `GROK_CREATURE_LLM_HEADERS_<PROVIDER>`, or {} when unset/unparsable. */
+function configuredHeaders(providerId, env) {
+  const raw = String(creatureEnv(headersEnvName(providerId || "default"), env) || "").trim();
+  if (!raw) return {};
+  try {
+    return headerEntries(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
 /**
  * Resolve a provider id to its endpoint descriptor.
  *
@@ -152,7 +193,7 @@ export function baseUrlEnvName(providerId) {
  * change; with no endpoint to call, it resolves to `null` and the caller falls
  * back to the creature's default backbone (and says so in the reply's warnings).
  */
-export function resolveProvider(id, { env = process.env, baseUrlOverride = "", apiBackend = "" } = {}) {
+export function resolveProvider(id, { env = process.env, baseUrlOverride = "", apiBackend = "", headers: headerOverride = null } = {}) {
   const key = String(id || "").trim().toLowerCase();
   const known = BY_KEY.get(key);
   const configured = String(creatureEnv(baseUrlEnvName(key || "default"), env) || "").trim();
@@ -165,7 +206,13 @@ export function resolveProvider(id, { env = process.env, baseUrlOverride = "", a
     baseUrl,
     apiBackend: backend,
     authScheme: known?.authScheme || "bearer",
-    headers: { ...(known?.headers || {}) },
+    // Table default, then the operator's env JSON, then the agent's own — each
+    // later source overrides a header the earlier one set by the same name.
+    headers: {
+      ...(known?.headers || {}),
+      ...configuredHeaders(key, env),
+      ...headerEntries(headerOverride),
+    },
     native: Boolean(known?.native),
     // Request-shape hint carried into the model config (see grokConfig). Only
     // set when the provider table pins it; undefined otherwise so grok keeps

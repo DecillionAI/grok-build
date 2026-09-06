@@ -463,7 +463,7 @@ and the Anthropic Messages API itself, so a provider override is a generated
 | `anthropic` | `api.anthropic.com/v1` | messages (`x-api-key`) | `claude-opus-5` |
 | `gemini` (`google`) | Gemini's OpenAI-compatible endpoint | chat completions | `gemini-2.5-pro` |
 | `openrouter` | `openrouter.ai/api/v1` | chat completions | `openai/gpt-4o` |
-| `agentrouter` | `agentrouter.org/v1` | chat completions | `gpt-5.5` |
+| `agentrouter` | `agentrouter.org/v1` | chat completions | `claude-sonnet-4-5-20250929`, `gpt-5.6-sol` |
 | `groq` · `deepseek` · `mistral` · `together` | each provider's OpenAI-compatible endpoint | chat completions | provider model id |
 | anything else **with** `llm.base_url` | that URL | chat completions (or `llm.api_backend`) | provider model id |
 
@@ -475,6 +475,13 @@ and the Anthropic Messages API itself, so a provider override is a generated
   subprocess or a crash dump cannot carry it further.
 - **Base URL overrides.** An agent may set `llm.base_url` (e.g. an Azure/OpenAI
   gateway); an operator may repoint a provider with `GROK_CREATURE_LLM_BASE_<PROVIDER>`.
+- **Extra request headers.** A gateway may demand a header the provider table
+  cannot know — an account id, a routing tag, a client identifier it allow-lists.
+  An operator sets `GROK_CREATURE_LLM_HEADERS_<PROVIDER>` (a JSON object) and an
+  agent may set `llm.headers`; both merge onto the table's own headers (the
+  agent's wins on a name collision) and are written as the model entry's
+  `extra_headers`. So an endpoint with an unusual requirement is configuration,
+  not a code change.
 - **A default non-xAI backbone.** `GROK_CREATURE_LLM_PROVIDER` + `_API_KEY`
   (+ `_MODEL`, `_BASE_URL`) baked at deploy time serve every agent that brings no
   provider of its own, through the same code path. A per-agent override always
@@ -488,7 +495,8 @@ and the Anthropic Messages API itself, so a provider override is a generated
 Media generation reuses `config.llm.api_key` for the selected provider, the
 platform's `GROK_CREATURE_LLM_KEY_<PROVIDER>` secrets, or the conventional
 `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`,
-provider-standard keys for Groq/DeepSeek/Mistral/Together, and xAI variables. It never copies these keys into the Grok child environment or a
+`AGENTROUTER_API_KEY`, provider-standard keys for Groq/DeepSeek/Mistral/Together,
+and xAI variables. It never copies these keys into the Grok child environment or a
 result attachment.
 
 | Env | Meaning |
