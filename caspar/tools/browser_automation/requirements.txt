@@ -1,2 +1,0 @@
-requests>=2.31
-playwright>=1.48
